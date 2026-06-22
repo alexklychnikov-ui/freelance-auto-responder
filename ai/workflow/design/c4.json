@@ -1,0 +1,125 @@
+{
+  "version": "2.0.0",
+  "context": {
+    "system": "Freelance Auto-Responder (MVP: Kwork)",
+    "actors": [
+      "Freelancer (Александр Клычников)",
+      "Kwork buyers"
+    ],
+    "external_systems": [
+      "Kwork (Chrome session via BrowserClient)",
+      "ProxyAPI OpenAI-compatible GPT",
+      "LightRAG MCP (user-lightrag)",
+      "Telegram Bot API (approve/reject)",
+      "Excel Response Journal (Zerocode2md)",
+      "BrowserMCP external server (optional runtime)",
+      "Cursor IDE Browser MCP (dev/runtime adapter)"
+    ],
+    "scope_mvp": [
+      "Periodic scan kwork_dev_it for new projects only",
+      "Full project description read",
+      "LightRAG context + GPT scoring",
+      "Telegram inline approve/reject with 24h timeout",
+      "Submit offer on Kwork after approve",
+      "Append row to Excel journal",
+      "Monitor buyer replies and notify in Telegram"
+    ],
+    "out_of_scope_mvp": [
+      "FL.ru enabled scan",
+      "Telegram channel sources",
+      "Auto-submit without approval"
+    ]
+  },
+  "containers": [
+    {
+      "name": "Scheduler Daemon",
+      "tech": "Python asyncio + APScheduler or custom loop",
+      "responsibility": [
+        "Load config/sources.yaml enabled sources",
+        "Trigger scan cycle per source_key interval",
+        "Orchestrate pipeline state machine",
+        "Bootstrap first-run dedup seeding"
+      ]
+    },
+    {
+      "name": "Platform Adapter Layer",
+      "tech": "Python Protocol PlatformAdapter",
+      "responsibility": [
+        "kwork adapter: scan, read_full, submit, monitor_replies",
+        "Stub flru and telegram_channel for phase 2/3"
+      ]
+    },
+    {
+      "name": "Browser Client Layer",
+      "tech": "BrowserClient protocol",
+      "responsibility": [
+        "CursorBrowserAdapter for Cursor MCP",
+        "ExternalBrowserMcpAdapter for standalone BrowserMCP server",
+        "Navigate, snapshot, click, fill, evaluate JS"
+      ]
+    },
+    {
+      "name": "Project Store",
+      "tech": "SQLite data/seen_projects.db",
+      "responsibility": [
+        "Dedup by (platform, source_key, project_id)",
+        "Status lifecycle new→scored→notified→submitted|rejected|skipped",
+        "scan_state per source_key watermark"
+      ]
+    },
+    {
+      "name": "Analyzer",
+      "tech": "Python + MCP LightRAG + HTTP OpenAI",
+      "responsibility": [
+        "Dual LightRAG queries (stack + response rules)",
+        "GPT score JSON contract",
+        "GPT response text generation on approve"
+      ]
+    },
+    {
+      "name": "Telegram Approval Bot",
+      "tech": "aiogram",
+      "responsibility": [
+        "Send review cards with inline buttons",
+        "Handle approve/reject callbacks",
+        "Alert on login required, captcha, daily limit",
+        "Notify on buyer replies"
+      ]
+    },
+    {
+      "name": "Response Journal Writer",
+      "tech": "openpyxl",
+      "responsibility": [
+        "Append submitted offers to Мои отклики.xlsx",
+        "Update status on buyer reply"
+      ]
+    }
+  ],
+  "components": [
+    "SchedulerLoop",
+    "PipelineOrchestrator",
+    "KworkAdapter",
+    "BrowserClientFactory",
+    "CursorBrowserAdapter",
+    "ExternalBrowserMcpAdapter",
+    "SeenProjectsRepository",
+    "ScanStateRepository",
+    "LightRagClient",
+    "GptScorer",
+    "GptResponseGenerator",
+    "TelegramReviewBot",
+    "PendingOffersStore",
+    "JournalWriter",
+    "DailyResponseLimiter"
+  ],
+  "assumptions": [
+    "User pre-authenticated in Chrome for Kwork",
+    "Daemon runs on Windows VPS/local machine with Chrome",
+    "Single Telegram chat for all notifications"
+  ],
+  "limitations": [
+    "Browser automation fragile to DOM changes on Kwork",
+    "MVP single enabled source kwork_dev_it",
+    "No distributed locking — one daemon instance expected"
+  ]
+}

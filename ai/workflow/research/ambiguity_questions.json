@@ -1,0 +1,48 @@
+{
+  "version": "1.0.0",
+  "stage": "research",
+  "questions": [
+    {
+      "id": "Q1",
+      "question": "Старые артефакты MockupCreate — перезаписать?",
+      "status": "resolved",
+      "answer": "overwrite"
+    },
+    {
+      "id": "Q2",
+      "question": "MVP scope",
+      "status": "resolved",
+      "answer": "kwork_only (kwork_dev_it)"
+    },
+    {
+      "id": "Q3",
+      "question": "Browser runtime",
+      "status": "resolved",
+      "answer": "BrowserClient abstraction + cursor-ide-browser + external BrowserMCP"
+    },
+    {
+      "id": "Q4",
+      "question": "Scheduler runtime",
+      "status": "resolved",
+      "answer": "long_running_daemon"
+    },
+    {
+      "id": "Q5",
+      "question": "Telegram approve-бот — новый или существующий?",
+      "status": "open",
+      "default_assumption": "TELEGRAM_BOT_TOKEN и TELEGRAM_CHAT_ID из .env пользователя"
+    },
+    {
+      "id": "Q6",
+      "question": "Bootstrap первого scan",
+      "status": "open",
+      "default_assumption": "SCAN_BOOTSTRAP_SKIP_PIPELINE=true per promptFrilance.md"
+    },
+    {
+      "id": "Q7",
+      "question": "Portfolio guardrails применимы?",
+      "status": "resolved",
+      "answer": "no — отдельный Python daemon, не Next.js portfolio"
+    }
+  ]
+}

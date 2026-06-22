@@ -1,0 +1,48 @@
+{
+  "version": "1.0.0",
+  "required_roles": [
+    "teamlead",
+    "coder",
+    "qa",
+    "devops",
+    "security_expert",
+    "code_simplify_assessor",
+    "efficiency_assessor"
+  ],
+  "optional_roles": [
+    "designer",
+    "manual_tester",
+    "technical_writer",
+    "compliance_officer"
+  ],
+  "role_contracts": {
+    "teamlead": {
+      "focus": "orchestration_and_gates",
+      "deliverable": "stage_checkpoint"
+    },
+    "coder": {
+      "focus": "implementation_patterns",
+      "deliverable": "code_changeset"
+    },
+    "qa": {
+      "focus": "automated_and_manual_quality_checks",
+      "deliverable": "qa_report"
+    },
+    "devops": {
+      "focus": "docker_infra_services",
+      "deliverable": "ops_validation_report"
+    },
+    "security_expert": {
+      "focus": "threats_secrets_headers_input_validation",
+      "deliverable": "security_review"
+    },
+    "code_simplify_assessor": {
+      "focus": "simplicity_readability_maintainability",
+      "deliverable": "simplification_review"
+    },
+    "efficiency_assessor": {
+      "focus": "runtime_memory_io_and_scalability",
+      "deliverable": "performance_review"
+    }
+  }
+}

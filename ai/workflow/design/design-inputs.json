@@ -1,0 +1,48 @@
+{
+  "version": "2.0.0",
+  "status": "approved_by_user",
+  "project": "Freelance Auto-Responder",
+  "resolved_decisions": {
+    "mvp_platforms": ["kwork_dev_it"],
+    "post_mvp_platforms": ["flru_ai", "telegram_channels"],
+    "legacy_artifacts": "overwrite",
+    "browser_strategy": "BrowserClient protocol with CursorBrowserAdapter and ExternalBrowserMcpAdapter",
+    "scheduler_runtime": "long_running_daemon",
+    "bootstrap_mode": "SCAN_BOOTSTRAP_SKIP_PIPELINE=true",
+    "approval_required": true,
+    "max_daily_responses": 5,
+    "min_gpt_score": 7,
+    "scan_interval_minutes": 30,
+    "early_exit_known_count": 5
+  },
+  "env_contract": {
+    "OPENAI_API_KEY": "required",
+    "OPENAI_BASE_URL": "required",
+    "OPENAI_MODEL": "gpt-4o-mini",
+    "TELEGRAM_BOT_TOKEN": "required",
+    "TELEGRAM_CHAT_ID": "required",
+    "BROWSERMCP_SERVER": "optional_for_external_adapter",
+    "RESPONSE_JOURNAL": "required",
+    "LIGHTRAG_MCP": "user-lightrag",
+    "SCAN_INTERVAL_MINUTES": "default 30",
+    "MIN_GPT_SCORE": "default 7",
+    "MAX_DAILY_RESPONSES": "default 5",
+    "REQUIRE_TELEGRAM_APPROVAL": "default true",
+    "SCAN_BOOTSTRAP_SKIP_PIPELINE": "default true",
+    "SCAN_EARLY_EXIT_KNOWN_COUNT": "default 5"
+  },
+  "assumptions": [
+    "Kwork auth via Chrome session; user logs in manually before daemon start",
+    "LightRAG accessed via MCP search_knowledge_base mode mix",
+    "Excel journal schema matches Zerocode2md ResponseJournal",
+    "FL.ru and Telegram adapters stubbed but not enabled in MVP config"
+  ],
+  "open_questions": [
+    "Reuse existing Telegram bot token vs dedicated bot — resolved at .env setup by user"
+  ],
+  "constraints": [
+    "No auto-submit without Telegram approve",
+    "No Kwork password in code or env",
+    "Logs must not contain API keys or full response bodies with secrets"
+  ]
+}

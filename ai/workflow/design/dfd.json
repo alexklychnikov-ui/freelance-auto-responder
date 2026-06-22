@@ -1,0 +1,100 @@
+{
+  "version": "2.0.0",
+  "processes": [
+    {
+      "id": "P1",
+      "name": "ScanCycle",
+      "inputs": ["sources.yaml", "scan_state", "seen_projects.db"],
+      "outputs": ["new ProjectPreview records", "updated scan_state", "scan log line"],
+      "stores": ["seen_projects.db", "logs/"]
+    },
+    {
+      "id": "P2",
+      "name": "ReadFull",
+      "inputs": ["project_id", "browser session"],
+      "outputs": ["ProjectFull JSON"],
+      "stores": ["seen_projects.db status update"]
+    },
+    {
+      "id": "P3",
+      "name": "AnalyzeFit",
+      "inputs": ["ProjectFull", "LightRAG context A+B", "local response examples"],
+      "outputs": ["score JSON fit/score/reason/risks"],
+      "stores": ["seen_projects.db fit/score/status=scored"]
+    },
+    {
+      "id": "P4",
+      "name": "TelegramReview",
+      "inputs": ["ProjectFull", "score JSON"],
+      "outputs": ["TG message", "pending_offers JSON"],
+      "stores": ["data/pending_offers/", "seen_projects.db status=notified"]
+    },
+    {
+      "id": "P5",
+      "name": "SubmitOffer",
+      "inputs": ["approve callback", "generated response text", "browser session"],
+      "outputs": ["SubmitResult", "response_text"],
+      "stores": ["seen_projects.db status=submitted", "pending_offers update"]
+    },
+    {
+      "id": "P6",
+      "name": "ExcelLog",
+      "inputs": ["ProjectFull", "score", "response_text"],
+      "outputs": ["new Excel row"],
+      "stores": ["ResponseJournal xlsx"]
+    },
+    {
+      "id": "P7",
+      "name": "MonitorReplies",
+      "inputs": ["submitted projects", "browser"],
+      "outputs": ["ReplyEvent list"],
+      "stores": ["seen_projects.db", "Excel status update", "TG notification"]
+    }
+  ],
+  "data_stores": [
+    {
+      "id": "D1",
+      "name": "seen_projects.db",
+      "entities": ["projects", "scan_state"]
+    },
+    {
+      "id": "D2",
+      "name": "pending_offers/",
+      "format": "JSON per (platform, source_key, project_id)"
+    },
+    {
+      "id": "D3",
+      "name": "Мои отклики.xlsx",
+      "columns": ["№", "Дата отклика", "Площадка", "Ссылка", "Тип проекта", "Статус", "Результат общения", "Заметки"]
+    },
+    {
+      "id": "D4",
+      "name": "config/sources.yaml",
+      "entities": ["enabled sources with intervals and filters"]
+    }
+  ],
+  "external_entities": [
+    "Kwork website",
+    "ProxyAPI GPT",
+    "LightRAG MCP",
+    "Telegram API",
+    "Freelancer user"
+  ],
+  "flows": [
+    {"from": "Scheduler Daemon", "to": "P1 ScanCycle", "data": "trigger per source_key"},
+    {"from": "P1", "to": "D1", "data": "new project rows / skip bootstrap"},
+    {"from": "P1", "to": "P2", "data": "new project_id only"},
+    {"from": "P2", "to": "P3", "data": "ProjectFull"},
+    {"from": "LightRAG MCP", "to": "P3", "data": "context strings"},
+    {"from": "P3", "to": "P4", "data": "fit=true score>=7"},
+    {"from": "Freelancer user", "to": "P4", "data": "approve/reject callback"},
+    {"from": "P4", "to": "P5", "data": "approve only"},
+    {"from": "P5", "to": "P6", "data": "successful submit"},
+    {"from": "P7", "to": "Freelancer user", "data": "buyer reply notification"}
+  ],
+  "assumptions": [
+    "Bootstrap cycle writes skipped without GPT/TG",
+    "Rejected projects never re-enter TelegramReview"
+  ],
+  "open_questions": []
+}

@@ -1,0 +1,23 @@
+sources:
+  - id: kwork_dev_it
+    platform: kwork
+    enabled: true
+    url: https://kwork.ru/projects?c=41
+    scan_interval_minutes: 30
+    bootstrap: true
+
+  - id: flru_ai
+    platform: flru
+    enabled: false
+    url: https://www.fl.ru/projects/category/ai-iskusstvenniy-intellekt/
+    scan_interval_minutes: 45
+    filters:
+      listing_types: [order]
+      skip_fulltime: true
+
+  - id: tg_job_webdev
+    platform: telegram
+    enabled: false
+    channel: "@job_webdev"
+    scan_interval_minutes: 15
+    last_message_id: 0

@@ -1,0 +1,19 @@
+[Unit]
+Description=Freelance Auto-Responder daemon
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/freelance-responder
+Environment=PYTHONUNBUFFERED=1
+Environment=PLAYWRIGHT_BROWSERS_PATH=/root/.cache/ms-playwright
+ExecStart=/opt/freelance-responder/.venv/bin/python -m src.scheduler daemon
+Restart=on-failure
+RestartSec=30
+StandardOutput=append:/opt/freelance-responder/logs/daemon.log
+StandardError=append:/opt/freelance-responder/logs/daemon.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,35 @@
+{
+  "version": "2.0.0",
+  "gates": [
+    {
+      "id": "G1",
+      "after_phase": "PL-2",
+      "checks": ["sqlite schema tests pass"],
+      "owner": "qa"
+    },
+    {
+      "id": "G2",
+      "after_phase": "PL-4",
+      "checks": ["kwork fixture parse tests pass"],
+      "owner": "qa"
+    },
+    {
+      "id": "G3",
+      "after_phase": "PL-6",
+      "checks": ["approval gate enforced", "no secret in logs"],
+      "owner": "security_expert"
+    },
+    {
+      "id": "G4",
+      "after_phase": "PL-8",
+      "checks": ["daemon run-once smoke", "scan log format"],
+      "owner": "devops"
+    },
+    {
+      "id": "G5",
+      "after_phase": "PL-9",
+      "checks": ["QA-1 through QA-8", "simplify review", "efficiency review"],
+      "owner": "teamlead"
+    }
+  ]
+}

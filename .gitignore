@@ -1,0 +1,29 @@
+# secrets
+.env
+*.pem
+*.key
+
+# python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# runtime data (restore from backup / VPS)
+data/seen_projects.db
+data/kwork_storage.json
+data/kwork_browser_profile/
+data/prepared_responses/
+data/pending_offers/
+data/*.xlsx
+logs/*.log
+logs/agent-worklog.txt
+
+# os / ide
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

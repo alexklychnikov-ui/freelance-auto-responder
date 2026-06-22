@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "reports": [
+    {
+      "role": "coder",
+      "task": "PL-1..PL-4 skeleton sqlite browser kwork",
+      "result": "done",
+      "checks": "19 pytest passed"
+    },
+    {
+      "role": "coder",
+      "task": "PL-5..PL-8 analyzer telegram journal pipeline daemon",
+      "result": "done",
+      "checks": "33 pytest passed"
+    },
+    {
+      "role": "qa",
+      "task": "QA gate PL-1..8",
+      "result": "partial",
+      "findings": ["QA plan gaps", "StopIteration", "hardcoded paths"]
+    },
+    {
+      "role": "coder",
+      "task": "PL-9 middle+ fixes",
+      "result": "done",
+      "checks": "39 pytest passed"
+    }
+  ]
+}

@@ -1,0 +1,45 @@
+{
+  "version": "1.0.0",
+  "stage": "research",
+  "date": "2026-06-22",
+  "source_prompt": "promptFrilance.md",
+  "facts": {
+    "repository": {
+      "application_code": "none",
+      "file_count": 29,
+      "product_spec": "promptFrilance.md",
+      "bootstrap_origin": "C:\\Python\\Projects\\MockupCreate",
+      "legacy_artifacts_domain": "Windows GUI Mockup Generator (unrelated)"
+    },
+    "requirements_summary": {
+      "goal": "Auto-scan new freelance orders, score via LightRAG+GPT, Telegram approve, submit response, Excel journal, monitor replies",
+      "mvp_platform": "kwork_dev_it",
+      "mandatory_approval": true,
+      "dedup_store": "SQLite data/seen_projects.db",
+      "pipeline": "SCAN → READ_FULL → LIGHT_RAG_CONTEXT → GPT_SCORE → TELEGRAM_REVIEW → SUBMIT → EXCEL_LOG → MONITOR_REPLY"
+    },
+    "external_paths_verified": {
+      "browsermcp_server": "C:\\Python\\Projects\\BrowserMCP\\packages\\mcp-server\\dist\\index.js",
+      "response_journal_xlsx": "C:\\Python\\Projects\\Zerocode2md\\ResponseJournal\\Мои отклики.xlsx",
+      "response_examples_dir": "C:\\Python\\Projects\\Zerocode2md\\Output\\Отклики\\",
+      "create_journal_script": "C:\\Python\\Projects\\Zerocode2md\\scripts\\create_response_journal.py",
+      "lightrag_project": "C:\\Python\\Projects\\LigthRAG"
+    },
+    "cursor_mcp_available": {
+      "cursor_ide_browser": true,
+      "user_lightrag": true
+    },
+    "lightrag_kb_facts": {
+      "executor": "Александр Клычников, Python/AI/Telegram, Иркутск",
+      "portfolio": "https://portfolio.hayklyvibelexy.ru",
+      "github": "alexklychnikov-ui",
+      "response_rules_source": "Zerocoder_OV05_Resume_SP_KP.md"
+    }
+  },
+  "resolved_decisions": {
+    "legacy_artifacts": "overwrite",
+    "mvp_scope": "kwork_only",
+    "browser_strategy": "BrowserClient abstraction with cursor-ide-browser and external BrowserMCP adapters",
+    "scheduler_runtime": "long_running_daemon"
+  }
+}

@@ -1,0 +1,176 @@
+{
+  "version": "2.0.0",
+  "stage": "planning",
+  "global_gate_rule": "no_pass_no_next_phase",
+  "phases": [
+    {
+      "id": "PL-1",
+      "name": "Project Skeleton and Config",
+      "goal": "Runnable Python package with env, sources.yaml, logging",
+      "owner": "coder",
+      "reviewer": "qa",
+      "actions": [
+        "Create requirements.txt/pyproject, src layout",
+        "config/sources.yaml with kwork_dev_it enabled",
+        "Settings from .env.example",
+        "data/ dirs and logs/"
+      ],
+      "acceptance_criteria": [
+        "python -m src.scheduler --help works",
+        "Settings load required env with validation",
+        "sources.yaml parses and returns enabled sources"
+      ],
+      "rollback": "Revert to empty src if structure conflicts"
+    },
+    {
+      "id": "PL-2",
+      "name": "SQLite Dedup and Scan State",
+      "goal": "seen_projects.db schema and repositories",
+      "owner": "coder",
+      "reviewer": "qa",
+      "actions": [
+        "Implement projects and scan_state tables",
+        "Bootstrap mode: insert skipped without pipeline",
+        "Early-exit known count logic in repository queries"
+      ],
+      "acceptance_criteria": [
+        "Unit tests: new vs known project detection",
+        "Bootstrap marks page1 as skipped",
+        "Composite PK (platform, source_key, project_id)"
+      ],
+      "rollback": "Delete db file and recreate schema migration"
+    },
+    {
+      "id": "PL-3",
+      "name": "BrowserClient Abstraction",
+      "goal": "Protocol + Cursor and External MCP adapters (stub external if no server)",
+      "owner": "coder",
+      "reviewer": "security_expert",
+      "actions": [
+        "BrowserClient protocol",
+        "CursorBrowserAdapter wrapping cursor-ide-browser tool interface",
+        "ExternalBrowserMcpAdapter via subprocess/MCP client stub",
+        "Factory by BROWSER_ADAPTER env"
+      ],
+      "acceptance_criteria": [
+        "Adapter interface covered by fake/mock tests",
+        "Factory selects adapter from env",
+        "No secrets in browser logs"
+      ],
+      "rollback": "Single adapter only if dual impl blocks progress"
+    },
+    {
+      "id": "PL-4",
+      "name": "Kwork Adapter Scan and Read",
+      "goal": "scan_new and read_full for kwork_dev_it",
+      "owner": "coder",
+      "reviewer": "manual_tester",
+      "actions": [
+        "Navigate listing URL, extract cards via evaluate JS",
+        "Parse project_id from /projects/{id}",
+        "read_full: expand description, parse fields"
+      ],
+      "acceptance_criteria": [
+        "Returns ProjectPreview list from live or fixture HTML",
+        "read_full returns ProjectFull schema",
+        "Integration test with saved HTML fixture"
+      ],
+      "rollback": "Use fixture-only mode for CI without browser"
+    },
+    {
+      "id": "PL-5",
+      "name": "Analyzer LightRAG + GPT Score",
+      "goal": "Dual LightRAG queries and GPT scoring JSON",
+      "owner": "coder",
+      "reviewer": "qa",
+      "actions": [
+        "LightRagClient MCP wrapper",
+        "GptScorer with system prompt from promptFrilance.md",
+        "Load local response examples path",
+        "Pydantic validation of score result"
+      ],
+      "acceptance_criteria": [
+        "Score JSON parsed and validated",
+        "fit=false skips Telegram path",
+        "Mock tests without live API"
+      ],
+      "rollback": "Deterministic local scorer for dev flag"
+    },
+    {
+      "id": "PL-6",
+      "name": "Telegram Approval Bot",
+      "goal": "Review cards, approve/reject, pending offers store",
+      "owner": "coder",
+      "reviewer": "security_expert",
+      "actions": [
+        "aiogram bot with inline buttons",
+        "Persist pending_offers JSON",
+        "24h timeout auto-reject",
+        "Daily limit check before submit handoff"
+      ],
+      "acceptance_criteria": [
+        "Callback routes approve/reject",
+        "No submit without approve flag",
+        "Pending offer reloadable after restart"
+      ],
+      "rollback": "CLI approve for dev if bot blocked"
+    },
+    {
+      "id": "PL-7",
+      "name": "Submit Offer and Excel Journal",
+      "goal": "Kwork submit_response + openpyxl journal append",
+      "owner": "coder",
+      "reviewer": "qa",
+      "actions": [
+        "GptResponseGenerator on approve",
+        "Kwork submit via browser fill/click",
+        "JournalWriter append row per contract"
+      ],
+      "acceptance_criteria": [
+        "Excel row appended on successful submit",
+        "Submit blocked when REQUIRE_TELEGRAM_APPROVAL and no approve",
+        "Response text stored in pending offer"
+      ],
+      "rollback": "Dry-run submit mode logs only"
+    },
+    {
+      "id": "PL-8",
+      "name": "Scheduler Daemon and Pipeline",
+      "goal": "Long-running loop orchestrating full state machine",
+      "owner": "coder",
+      "reviewer": "devops",
+      "actions": [
+        "Asyncio daemon: scan interval per source",
+        "PipelineOrchestrator wires all steps",
+        "Concurrent TG bot task",
+        "monitor_replies periodic hook"
+      ],
+      "acceptance_criteria": [
+        "Daemon runs scan cycle on interval",
+        "Bootstrap first cycle behavior correct",
+        "Graceful shutdown on SIGINT",
+        "Scan log line format matches spec"
+      ],
+      "rollback": "run-once CLI if daemon unstable"
+    },
+    {
+      "id": "PL-9",
+      "name": "E2E Hardening and Review",
+      "goal": "QA, security, simplify, efficiency gates",
+      "owner": "teamlead",
+      "reviewer": "compliance_officer",
+      "actions": [
+        "Run qa-test-plan scenarios",
+        "Security review secrets and approval gate",
+        "Fix middle+ findings",
+        "Update coding checkpoint artifacts"
+      ],
+      "acceptance_criteria": [
+        "All mandatory MVP acceptance from promptFrilance.md phase 1",
+        "No open blocker findings",
+        "stage_checkpoint.json reflects freelance-responder"
+      ],
+      "rollback": "Disable submit in prod until manual sign-off"
+    }
+  ]
+}

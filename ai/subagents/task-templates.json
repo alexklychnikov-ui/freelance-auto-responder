@@ -1,0 +1,38 @@
+{
+  "version": "1.0.0",
+  "template": {
+    "input": {
+      "stage": "<research|design|planning|coding>",
+      "role": "<role>",
+      "goal": "<single_goal>",
+      "scope": "<allowed_scope>",
+      "constraints": [
+        "architecture_guardrails",
+        "security_baseline",
+        "stage_rules"
+      ],
+      "acceptance_criteria": [
+        "<criterion_1>",
+        "<criterion_2>"
+      ],
+      "artifacts_expected": [
+        "<artifact>"
+      ]
+    },
+    "output": {
+      "role": "<role>",
+      "task": "<short>",
+      "result": "<done|partial|blocked>",
+      "artifacts": [
+        "<artifact_path_or_name>"
+      ],
+      "checks": [
+        "<check + status>"
+      ],
+      "findings_middle_plus": [
+        "<must_fix_item>"
+      ],
+      "handoff": "<next_step>"
+    }
+  }
+}

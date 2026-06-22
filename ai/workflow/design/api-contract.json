@@ -1,0 +1,92 @@
+{
+  "version": "2.0.0",
+  "internal_contracts": {
+    "PlatformAdapter": {
+      "methods": {
+        "scan_new": {"returns": "list[ProjectPreview]"},
+        "read_full": {"args": ["project_id: str"], "returns": "ProjectFull"},
+        "submit_response": {"args": ["project_id", "text", "price"], "returns": "SubmitResult"},
+        "monitor_replies": {"returns": "list[ReplyEvent]"}
+      }
+    },
+    "BrowserClient": {
+      "methods": {
+        "navigate": {"args": ["url: str"]},
+        "snapshot": {"returns": "str"},
+        "click": {"args": ["ref_or_selector"]},
+        "fill": {"args": ["ref_or_selector", "text"]},
+        "evaluate": {"args": ["js: str"], "returns": "Any"},
+        "screenshot": {"returns": "bytes"}
+      },
+      "implementations": ["CursorBrowserAdapter", "ExternalBrowserMcpAdapter"]
+    },
+    "ProjectPreview": {
+      "fields": ["platform", "source_key", "project_id", "url", "title", "budget_text", "published_at", "responses_count"]
+    },
+    "ProjectFull": {
+      "fields": ["platform", "source_key", "project_id", "url", "title", "full_description", "desired_budget", "max_budget", "offers_count", "buyer", "buyer_hire_rate", "time_left", "tags"]
+    },
+    "GptScoreResult": {
+      "fields": ["score", "fit", "reason", "matched_skills", "risks", "suggested_project_type", "competition_level", "recommendation"]
+    }
+  },
+  "external_apis": {
+    "openai_chat_completions": {
+      "base_url_env": "OPENAI_BASE_URL",
+      "auth": "Bearer OPENAI_API_KEY",
+      "endpoints": {
+        "POST /chat/completions": {
+          "uses": ["GptScorer", "GptResponseGenerator"],
+          "model_env": "OPENAI_MODEL"
+        }
+      }
+    },
+    "lightrag_mcp": {
+      "server": "user-lightrag",
+      "tool": "search_knowledge_base",
+      "params": {"query": "string", "mode": "mix", "only_need_context": true}
+    },
+    "telegram_bot_api": {
+      "uses": ["TelegramReviewBot"],
+      "methods": ["sendMessage", "editMessageReplyMarkup", "answerCallbackQuery"],
+      "callbacks": ["approve", "reject", "open_url"]
+    },
+    "browser_mcp_external": {
+      "path_env": "BROWSERMCP_SERVER",
+      "tools": ["browser_navigate", "browser_snapshot", "browser_click", "browser_fill", "browser_take_screenshot"]
+    },
+    "cursor_ide_browser": {
+      "tools": ["browser_navigate", "browser_snapshot", "browser_click", "browser_fill", "browser_cdp"]
+    }
+  },
+  "persistence": {
+    "sqlite": {
+      "path": "data/seen_projects.db",
+      "tables": {
+        "projects": {
+          "pk": ["platform", "source_key", "project_id"],
+          "columns": ["first_seen_at", "published_at", "status", "fit", "score", "title", "url"]
+        },
+        "scan_state": {
+          "pk": ["source_key"],
+          "columns": ["platform", "last_scan_at", "last_known_project_id", "last_new_project_at"]
+        }
+      }
+    },
+    "excel_journal": {
+      "path_env": "RESPONSE_JOURNAL",
+      "library": "openpyxl"
+    }
+  },
+  "security_notes": [
+    "REQUIRE_TELEGRAM_APPROVAL must gate submit_response",
+    "Redact OPENAI_API_KEY and TELEGRAM_BOT_TOKEN in logs",
+    "No storage of Kwork credentials",
+    "Daily response cap enforced before submit"
+  ],
+  "assumptions": [
+    "GPT returns strict JSON for scoring; parser validates with pydantic",
+    "Browser adapter selected via env BROWSER_ADAPTER=cursor|external"
+  ],
+  "open_questions": []
+}

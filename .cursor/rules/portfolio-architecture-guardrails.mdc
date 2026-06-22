@@ -1,0 +1,14 @@
+---
+description: Архитектурные ограничения портфолио-проекта
+alwaysApply: true
+---
+
+# Portfolio Architecture Guardrails
+
+- UI (`Projects`, `Services`) читает данные из `public/data/*.json`.
+- API (`/api/projects`, `/api/services`) и Prisma работают отдельно; не смешивать с UI JSON без явной задачи.
+- Для UI-изменений меняй `public/data/*`; для API/интеграций меняй Prisma и `/api/*`.
+- Для AI/GitHub анализа используй существующий pipeline `/api/github/analyze`, не дублируй backend-логику.
+- Новые фичи: stateless или через Prisma, с учетом rate-limit и безопасности.
+- Секреты не хардкодить; только ENV (`OPENAI_API_KEY`, `TELEGRAM_BACKEND_API_KEY`, ...).
+- UI-изменения: переиспользуй `components/portfolio/*` и учитывай i18n (`RU/EN`).

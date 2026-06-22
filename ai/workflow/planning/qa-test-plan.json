@@ -1,0 +1,62 @@
+{
+  "version": "2.0.0",
+  "mvp_acceptance_mapping": {
+    "promptFrilance_phase1_1": "PL-2 + PL-4 dedup per source_key",
+    "promptFrilance_phase1_2": "PL-4 through PL-8 full pipeline"
+  },
+  "scenarios": [
+    {
+      "id": "QA-1",
+      "name": "Bootstrap scan skips pipeline",
+      "steps": ["Empty db", "Run scan with SCAN_BOOTSTRAP_SKIP_PIPELINE=true", "Assert all status=skipped", "Assert no TG/GPT calls"],
+      "expected": "No notifications on first run"
+    },
+    {
+      "id": "QA-2",
+      "name": "New project detected only once",
+      "steps": ["Insert known project_id", "Run scan with same id on page", "Assert skipped count"],
+      "expected": "No duplicate processing"
+    },
+    {
+      "id": "QA-3",
+      "name": "GPT reject skips Telegram",
+      "steps": ["Mock scorer fit=false", "Run pipeline", "Assert status not notified"],
+      "expected": "No TG message"
+    },
+    {
+      "id": "QA-4",
+      "name": "Approve required for submit",
+      "steps": ["Attempt submit without approve", "Assert blocked"],
+      "expected": "SubmitResult success=false"
+    },
+    {
+      "id": "QA-5",
+      "name": "Daily limit blocks submit",
+      "steps": ["Set MAX_DAILY_RESPONSES=5 with 5 today", "Approve new", "Assert blocked + TG alert"],
+      "expected": "No browser submit"
+    },
+    {
+      "id": "QA-6",
+      "name": "Excel journal append",
+      "steps": ["Mock successful submit", "Assert new row in xlsx copy"],
+      "expected": "Platform column Kwork"
+    },
+    {
+      "id": "QA-7",
+      "name": "Reject callback",
+      "steps": ["Send TG reject", "Assert status=rejected", "Rescan same project"],
+      "expected": "No second TG card"
+    },
+    {
+      "id": "QA-8",
+      "name": "Browser adapter factory",
+      "steps": ["Set BROWSER_ADAPTER=cursor and external", "Assert correct class"],
+      "expected": "Factory returns expected adapter"
+    }
+  ],
+  "manual_checks": [
+    "Kwork login session present before live submit",
+    "Live scan on c=41 returns parseable cards",
+    "Telegram buttons work on mobile/desktop"
+  ]
+}

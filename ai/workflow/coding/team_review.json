@@ -1,0 +1,22 @@
+{
+  "version": "2.0.0",
+  "review_date": "2026-06-22",
+  "verdict": "approved_for_mvp_smoke",
+  "gates": {
+    "qa": "passed",
+    "security_manual": "passed",
+    "simplify": "deferred",
+    "efficiency": "deferred"
+  },
+  "open_items": [
+    "Live BrowserMCP wiring for CursorBrowserAdapter",
+    "monitor_replies stub — phase 1 partial",
+    "Manual smoke: Kwork session + TG buttons"
+  ],
+  "security_notes": [
+    "REQUIRE_TELEGRAM_APPROVAL gates submit in orchestrator and review_service",
+    "No Kwork password in codebase",
+    "Secrets via pydantic-settings from env only",
+    "DRY_RUN_SUBMIT for safe testing"
+  ]
+}

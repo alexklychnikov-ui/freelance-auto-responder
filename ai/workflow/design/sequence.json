@@ -1,0 +1,74 @@
+{
+  "version": "2.0.0",
+  "flows": [
+    {
+      "id": "SF1",
+      "name": "PeriodicScanNewProjects",
+      "actors": ["Scheduler", "KworkAdapter", "BrowserClient", "SeenProjectsRepository"],
+      "steps": [
+        {"from": "Scheduler", "to": "KworkAdapter", "action": "scan_new() for enabled source kwork_dev_it"},
+        {"from": "KworkAdapter", "to": "BrowserClient", "action": "navigate https://kwork.ru/projects?c=41"},
+        {"from": "BrowserClient", "to": "KworkAdapter", "action": "snapshot/CDP extract card list page 1"},
+        {"from": "KworkAdapter", "to": "SeenProjectsRepository", "action": "filter unknown project_ids, early-exit after 5 known"},
+        {"from": "KworkAdapter", "to": "Scheduler", "action": "return list[ProjectPreview]"},
+        {"from": "Scheduler", "to": "SeenProjectsRepository", "action": "insert status=new or bootstrap skipped"}
+      ],
+      "alt": [
+        {"condition": "bootstrap first run", "action": "mark all page1 as skipped, no pipeline"},
+        {"condition": "CAPTCHA detected", "action": "stop scan, Telegram alert"}
+      ]
+    },
+    {
+      "id": "SF2",
+      "name": "ScoreAndNotify",
+      "actors": ["PipelineOrchestrator", "KworkAdapter", "LightRagClient", "GptScorer", "TelegramReviewBot"],
+      "steps": [
+        {"from": "PipelineOrchestrator", "to": "KworkAdapter", "action": "read_full(project_id)"},
+        {"from": "PipelineOrchestrator", "to": "LightRagClient", "action": "search stack context (mix)"},
+        {"from": "PipelineOrchestrator", "to": "LightRagClient", "action": "search response rules (mix)"},
+        {"from": "PipelineOrchestrator", "to": "GptScorer", "action": "score(project + contexts)"},
+        {"from": "GptScorer", "to": "PipelineOrchestrator", "action": "score JSON"},
+        {"from": "PipelineOrchestrator", "to": "TelegramReviewBot", "action": "send card if fit and score>=MIN_GPT_SCORE"},
+        {"from": "TelegramReviewBot", "to": "Freelancer", "action": "inline [Откликнуть][Пропустить][Открыть]"}
+      ],
+      "alt": [
+        {"condition": "fit=false or score<7", "action": "status=skipped/rejected, no TG"}
+      ]
+    },
+    {
+      "id": "SF3",
+      "name": "ApproveAndSubmit",
+      "actors": ["Freelancer", "TelegramReviewBot", "GptResponseGenerator", "KworkAdapter", "JournalWriter"],
+      "steps": [
+        {"from": "Freelancer", "to": "TelegramReviewBot", "action": "callback approve"},
+        {"from": "TelegramReviewBot", "to": "DailyResponseLimiter", "action": "check MAX_DAILY_RESPONSES"},
+        {"from": "TelegramReviewBot", "to": "GptResponseGenerator", "action": "generate response text"},
+        {"from": "TelegramReviewBot", "to": "KworkAdapter", "action": "submit_response(project_id, text, price)"},
+        {"from": "KworkAdapter", "to": "BrowserClient", "action": "navigate project, click Предложить услугу, fill, submit"},
+        {"from": "KworkAdapter", "to": "JournalWriter", "action": "append Excel row on success"},
+        {"from": "TelegramReviewBot", "to": "Freelancer", "action": "confirm submitted or login required"}
+      ],
+      "alt": [
+        {"condition": "reject callback", "action": "status=rejected"},
+        {"condition": "24h timeout", "action": "auto reject"},
+        {"condition": "not logged in", "action": "TG alert, pause submit"}
+      ]
+    },
+    {
+      "id": "SF4",
+      "name": "MonitorBuyerReply",
+      "actors": ["Scheduler", "KworkAdapter", "TelegramReviewBot", "JournalWriter"],
+      "steps": [
+        {"from": "Scheduler", "to": "KworkAdapter", "action": "monitor_replies() for submitted projects"},
+        {"from": "KworkAdapter", "to": "Scheduler", "action": "ReplyEvent list"},
+        {"from": "Scheduler", "to": "TelegramReviewBot", "action": "notify new buyer message"},
+        {"from": "Scheduler", "to": "JournalWriter", "action": "update Excel Результат общения"}
+      ]
+    }
+  ],
+  "assumptions": [
+    "Telegram bot runs concurrently with scheduler daemon (asyncio tasks)",
+    "Pending offer context persisted before waiting for callback"
+  ],
+  "open_questions": []
+}

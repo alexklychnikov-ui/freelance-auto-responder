@@ -1,0 +1,54 @@
+{
+  "version": "1.0.0",
+  "stages": [
+    {
+      "name": "research",
+      "code_allowed": false,
+      "must_not": [
+        "propose_solutions",
+        "invent_missing_facts"
+      ],
+      "required_outputs": [
+        "fact_log",
+        "ambiguity_questions"
+      ],
+      "exit_gate": "all_facts_sourced_and_ambiguities_logged"
+    },
+    {
+      "name": "design",
+      "code_allowed": false,
+      "required_outputs": [
+        "c4",
+        "dfd",
+        "sequence"
+      ],
+      "optional_outputs": [
+        "api_contract",
+        "migration_plan",
+        "security_notes"
+      ],
+      "exit_gate": "artifacts_consistent_and_reviewed"
+    },
+    {
+      "name": "planning",
+      "code_allowed": false,
+      "required_outputs": [
+        "step_plan",
+        "acceptance_criteria_per_step",
+        "verification_plan"
+      ],
+      "exit_gate": "all_steps_testable_and_ordered"
+    },
+    {
+      "name": "coding",
+      "code_allowed": true,
+      "orchestrator_writes_code": false,
+      "required_outputs": [
+        "subagent_reports",
+        "team_review",
+        "stage_checkpoint"
+      ],
+      "exit_gate": "checks_pass_and_findings_resolved"
+    }
+  ]
+}
