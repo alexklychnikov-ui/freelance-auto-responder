@@ -8,18 +8,42 @@ from src.models import ProjectFull
 def _parse_amounts(text: str | None) -> list[int]:
     if not text:
         return []
-    return [int(n) for n in re.findall(r"\d[\d\s]*", text.replace("\u00a0", " ")) if n.strip()]
+    return [
+        int(n.replace(" ", "").replace("\u00a0", ""))
+        for n in re.findall(r"\d[\d\s]*", text.replace("\u00a0", " "))
+        if n.strip()
+    ]
+
+
+def _budget_amounts(project: ProjectFull) -> list[int]:
+    amounts: list[int] = []
+    for raw in (project.max_budget, project.desired_budget, project.full_description):
+        amounts.extend(_parse_amounts(raw))
+    return amounts
+
+
+def clamp_price_to_budget(price: int, project: ProjectFull) -> int:
+    amounts = _budget_amounts(project)
+    if not amounts:
+        return max(500, price)
+    max_budget = max(amounts)
+    min_budget = min(amounts)
+    if len(amounts) >= 2:
+        desired = min(amounts)
+        capped = min(price, max_budget)
+        return max(min_budget, capped) if desired <= max_budget else capped
+    return min(price, max_budget) if price > max_budget else max(500, price)
 
 
 def suggest_offer_price(project: ProjectFull) -> str:
-    amounts: list[int] = []
-    for raw in (project.max_budget, project.desired_budget):
-        amounts.extend(_parse_amounts(raw))
+    amounts = _budget_amounts(project)
     if not amounts:
-        return "5000"
+        return "8000"
     if len(amounts) >= 2:
-        return str(max(amounts))
+        desired, maximum = min(amounts), max(amounts)
+        target = int(desired + (maximum - desired) * 0.6)
+        return str(clamp_price_to_budget(target, project))
     value = amounts[0]
     if project.max_budget:
-        return str(value)
-    return str(max(value, int(value * 1.5)))
+        return str(clamp_price_to_budget(value, project))
+    return str(max(value, int(value * 1.2)))

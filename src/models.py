@@ -44,6 +44,12 @@ class GptScoreResult(BaseModel):
     recommendation: Literal["откликаться", "пропустить", "наблюдать"]
 
 
+class OfferTerms(BaseModel):
+    price_rub: int = Field(ge=500)
+    delivery_days: int = Field(ge=1, le=60)
+    plan_summary: str = ""
+
+
 class SubmitResult(BaseModel):
     success: bool
     project_id: str

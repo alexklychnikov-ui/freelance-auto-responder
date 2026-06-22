@@ -11,7 +11,7 @@ try:
     print("logged_in_before", is_logged_in(browser))
     ensure_logged_in(browser, creds, force=True)
     print("logged_in_after", is_logged_in(browser))
-    browser.navigate("https://kwork.ru/projects?c=41")
+    browser.navigate("https://kwork.ru/projects?c=11")
     n = browser.evaluate("document.querySelectorAll('a[href*=\"/projects/\"]').length")
     print("project_links", n)
 except Exception as e:

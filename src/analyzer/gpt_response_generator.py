@@ -7,16 +7,18 @@ import httpx
 
 from src.config import Settings
 from src.models import ProjectFull
+from src.responses.portfolio_link import PORTFOLIO_URL, ensure_portfolio_link
 
 logger = logging.getLogger(__name__)
 
-GENERATION_SYSTEM_PROMPT = """\
+GENERATION_SYSTEM_PROMPT = f"""\
 Напиши отклик на фриланс-проект для Александра Клычниковова (Python/AI/Telegram/MVP).
 
 Правила:
 - Первый абзац: внимание + фокус + польза (конкретно про ЭТОТ проект)
 - Показать понимание задачи (2-4 буллета)
 - Релевантный кейс (1-2 ссылки GitHub/портфолио)
+- ОБЯЗАТЕЛЬНО укажи ссылку на портфолио: {PORTFOLIO_URL}
 - Сроки/бюджет — ориентир, не выдумывать точную цену без ТЗ
 - Тон: уверенный, по делу, без «здравствуйте уважаемые»
 - Длина: 1500-2500 знаков
@@ -85,4 +87,4 @@ class GptResponseGenerator:
         response = self._get_client().post(url, headers=headers, json=body)
         response.raise_for_status()
         data = response.json()
-        return str(data["choices"][0]["message"]["content"]).strip()
+        return ensure_portfolio_link(str(data["choices"][0]["message"]["content"]).strip())

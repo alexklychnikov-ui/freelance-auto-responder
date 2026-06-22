@@ -2,7 +2,7 @@ sources:
   - id: kwork_dev_it
     platform: kwork
     enabled: true
-    url: https://kwork.ru/projects?c=41
+    url: https://kwork.ru/projects?c=11
     scan_interval_minutes: 30
     bootstrap: true
 

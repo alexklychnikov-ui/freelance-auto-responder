@@ -1,7 +1,7 @@
 from src.browser.playwright_adapter import PlaywrightBrowserAdapter
 
 b = PlaywrightBrowserAdapter()
-b.navigate("https://kwork.ru/projects?c=41")
+b.navigate("https://kwork.ru/projects?c=11")
 p = b._ensure_page()
 info = p.evaluate("""() => {
   const links = [...document.querySelectorAll('a[href*="/projects/"]')].slice(0,3);

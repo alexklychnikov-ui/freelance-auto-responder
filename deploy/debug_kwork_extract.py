@@ -2,7 +2,7 @@ from src.browser.playwright_adapter import PlaywrightBrowserAdapter
 from src.adapters.kwork import LISTING_EXTRACTOR_JS
 
 b = PlaywrightBrowserAdapter()
-b.navigate("https://kwork.ru/projects?c=41")
+b.navigate("https://kwork.ru/projects?c=11")
 p = b._ensure_page()
 checks = p.evaluate("""() => ({
   articles: document.querySelectorAll('article.project-card, [data-project-id], a[href*="/projects/"]').length,

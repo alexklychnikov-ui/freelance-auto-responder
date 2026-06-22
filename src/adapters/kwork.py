@@ -90,6 +90,13 @@ PROJECT_EXTRACTOR_JS = """
     .map(el => el.textContent.trim())
     .filter(Boolean);
 
+  const pageText = (root.textContent || '').replace(/\\s+/g, ' ');
+  const findBudget = (pattern) => {
+    const re = new RegExp(pattern + '[^₽]{0,40}([\\d\\s]+)\\s*₽', 'i');
+    const m = pageText.match(re);
+    return m ? m[1].replace(/\\s/g, ' ').trim() + ' ₽' : null;
+  };
+
   const offersRaw = root.querySelector('.offers-count, [data-offers]');
   let offers = null;
   if (offersRaw) {
@@ -102,8 +109,15 @@ PROJECT_EXTRACTOR_JS = """
     url: location.href,
     title: (titleEl?.textContent || '').trim(),
     full_description: (descEl?.textContent || descEl?.getAttribute('data-description') || '').trim(),
-    desired_budget: root.querySelector('.desired-budget, [data-desired-budget]')?.textContent?.trim() || null,
-    max_budget: root.querySelector('.max-budget, [data-max-budget]')?.textContent?.trim() || null,
+    desired_budget:
+      root.querySelector('.desired-budget, [data-desired-budget]')?.textContent?.trim()
+      || findBudget('желаем')
+      || null,
+    max_budget:
+      root.querySelector('.max-budget, [data-max-budget]')?.textContent?.trim()
+      || findBudget('допустим')
+      || findBudget('до')
+      || null,
     offers_count: offers,
     buyer: root.querySelector('.buyer-link, [data-buyer]')?.textContent?.trim() || null,
     buyer_hire_rate: root.querySelector('.buyer-hire-rate, [data-buyer-hire-rate]')?.textContent?.trim() || null,
@@ -196,18 +210,70 @@ def _build_offer_fill_js(text: str, price: str, delivery_days: int) -> str:
   );
   if (payCard) payCard.click();
 
-  let daysSet = false;
-  for (const sel of document.querySelectorAll('select')) {{
-    const opt = [...sel.options].find((o) =>
-      (o.textContent || '').includes(payload.days + ' дн')
-    );
-    if (opt) {{
-      sel.value = opt.value;
-      sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
-      daysSet = true;
-      break;
-    }}
+  function dayLabel(days) {{
+    if (days % 10 === 1 && days % 100 !== 11) return days + ' день';
+    if (days % 10 >= 2 && days % 10 <= 4 && (days % 100 < 10 || days % 100 >= 20)) return days + ' дня';
+    return days + ' дней';
   }}
+
+  function pickDeadlineOption(days) {{
+    const patterns = [
+      days + ' дн',
+      dayLabel(days),
+      String(days),
+    ];
+    const nodes = [
+      ...document.querySelectorAll('select option'),
+      ...document.querySelectorAll('.multiselect__option, .v-list-item, li[role="option"], [class*="option"]'),
+    ];
+    let best = null;
+    let bestDiff = Infinity;
+    for (const node of nodes) {{
+      const text = (node.textContent || '').replace(/\\s+/g, ' ').trim();
+      if (!text) continue;
+      if (patterns.some((p) => text.includes(p))) return node;
+      const m = text.match(/(\\d{{1,2}})\\s*дн/i);
+      if (m) {{
+        const diff = Math.abs(parseInt(m[1], 10) - days);
+        if (diff < bestDiff) {{
+          bestDiff = diff;
+          best = node;
+        }}
+      }}
+    }}
+    return best;
+  }}
+
+  function setDeadline(days) {{
+    for (const sel of document.querySelectorAll('select')) {{
+      const opt = pickDeadlineOption(days);
+      if (opt && opt.tagName === 'OPTION') {{
+        sel.value = opt.value;
+        sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        return true;
+      }}
+    }}
+
+    const triggers = [
+      ...document.querySelectorAll('.multiselect, .multiselect__select, [class*="deadline"], [class*="duration"]'),
+      ...[...document.querySelectorAll('label, .field-name, .form-field__name')].filter((el) =>
+        /срок выполнения/i.test(el.textContent || '')
+      ).map((el) => el.closest('.form-field, .field, .form-item, div')?.querySelector('.multiselect, input, button, [role="combobox"]'))
+        .filter(Boolean),
+    ];
+
+    for (const trigger of triggers) {{
+      try {{ trigger.click(); }} catch (e) {{}}
+      const opt = pickDeadlineOption(days);
+      if (opt) {{
+        try {{ opt.click(); }} catch (e) {{}}
+        return true;
+      }}
+    }}
+    return false;
+  }}
+
+  const daysSet = setDeadline(payload.days);
 
   const submitBtn = [...document.querySelectorAll('button, input[type="submit"]')].find((el) =>
     /^предложить$/i.test((el.textContent || el.value || '').trim())
@@ -222,6 +288,10 @@ def _build_offer_fill_js(text: str, price: str, delivery_days: int) -> str:
   }};
 }})()
 """
+
+
+def kwork_offer_form_url(project_id: str) -> str:
+    return f"https://kwork.ru/new_offer?project={project_id}"
 
 
 def _parse_listing_block(block: str) -> dict[str, Any] | None:

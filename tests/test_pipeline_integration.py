@@ -128,7 +128,7 @@ def _make_orchestrator(
         prepared_store=PreparedResponseStore(
             Path(settings.database_path).parent / "prepared"
         ),
-        adapter_factory=lambda _s: mock_adapter,
+        adapter_factory=lambda _s, _b=None: mock_adapter,
         browser=MagicMock(),
     )
     return orch, mock_scorer, mock_tg, mock_adapter

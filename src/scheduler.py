@@ -166,7 +166,7 @@ def cmd_browser_smoke() -> int:
         logger.info("BrowserMCP smoke: ensure kwork session")
         ensure_logged_in(client, creds)
         logger.info("BrowserMCP smoke: navigate kwork listing")
-        client.navigate("https://kwork.ru/projects?c=41")
+        client.navigate("https://kwork.ru/projects?c=11")
         snap = client.snapshot()
         logger.info("snapshot length=%s chars", len(snap))
         cards = client.evaluate(

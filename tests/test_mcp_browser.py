@@ -51,12 +51,12 @@ def test_external_adapter_delegates_to_session() -> None:
         server_path="C:/x/index.js",
         session=fake,  # type: ignore[arg-type]
     )
-    adapter.navigate("https://kwork.ru/projects?c=41")
+    adapter.navigate("https://kwork.ru/projects?c=11")
     adapter.snapshot()
     adapter.evaluate("1+1")
     adapter.click(".btn")
     adapter.fill("textarea", "hello")
-    assert fake.calls[0] == ("navigate", {"url": "https://kwork.ru/projects?c=41"})
+    assert fake.calls[0] == ("navigate", {"url": "https://kwork.ru/projects?c=11"})
 
 
 def test_close_browser_client() -> None:

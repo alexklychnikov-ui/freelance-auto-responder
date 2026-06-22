@@ -4,7 +4,7 @@ from src.adapters.kwork import KworkAdapter
 browser = PlaywrightBrowserAdapter()
 adapter = KworkAdapter(
     source_key="kwork_dev_it",
-    listing_url="https://kwork.ru/projects?c=41",
+    listing_url="https://kwork.ru/projects?c=11",
     browser=browser,
     auto_login=False,
 )

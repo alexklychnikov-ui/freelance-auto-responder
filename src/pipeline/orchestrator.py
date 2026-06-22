@@ -4,22 +4,22 @@ import asyncio
 import html
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any
 
 from src.adapters.kwork_auth import KworkAuthError
-from src.adapters.kwork import KworkAdapter
+from src.adapters.kwork import KworkAdapter, kwork_offer_form_url
 from src.adapters.kwork_auth import KworkCredentials
 from src.analyzer.examples_loader import load_response_examples
+from src.analyzer.gpt_offer_estimator import GptOfferEstimator
 from src.analyzer.gpt_response_generator import GptResponseGenerator
 from src.analyzer.gpt_scorer import GptScorer
 from src.analyzer.lightrag_client import LightRagClient
 from src.browser.factory import close_browser_client, get_browser_client
-from src.adapters.kwork_pricing import suggest_offer_price
 from src.config import Settings, SourceConfig, get_enabled_sources, get_settings
 from src.journal.writer import JournalWriter
 from src.limits.daily import is_daily_limit_reached
 from src.models import PendingOffer, ProjectFull
+from src.responses.portfolio_link import ensure_portfolio_link
 from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
 from src.store.repository import ProjectRepository
 from src.telegram_bot.bot import TelegramReviewBot
@@ -40,6 +40,7 @@ class PipelineOrchestrator:
         lightrag: LightRagClient,
         journal: JournalWriter,
         prepared_store: PreparedResponseStore,
+        offer_estimator: GptOfferEstimator | None = None,
         *,
         adapter_factory: Any | None = None,
         browser: Any | None = None,
@@ -52,6 +53,7 @@ class PipelineOrchestrator:
         self.lightrag = lightrag
         self.journal = journal
         self.prepared_store = prepared_store
+        self.offer_estimator = offer_estimator or GptOfferEstimator(settings)
         self._browser = browser
         self._adapter_factory = adapter_factory or self._default_adapter
         self.review_service.set_approve_handler(self.handle_approve_click)
@@ -61,6 +63,7 @@ class PipelineOrchestrator:
         if self._browser is not None:
             close_browser_client(self._browser)
             self._browser = None
+        self.offer_estimator.close()
 
     def _get_browser(self):
         if self._browser is None:
@@ -92,9 +95,8 @@ class PipelineOrchestrator:
         self.review_service.expire_stale_pending()
 
         for source in get_enabled_sources(self.settings.sources_config_path):
-            adapter = self._adapter_factory(source)
             try:
-                previews = await asyncio.to_thread(adapter.scan_new)
+                previews = await asyncio.to_thread(self._scan_listings, source)
             except KworkAuthError as exc:
                 logger.error("Kwork auth failed for %s: %s", source.id, exc)
                 await self.review_service.tg_bot.notify(
@@ -151,7 +153,7 @@ class PipelineOrchestrator:
                 totals["new"] += 1
                 new_in_source += 1
 
-                await self._process_new_project(adapter, preview)
+                await self._process_new_project(source, preview)
 
             max_id = max(
                 (int(p.project_id) for p in previews if p.project_id.isdigit()),
@@ -179,8 +181,24 @@ class PipelineOrchestrator:
 
         return totals
 
-    async def _process_new_project(self, adapter: Any, preview: Any) -> None:
-        full = await asyncio.to_thread(adapter.read_full, preview.project_id)
+    def _scan_listings(self, source: SourceConfig) -> list[Any]:
+        browser = get_browser_client(self.settings)
+        try:
+            adapter = self._adapter_factory(source, browser)
+            return adapter.scan_new()
+        finally:
+            close_browser_client(browser)
+
+    def _read_full_listing(self, source: SourceConfig, project_id: str) -> ProjectFull:
+        browser = get_browser_client(self.settings)
+        try:
+            adapter = self._adapter_factory(source, browser)
+            return adapter.read_full(project_id)
+        finally:
+            close_browser_client(browser)
+
+    async def _process_new_project(self, source: SourceConfig, preview: Any) -> None:
+        full = await asyncio.to_thread(self._read_full_listing, source, preview.project_id)
         context = await asyncio.to_thread(self.lightrag.get_full_context)
         examples = await asyncio.to_thread(
             load_response_examples, self.settings.response_examples_dir
@@ -279,7 +297,7 @@ class PipelineOrchestrator:
             )
             return
 
-        offer.response_text = text.strip()
+        offer.response_text = ensure_portfolio_link(text.strip())
         self.review_service.store.save(offer)
 
         if self.settings.prepare_only_no_submit:
@@ -308,9 +326,17 @@ class PipelineOrchestrator:
             )
             return
 
-        price = suggest_offer_price(offer.project)
-        delivery_days = self.settings.default_offer_days
         response_text = offer.response_text or ""
+        context = await asyncio.to_thread(self.lightrag.get_full_context)
+        terms = await asyncio.to_thread(
+            self.offer_estimator.estimate,
+            offer.project,
+            response_text,
+            lightrag_context=context,
+        )
+        price = str(terms.price_rub)
+        delivery_days = terms.delivery_days
+        offer_url = kwork_offer_form_url(offer.project_id)
 
         def _run_prepare():
             browser = get_browser_client(self.settings)
@@ -324,18 +350,17 @@ class PipelineOrchestrator:
                     price,
                     delivery_days=delivery_days,
                 )
-                screenshot = browser.screenshot()
-                return result, screenshot, price
+                return result
             finally:
                 close_browser_client(browser)
 
         try:
             await self.review_service.tg_bot.notify(
                 f"⏳ Заполняю форму Kwork: {offer.title}\n"
-                f"Цена: {price} ₽ · Срок: {delivery_days} дн.\n"
+                f"Оценка: {price} ₽ · {delivery_days} дн.\n"
                 "Кнопку «Предложить» не нажимаю."
             )
-            result, screenshot, price = await asyncio.to_thread(_run_prepare)
+            result = await asyncio.to_thread(_run_prepare)
         except Exception as exc:
             logger.exception("prepare_failed project_id=%s", offer.project_id)
             await self._save_prepared_response(
@@ -343,7 +368,6 @@ class PipelineOrchestrator:
                 response_text,
                 price,
                 delivery_days,
-                screenshot=None,
                 lock_offer=False,
             )
             await self.review_service.tg_bot.notify(
@@ -359,7 +383,6 @@ class PipelineOrchestrator:
                 response_text,
                 price,
                 delivery_days,
-                screenshot=screenshot,
                 lock_offer=False,
             )
             msg = result.message or "unknown"
@@ -378,20 +401,13 @@ class PipelineOrchestrator:
             return
 
         await self._save_prepared_response(
-            offer, response_text, price, delivery_days, screenshot=screenshot
-        )
-        await self.review_service.tg_bot.send_photo(
-            screenshot,
-            caption=(
-                f"🧪 Форма заполнена (без отправки)\n"
-                f"{offer.title}\n"
-                f"Цена: {price} ₽ · {delivery_days} дн.\n"
-                "Excel: Sync-Journal.bat на ПК"
-            ),
+            offer, response_text, price, delivery_days
         )
         await self.review_service.tg_bot.notify(
-            f"✅ Готово: {offer.title}\n"
-            f"ID: {offer.project_id} · {len(response_text)} символов\n"
+            f"✅ Форма заполнена (без отправки)\n"
+            f"{html.escape(offer.title)}\n"
+            f"Цена: {price} ₽ · Срок: {delivery_days} дн.\n"
+            f"🔗 {offer_url}\n"
             "Excel: Sync-Journal.bat на ПК"
         )
 
@@ -402,17 +418,8 @@ class PipelineOrchestrator:
         price: str,
         delivery_days: int,
         *,
-        screenshot: bytes | None,
         lock_offer: bool = True,
     ) -> None:
-        shot_path: str | None = None
-        if screenshot:
-            shots_dir = Path(self.settings.prepared_responses_dir) / "screenshots"
-            shots_dir.mkdir(parents=True, exist_ok=True)
-            path = shots_dir / f"{offer.platform}_{offer.source_key}_{offer.project_id}.png"
-            path.write_bytes(screenshot)
-            shot_path = str(path)
-
         prepared = PreparedResponse(
             platform=offer.platform,
             source_key=offer.source_key,
@@ -424,7 +431,7 @@ class PipelineOrchestrator:
             response_text=response_text,
             price=price,
             delivery_days=delivery_days,
-            screenshot_path=shot_path,
+            screenshot_path=None,
         )
         self.prepared_store.save(prepared)
         if lock_offer:
@@ -548,6 +555,7 @@ def build_orchestrator(settings: Settings | None = None) -> PipelineOrchestrator
     )
     journal = JournalWriter(settings.response_journal)
     prepared_store = PreparedResponseStore(settings.prepared_responses_dir)
+    offer_estimator = GptOfferEstimator(settings)
     return PipelineOrchestrator(
         settings=settings,
         repository=repository,
@@ -557,4 +565,5 @@ def build_orchestrator(settings: Settings | None = None) -> PipelineOrchestrator
         lightrag=lightrag,
         journal=journal,
         prepared_store=prepared_store,
+        offer_estimator=offer_estimator,
     )

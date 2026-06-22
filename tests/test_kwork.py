@@ -75,7 +75,7 @@ def test_kwork_adapter_scan_new(listing_html: str, project_html: str) -> None:
     browser = FakeBrowser(listing_html, project_html)
     adapter = KworkAdapter(
         source_key="kwork_dev_it",
-        listing_url="https://kwork.ru/projects?c=41",
+        listing_url="https://kwork.ru/projects?c=11",
         browser=browser,
         auto_login=False,
     )
@@ -90,7 +90,7 @@ def test_kwork_adapter_read_full(listing_html: str, project_html: str) -> None:
     browser = FakeBrowser(listing_html, project_html)
     adapter = KworkAdapter(
         source_key="kwork_dev_it",
-        listing_url="https://kwork.ru/projects?c=41",
+        listing_url="https://kwork.ru/projects?c=11",
         browser=browser,
         auto_login=False,
     )
@@ -116,7 +116,7 @@ def test_kwork_submit_dry_run(listing_html: str, project_html: str) -> None:
 
     adapter = KworkAdapter(
         source_key="kwork_dev_it",
-        listing_url="https://kwork.ru/projects?c=41",
+        listing_url="https://kwork.ru/projects?c=11",
         browser=browser,
         dry_run_submit=True,
         auto_login=False,
@@ -140,7 +140,7 @@ def test_kwork_submit_live_click(listing_html: str, project_html: str) -> None:
 
     adapter = KworkAdapter(
         source_key="kwork_dev_it",
-        listing_url="https://kwork.ru/projects?c=41",
+        listing_url="https://kwork.ru/projects?c=11",
         browser=browser,
         dry_run_submit=False,
         auto_login=False,
