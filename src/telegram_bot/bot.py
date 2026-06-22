@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 from typing import Any
 
@@ -28,6 +29,30 @@ PLATFORM_LABELS = {
 CALLBACK_APPROVE = "approve"
 CALLBACK_REJECT = "reject"
 CALLBACK_OPEN = "open"
+
+
+def _chunk_text(text: str, max_len: int = 4000) -> list[str]:
+    body = text.strip()
+    if len(body) <= max_len:
+        return [body]
+    chunks: list[str] = []
+    start = 0
+    while start < len(body):
+        end = min(start + max_len, len(body))
+        if end < len(body):
+            split = body.rfind("\n\n", start, end)
+            if split > start + 200:
+                end = split
+        chunks.append(body[start:end].strip())
+        start = end
+    return [c for c in chunks if c]
+
+
+def _project_view_url(url: str) -> str:
+    base = url.rstrip("/")
+    if base.endswith("/view"):
+        return base
+    return f"{base}/view"
 
 
 def _callback_data(action: str, platform: str, source_key: str, project_id: str) -> str:
@@ -125,7 +150,7 @@ class TelegramReviewBot:
                 await callback.answer("Некорректный callback")
                 return
             _, platform, source_key, project_id = parsed
-            await callback.answer("Генерирую черновик…")
+            await callback.answer("Готовлю отклик для формы…")
             await on_approve(platform, source_key, project_id, callback)
 
         @self._dp.callback_query(F.data.startswith(f"{CALLBACK_REJECT}:"))
@@ -141,7 +166,7 @@ class TelegramReviewBot:
         async def handle_start(message: Message) -> None:
             await message.answer(
                 "Freelance Auto-Responder\n"
-                "Отклик: карточка → черновик → reply → prepare на Kwork.\n"
+                "Отклик: карточка → автозаполнение формы на Kwork (VPS).\n"
                 "Excel: запусти Sync-Journal.bat на ПК."
             )
 
@@ -163,21 +188,50 @@ class TelegramReviewBot:
         )
         return msg.message_id
 
-    async def send_draft_for_edit(self, offer: PendingOffer, draft: str) -> int:
-        text = (
-            f"✍️ <b>Черновик отклика</b> · {offer.title}\n"
-            f"🔗 {offer.url}\n\n"
-            f"{draft}\n\n"
-            "—\n"
-            "Отредактируйте и отправьте <b>ответом на это сообщение</b> "
-            "финальный текст для публикации на Kwork."
-        )
+    async def send_offer_link(self, offer: PendingOffer) -> int:
+        view_url = html.escape(_project_view_url(offer.url), quote=True)
+        safe_title = html.escape(offer.title, quote=False)
+        text = f"✍️ <b>Черновик отклика</b> · {safe_title}\n🔗 {view_url}"
         msg = await self._bot.send_message(
             chat_id=self.chat_id,
             text=text,
             disable_web_page_preview=True,
         )
         return msg.message_id
+
+    async def send_prepared_offer_details(
+        self,
+        offer: PendingOffer,
+        *,
+        response_text: str,
+        price: str,
+        delivery_days: int,
+        deadline_manual: bool = False,
+    ) -> None:
+        view = _project_view_url(offer.url)
+        safe_title = html.escape(offer.title, quote=False)
+        header = (
+            f"✅ <b>Данные для отклика</b>\n"
+            f"📌 {safe_title}\n"
+            f"💰 {html.escape(str(price))} ₽ · {delivery_days} дн.\n"
+            f"🔗 {html.escape(view, quote=True)}\n\n"
+            "Открой заказ → <b>Предложить услугу</b> → вставь текст, цену и срок.\n"
+            "<i>Автозаполнение на VPS не переносится в твой браузер.</i>"
+        )
+        if deadline_manual:
+            header += "\n⚠️ Срок в dropdown — выбери вручную"
+        await self._bot.send_message(
+            chat_id=self.chat_id,
+            text=header,
+            disable_web_page_preview=True,
+        )
+        for i, chunk in enumerate(_chunk_text(response_text)):
+            label = "📝 Текст для поля «Описание»:" if i == 0 else "📝 (продолжение)"
+            await self._bot.send_message(
+                chat_id=self.chat_id,
+                text=f"{label}\n\n{chunk}",
+                parse_mode=None,
+            )
 
     async def mark_review_skipped(self, callback: CallbackQuery) -> None:
         if callback.message is None:
@@ -194,7 +248,7 @@ class TelegramReviewBot:
             return
         base = callback.message.text or callback.message.caption or ""
         await callback.message.edit_text(
-            f"{base}\n\n✅ <b>Черновик отклика отправлен ниже</b>",
+            f"{base}\n\n✅ <b>Готовлю данные для отклика</b>",
             reply_markup=None,
             disable_web_page_preview=True,
         )

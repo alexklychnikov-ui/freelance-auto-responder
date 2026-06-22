@@ -45,7 +45,7 @@ async def _run_test_async() -> int:
             for preview in previews:
                 logger.info("run-test: scoring %s — %s", preview.project_id, preview.title)
                 full = adapter.read_full(preview.project_id)
-                context = orchestrator.lightrag.get_full_context()
+                context = orchestrator.lightrag.get_scoring_context(full)
                 examples = load_response_examples(settings.response_examples_dir)
                 score = orchestrator.scorer.score(full, context, examples=examples)
                 logger.info(

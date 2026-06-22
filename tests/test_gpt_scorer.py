@@ -41,7 +41,43 @@ def project() -> ProjectFull:
 def test_load_scoring_system_prompt() -> None:
     prompt = load_scoring_system_prompt()
     assert "Александра Клычниковова" in prompt
-    assert "score" in prompt
+    assert "не подходит" in prompt.lower() or "не подходит" in prompt
+    assert "мобильн" in prompt.lower() or "android" in prompt.lower()
+    assert len(prompt) > 500
+    assert "risks" in prompt
+
+
+def test_score_guardrails_native_mobile() -> None:
+    from src.analyzer.gpt_scorer import _normalize_score_payload
+
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="1",
+        url="https://kwork.ru/projects/1",
+        title="Проект айро",
+        full_description="веб-версия сайта и два мобильных приложения Android и iOS",
+        desired_budget="20000",
+    )
+    raw = {
+        "score": 10,
+        "fit": True,
+        "reason": "Отлично подходит",
+        "matched_skills": ["Python", "Android"],
+        "risks": [
+            "Отсутствие четкого описания проекта может привести к недопониманию.",
+            "Неизвестный бюджет может ограничить возможности реализации.",
+        ],
+        "suggested_project_type": "Веб-MVP",
+        "competition_level": "medium",
+        "recommendation": "откликаться",
+    }
+    data = _normalize_score_payload(raw, project)
+    assert data["score"] <= 4
+    assert data["fit"] is False
+    assert data["recommendation"] == "пропустить"
+    assert not any("неизвестный бюджет" in r.lower() for r in data["risks"])
+    assert any("android" in r.lower() or "мобил" in r.lower() for r in data["risks"])
 
 
 def test_gpt_scorer_parses_response(settings: Settings, project: ProjectFull) -> None:

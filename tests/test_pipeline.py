@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from src.config import Settings
-from src.models import GptScoreResult, PendingOffer, ProjectFull, ProjectPreview
+from src.models import GptScoreResult, OfferTerms, PendingOffer, ProjectFull, ProjectPreview
 from src.pipeline.orchestrator import PipelineOrchestrator
 from src.store.repository import ProjectRepository
 
@@ -71,6 +71,15 @@ def _make_orchestrator(
     mock_adapter.submit_response.return_value = MagicMock(
         success=True, project_id="999", message="ok"
     )
+    mock_adapter.prepare_response.return_value = MagicMock(
+        success=True, project_id="999", message="prepared"
+    )
+
+    mock_estimator = MagicMock()
+    mock_estimator.estimate.return_value = OfferTerms(
+        price_rub=5000, delivery_days=14, plan_summary=""
+    )
+    mock_estimator.close = MagicMock()
 
     mock_scorer = MagicMock()
     mock_scorer.score.return_value = score
@@ -85,7 +94,7 @@ def _make_orchestrator(
 
     mock_tg = MagicMock()
     mock_tg.send_review_card = AsyncMock(return_value=1)
-    mock_tg.send_draft_for_edit = AsyncMock(return_value=2)
+    mock_tg.send_offer_link = AsyncMock(return_value=2)
     mock_tg.mark_review_skipped = AsyncMock()
     mock_tg.mark_review_approved = AsyncMock()
     mock_tg.send_photo = AsyncMock()
@@ -111,10 +120,11 @@ def _make_orchestrator(
         prepared_store=PreparedResponseStore(
             Path(settings.database_path).parent / "prepared"
         ),
+        offer_estimator=mock_estimator,
         adapter_factory=lambda _s, _b=None: mock_adapter,
         browser=MagicMock(),
     )
-    return orch
+    return orch, mock_adapter
 
 
 @pytest.mark.asyncio
@@ -128,7 +138,7 @@ async def test_pipeline_scan_score_submit(
         url=project_full.url,
         title=project_full.title,
     )
-    orch = _make_orchestrator(
+    orch, mock_adapter = _make_orchestrator(
         settings, previews=[preview], project_full=project_full, score=score
     )
     totals = await orch.run_scan_cycle()
@@ -136,6 +146,7 @@ async def test_pipeline_scan_score_submit(
     assert totals["new"] == 1
     orch.scorer.score.assert_called_once()
     orch.response_generator.generate.assert_called_once()
+    mock_adapter.prepare_response.assert_called_once()
 
     repo = ProjectRepository(settings.database_path)
     assert repo.is_known("kwork", "kwork_dev_it", "999")
@@ -164,7 +175,7 @@ async def test_pipeline_skips_low_score(
         url="https://kwork.ru/projects/888",
         title="Low",
     )
-    orch = _make_orchestrator(
+    orch, _ = _make_orchestrator(
         settings, previews=[preview], project_full=project_full, score=low_score
     )
     await orch.run_scan_cycle()
@@ -183,7 +194,7 @@ async def test_handle_approved_requires_approval_flag(
         url=project_full.url,
         title="x",
     )
-    orch = _make_orchestrator(
+    orch, _ = _make_orchestrator(
         settings, previews=[preview], project_full=project_full, score=score
     )
 
@@ -214,7 +225,7 @@ async def test_handle_approved_unknown_source_notifies(
         url=project_full.url,
         title="x",
     )
-    orch = _make_orchestrator(
+    orch, _ = _make_orchestrator(
         settings, previews=[preview], project_full=project_full, score=score
     )
 
@@ -235,3 +246,38 @@ async def test_handle_approved_unknown_source_notifies(
 
     orch.review_service.tg_bot.notify.assert_called_once()
     assert "unknown_source" in orch.review_service.tg_bot.notify.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_prepare_success_always_notifies(
+    settings: Settings, project_full: ProjectFull, score: GptScoreResult
+) -> None:
+    settings.prepare_only_no_submit = True
+    orch, mock_adapter = _make_orchestrator(
+        settings,
+        previews=[],
+        project_full=project_full,
+        score=score,
+    )
+    mock_adapter.prepare_response.return_value = MagicMock(
+        success=True,
+        project_id=project_full.project_id,
+        message="prepared: form filled, submit not clicked",
+    )
+    offer = PendingOffer(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="999",
+        url=project_full.url,
+        title=project_full.title,
+        project=project_full,
+        score=score,
+        created_at=datetime.now(timezone.utc),
+        status="approved",
+        approved_at=datetime.now(timezone.utc),
+        response_text="Готовый текст отклика для формы.",
+    )
+    await orch._prepare_offer_on_site(offer)
+    notify_texts = [c[0][0] for c in orch.review_service.tg_bot.notify.call_args_list]
+    assert any("Форма заполнена на Kwork" in t for t in notify_texts)
+    assert any("new_offer?project=" in t for t in notify_texts)

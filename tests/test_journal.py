@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pytest
@@ -58,7 +58,12 @@ def test_journal_append_row(journal_path: Path, project: ProjectFull, score: Gpt
     wb = load_workbook(journal_path)
     ws = wb.active
     assert row == 2
-    assert ws.cell(row=2, column=2).value == date.today().isoformat()
+    cell_date = ws.cell(row=2, column=2).value
+    expected = date.today()
+    if isinstance(cell_date, datetime):
+        assert cell_date.date() == expected
+    else:
+        assert cell_date == expected.isoformat()
     assert ws.cell(row=2, column=3).value == "Kwork"
     assert ws.cell(row=2, column=4).value == project.url
     assert ws.cell(row=2, column=5).value == "Telegram-бот"

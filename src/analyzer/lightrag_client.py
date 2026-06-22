@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import logging
-
 from collections.abc import Callable
+from pathlib import Path
 
+from src.analyzer.github_stack import load_github_stack
 from src.analyzer.lightrag_http import search_lightrag_http
+from src.models import ProjectFull
 
-STACK_QUERY = (
-    "Технический стек Александра Клычниковова, проекты портфолио, опыт Python AI "
-    "Telegram парсинг FastAPI Docker. Что из этого применимо к фриланс-задачам разработки?"
+GENERAL_STACK_QUERY = (
+    "Технический стек Александра Клычниковова, проекты портфолио: Python, AI, "
+    "Telegram-боты, FastAPI, LightRAG, RAG, автоматизация, Docker, Next.js. "
+    "Какие типы задач он реально делал по кейсам из портфолио."
 )
 
 RULES_QUERY = (
@@ -27,6 +30,21 @@ def _noop_search(query: str, mode: str) -> str:
     return ""
 
 
+def build_project_stack_query(project: ProjectFull) -> str:
+    parts = [
+        project.title or "",
+        project.full_description or "",
+        " ".join(project.tags or []),
+    ]
+    tz = " ".join(p.strip() for p in parts if p.strip())
+    if len(tz) > 1500:
+        tz = tz[:1500] + "…"
+    return (
+        "Какие проекты и кейсы Александра Клычниковова из портфолио наиболее релевантны "
+        f"этому заказу: {tz}"
+    )
+
+
 class LightRagClient:
     def __init__(
         self,
@@ -34,7 +52,14 @@ class LightRagClient:
         *,
         base_url: str | None = None,
         api_key: str = "",
+        github_username: str = "alexklychnikov-ui",
+        github_token: str = "",
+        github_stack_cache: str = "data/github_stack_cache.json",
     ) -> None:
+        self._github_username = github_username
+        self._github_token = github_token
+        self._github_stack_cache = github_stack_cache
+
         if search_fn is not None:
             self._search_fn = search_fn
         elif base_url:
@@ -52,11 +77,34 @@ class LightRagClient:
         else:
             self._search_fn = _noop_search
 
+    def get_github_stack(self) -> str:
+        return load_github_stack(
+            username=self._github_username,
+            token=self._github_token,
+            cache_path=Path(self._github_stack_cache),
+        )
+
     def search_stack_context(self) -> str:
-        return self._search_fn(STACK_QUERY, "mix")
+        return self._search_fn(GENERAL_STACK_QUERY, "mix")
+
+    def search_project_context(self, project: ProjectFull) -> str:
+        query = build_project_stack_query(project)
+        return self._search_fn(query, "mix")
 
     def search_response_rules(self) -> str:
         return self._search_fn(RULES_QUERY, "mix")
+
+    def get_scoring_context(self, project: ProjectFull) -> str:
+        github_stack = self.get_github_stack()
+        lightrag = self.search_project_context(project)
+        parts = [
+            "## Стек и репозитории GitHub (источник правды для score)\n" + github_stack,
+        ]
+        if lightrag.strip():
+            parts.append(
+                "## Релевантные кейсы из LightRAG по этому заказу\n" + lightrag.strip()
+            )
+        return "\n\n".join(parts)
 
     def get_full_context(self) -> str:
         stack = self.search_stack_context()

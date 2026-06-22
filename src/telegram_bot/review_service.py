@@ -102,6 +102,10 @@ class ReviewService:
         if offer.status != "pending":
             await callback.answer(f"Уже обработано: {offer.status}", show_alert=True)
             return
+        chat_id = str(self.settings.telegram_chat_id)
+        if callback.message and str(callback.message.chat.id) != chat_id:
+            await callback.answer("Недоступно", show_alert=True)
+            return
 
         offer.status = "approved"
         offer.approved_at = datetime.now(timezone.utc)
@@ -124,6 +128,10 @@ class ReviewService:
             return
         if offer.status != "pending":
             await callback.answer(f"Уже обработано: {offer.status}", show_alert=True)
+            return
+        chat_id = str(self.settings.telegram_chat_id)
+        if callback.message and str(callback.message.chat.id) != chat_id:
+            await callback.answer("Недоступно", show_alert=True)
             return
 
         offer.status = "rejected"

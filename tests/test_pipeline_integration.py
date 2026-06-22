@@ -102,7 +102,7 @@ def _make_orchestrator(
 
     mock_tg = MagicMock()
     mock_tg.send_review_card = AsyncMock(return_value=1)
-    mock_tg.send_draft_for_edit = AsyncMock(return_value=2)
+    mock_tg.send_offer_link = AsyncMock(return_value=2)
     mock_tg.mark_review_skipped = AsyncMock()
     mock_tg.mark_review_approved = AsyncMock()
     mock_tg.send_photo = AsyncMock()
@@ -332,6 +332,8 @@ async def test_reject_then_rescan_no_second_notify(
 
     callback = MagicMock()
     callback.answer = AsyncMock()
+    callback.message = MagicMock()
+    callback.message.chat.id = settings.telegram_chat_id
     await orch.review_service._handle_reject(
         "kwork", "kwork_dev_it", "555", callback
     )

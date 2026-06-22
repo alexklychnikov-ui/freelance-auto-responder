@@ -6,6 +6,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
+
 from src.adapters.kwork_auth import KworkAuthError
 from src.adapters.kwork import KworkAdapter, kwork_offer_form_url
 from src.adapters.kwork_auth import KworkCredentials
@@ -14,6 +16,8 @@ from src.analyzer.gpt_offer_estimator import GptOfferEstimator
 from src.analyzer.gpt_response_generator import GptResponseGenerator
 from src.analyzer.gpt_scorer import GptScorer
 from src.analyzer.lightrag_client import LightRagClient
+from src.analyzer.project_brief import build_project_brief
+from src.analyzer.response_history import load_recent_response_context
 from src.browser.factory import close_browser_client, get_browser_client
 from src.config import Settings, SourceConfig, get_enabled_sources, get_settings
 from src.journal.writer import JournalWriter
@@ -199,7 +203,7 @@ class PipelineOrchestrator:
 
     async def _process_new_project(self, source: SourceConfig, preview: Any) -> None:
         full = await asyncio.to_thread(self._read_full_listing, source, preview.project_id)
-        context = await asyncio.to_thread(self.lightrag.get_full_context)
+        context = await asyncio.to_thread(self.lightrag.get_scoring_context, full)
         examples = await asyncio.to_thread(
             load_response_examples, self.settings.response_examples_dir
         )
@@ -241,14 +245,71 @@ class PipelineOrchestrator:
                 status="approved",
                 approved_at=datetime.now(timezone.utc),
             )
-            context = self.lightrag.get_full_context()
-            examples = load_response_examples(self.settings.response_examples_dir)
-            offer.response_text = self.response_generator.generate(
-                full, context, examples=examples
+            if self.settings.prepare_only_no_submit:
+                await self._prepare_offer_on_site(offer)
+            else:
+                await self._ensure_response_text(offer)
+                await self.handle_approved(
+                    full.platform, full.source_key, full.project_id, offer
+                )
+
+    async def _refresh_offer_project(self, offer: PendingOffer) -> ProjectFull:
+        brief = build_project_brief(offer.project)
+        if len(brief) >= 80 and len(offer.project.full_description or "") >= 40:
+            return offer.project
+        source = next(
+            (
+                s
+                for s in get_enabled_sources(self.settings.sources_config_path)
+                if s.id == offer.source_key
+            ),
+            None,
+        )
+        if source is None:
+            return offer.project
+        try:
+            full = await asyncio.to_thread(
+                self._read_full_listing, source, offer.project_id
             )
-            await self.handle_approved(
-                full.platform, full.source_key, full.project_id, offer
+            offer.project = full
+            offer.title = full.title
+            offer.url = full.url
+            self.review_service.store.save(offer)
+            logger.info(
+                "project_refreshed project_id=%s desc_len=%s",
+                offer.project_id,
+                len(full.full_description or ""),
             )
+            return full
+        except Exception:
+            logger.exception("project_refresh_failed project_id=%s", offer.project_id)
+            return offer.project
+
+    async def _generate_response_text(self, offer: PendingOffer) -> str:
+        await self._refresh_offer_project(offer)
+        context = await asyncio.to_thread(self.lightrag.get_full_context)
+        examples = await asyncio.to_thread(
+            load_response_examples, self.settings.response_examples_dir
+        )
+        recent = await asyncio.to_thread(
+            load_recent_response_context, self.prepared_store
+        )
+        text = await asyncio.to_thread(
+            self.response_generator.generate,
+            offer.project,
+            context,
+            examples=examples,
+            recent_responses=recent,
+        )
+        return ensure_portfolio_link(text.strip())
+
+    async def _ensure_response_text(self, offer: PendingOffer) -> str:
+        if (offer.response_text or "").strip():
+            return offer.response_text.strip()
+        text = await self._generate_response_text(offer)
+        offer.response_text = text
+        self.review_service.store.save(offer)
+        return text
 
     async def handle_approve_click(
         self,
@@ -258,35 +319,55 @@ class PipelineOrchestrator:
         offer: PendingOffer,
         callback: Any | None,
     ) -> None:
-        project = offer.project
-        context = self.lightrag.get_full_context()
-        examples = load_response_examples(self.settings.response_examples_dir)
-
-        try:
-            draft = self.response_generator.generate(
-                project, context, examples=examples
-            )
-        except Exception:
-            logger.exception("draft_generation_failed project_id=%s", project_id)
-            await self.review_service.tg_bot.notify(
-                f"❌ Не удалось сгенерировать черновик: {project.title}"
-            )
-            return
-
-        offer.response_text = draft
-        draft_msg_id = await self.review_service.tg_bot.send_draft_for_edit(
-            offer, draft
-        )
-        offer.draft_message_id = draft_msg_id
-        self.review_service.store.save(offer)
-
         if callback is not None:
             await self.review_service.tg_bot.mark_review_approved(callback)
 
-        await self.review_service.tg_bot.notify(
-            f"✍️ Черновик готов: {project.title}\n"
-            "Отредактируйте и ответьте на сообщение с черновиком."
-        )
+        try:
+            await self._ensure_response_text(offer)
+        except httpx.HTTPStatusError as exc:
+            offer.status = "pending"
+            offer.approved_at = None
+            self.review_service.store.save(offer)
+            self.repository.update_status(
+                platform, source_key, project_id, "pending"
+            )
+            logger.exception("response_generation_failed project_id=%s", project_id)
+            if exc.response.status_code == 429:
+                await self.review_service.tg_bot.notify(
+                    f"⚠️ OpenAI rate limit: {html.escape(offer.title)}\n"
+                    "Нажми «Откликнуться» снова через 1–2 мин."
+                )
+            else:
+                await self.review_service.tg_bot.notify(
+                    f"❌ Не удалось сгенерировать текст для формы: "
+                    f"{html.escape(offer.title)}\nHTTP {exc.response.status_code}"
+                )
+            return
+        except Exception:
+            offer.status = "pending"
+            offer.approved_at = None
+            self.review_service.store.save(offer)
+            self.repository.update_status(
+                platform, source_key, project_id, "pending"
+            )
+            logger.exception("response_generation_failed project_id=%s", project_id)
+            await self.review_service.tg_bot.notify(
+                f"❌ Не удалось сгенерировать текст для формы: "
+                f"{html.escape(offer.title)}"
+            )
+            return
+
+        link_msg_id = await self.review_service.tg_bot.send_offer_link(offer)
+        offer.draft_message_id = link_msg_id
+        self.review_service.store.save(offer)
+
+        if self.settings.prepare_only_no_submit:
+            await self._prepare_offer_on_site(offer)
+        else:
+            await self.review_service.tg_bot.notify(
+                f"🔗 {kwork_offer_form_url(offer.project_id)}\n"
+                "Текст отклика — на форме Kwork."
+            )
 
     async def handle_user_response_text(
         self, offer: PendingOffer, text: str
@@ -326,7 +407,7 @@ class PipelineOrchestrator:
             )
             return
 
-        response_text = offer.response_text or ""
+        response_text = await self._ensure_response_text(offer)
         context = await asyncio.to_thread(self.lightrag.get_full_context)
         terms = await asyncio.to_thread(
             self.offer_estimator.estimate,
@@ -336,7 +417,6 @@ class PipelineOrchestrator:
         )
         price = str(terms.price_rub)
         delivery_days = terms.delivery_days
-        offer_url = kwork_offer_form_url(offer.project_id)
 
         def _run_prepare():
             browser = get_browser_client(self.settings)
@@ -349,6 +429,7 @@ class PipelineOrchestrator:
                     response_text,
                     price,
                     delivery_days=delivery_days,
+                    order_title=offer.title,
                 )
                 return result
             finally:
@@ -356,9 +437,8 @@ class PipelineOrchestrator:
 
         try:
             await self.review_service.tg_bot.notify(
-                f"⏳ Заполняю форму Kwork: {offer.title}\n"
-                f"Оценка: {price} ₽ · {delivery_days} дн.\n"
-                "Кнопку «Предложить» не нажимаю."
+                f"⏳ Готовлю отклик: {html.escape(offer.title)}\n"
+                f"Оценка: {price} ₽ · {delivery_days} дн."
             )
             result = await asyncio.to_thread(_run_prepare)
         except Exception as exc:
@@ -371,9 +451,9 @@ class PipelineOrchestrator:
                 lock_offer=False,
             )
             await self.review_service.tg_bot.notify(
-                "⚠️ Браузер упал, текст сохранён на сервере.\n"
+                "⚠️ Браузер упал, данные сохранены на сервере.\n"
                 f"{html.escape(str(exc))}\n"
-                "Ответьте ещё раз на черновик — повторю заполнение."
+                "Нажми «Откликнуться» ещё раз — повторю заполнение."
             )
             return
 
@@ -396,18 +476,28 @@ class PipelineOrchestrator:
                 await self.review_service.tg_bot.notify(
                     f"⚠️ Форма не заполнена: {html.escape(offer.title)}\n"
                     f"{html.escape(msg)}\n"
-                    "Текст сохранён — ответьте на черновик ещё раз"
+                    "Нажми «Откликнуться» ещё раз"
                 )
             return
 
         await self._save_prepared_response(
             offer, response_text, price, delivery_days
         )
+        deadline_manual = bool(
+            result.message and "deadline_not_set" in result.message
+        )
+        offer_url = kwork_offer_form_url(offer.project_id)
+        deadline_warn = ""
+        if deadline_manual:
+            deadline_warn = "\n⚠️ Срок в форме — выбери вручную в dropdown"
         await self.review_service.tg_bot.notify(
-            f"✅ Форма заполнена (без отправки)\n"
+            f"✅ Форма заполнена на Kwork (без отправки)\n"
             f"{html.escape(offer.title)}\n"
             f"Цена: {price} ₽ · Срок: {delivery_days} дн.\n"
             f"🔗 {offer_url}\n"
+            "Открой ссылку <b>под тем же аккаунтом Kwork</b>, что на VPS.\n"
+            "Описание и цена должны подтянуться — проверь и нажми «Предложить»."
+            f"{deadline_warn}\n"
             "Excel: Sync-Journal.bat на ПК"
         )
 
@@ -553,6 +643,9 @@ def build_orchestrator(settings: Settings | None = None) -> PipelineOrchestrator
     lightrag = LightRagClient(
         base_url=settings.lightrag_base_url or None,
         api_key=settings.lightrag_api_key,
+        github_username=settings.github_username,
+        github_token=settings.github_token,
+        github_stack_cache=settings.github_stack_cache,
     )
     journal = JournalWriter(settings.response_journal)
     prepared_store = PreparedResponseStore(settings.prepared_responses_dir)

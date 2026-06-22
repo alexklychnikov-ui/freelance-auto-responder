@@ -16,26 +16,81 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_PROMPT_PATH = Path("promptFrilance.md")
 
+SCORING_SYSTEM_PROMPT = """\
+Ты — ассистент фрилансера Александра Клычниковова (Python/AI/Telegram/MVP).
+
+Оцени КОНКРЕТНЫЙ проект: сопоставь требования ТЗ с реальным стеком из github_stack
+(репозитории https://github.com/alexklychnikov-ui). lightrag_context — только релевантные кейсы по этому заказу.
+Не завышай score. Если ключевая технология из ТЗ отсутствует в github_stack — score <= 4.
+
+Стек Александра (подходит):
+- Python, FastAPI, aiogram, Telegram-боты, парсинг, API-интеграции
+- AI/LLM, RAG, автоматизация, MVP, небольшой веб (Next.js базово)
+- Docker, PostgreSQL
+
+Явно НЕ подходит / нет опыта (score <= 4, fit=false, recommendation=пропустить):
+- Нативные мобильные приложения Android и iOS (Swift, Kotlin, Java, Objective-C)
+- Flutter / React Native / Xamarin как основная разработка (без подтверждённого кейса в контексте)
+- Чистый дизайн, вёрстка без логики, 1С, WordPress/Тильда без кастомного кода
+- Штатная позиция, не разовый проект
+
+Критерии score >= 7:
+- Основная работа: Python / боты / AI / API / автоматизация / небольшой веб-MVP
+- Есть релевантный кейс в github_stack или lightrag_context
+- Реализуемо одним разработчиком за разумный срок
+
+Правила полей (обязательно):
+- reason: 1–2 предложения — почему именно этот score для ЭТОГО заказа (упомяни суть ТЗ)
+- matched_skills: только навыки, подтверждённые ТЗ И наличием в github_stack/lightrag_context
+- risks: 2–4 риска СПЕЦИФИЧНЫЕ для этого ТЗ (технологии, объём, интеграции, сроки, домен заказчика).
+  ЗАПРЕЩЕНЫ шаблонные риски: «отсутствие чёткого описания», «неизвестный бюджет», «недопонимание требований» —
+  используй их только если в описании проекта реально пусто (< 50 символов) или бюджет отсутствует в данных
+- suggested_project_type: Парсинг | Telegram-бот | AI/RAG | Веб-MVP | Интеграция | Автоматизация | Другое
+
+Верни СТРОГО JSON:
+{
+  "score": 0,
+  "fit": false,
+  "reason": "",
+  "matched_skills": [],
+  "risks": [],
+  "suggested_project_type": "",
+  "competition_level": "medium",
+  "recommendation": "пропустить"
+}
+"""
+
+_NATIVE_MOBILE_RE = re.compile(
+    r"(android|ios|iphone|ipad|swift|kotlin|objective-?c|flutter|"
+    r"react\s*native|xamarin|мобильн\w*\s+прилож)",
+    re.IGNORECASE,
+)
+
+_GENERIC_RISK_PATTERNS = (
+    r"отсутствие четкого описания",
+    r"отсутствие чёткого описания",
+    r"неизвестный бюджет",
+    r"недопониман\w*\s+требован",
+    r"может привести к недопониман",
+    r"ограничить возможности реализации",
+)
+
 
 def load_scoring_system_prompt(prompt_path: Path | None = None) -> str:
     path = prompt_path or DEFAULT_PROMPT_PATH
+    if not path.exists():
+        return SCORING_SYSTEM_PROMPT
     text = path.read_text(encoding="utf-8")
     match = re.search(
-        r"Ты — ассистент фрилансера Александра Клычниковова.*?```\s*\n(\{[\s\S]*?\})\s*\n```",
+        r"\*\*Системный промпт \(шаблон\):\*\*\s*\n+```\s*\n(.*?)\n```",
         text,
         flags=re.DOTALL,
     )
     if match:
-        json_template = match.group(1)
-        intro = text[match.start() : match.start() + 200].split("```")[0].strip()
-        return f"{intro}\n\nВерни СТРОГО JSON:\n{json_template}"
-
-    return (
-        "Ты — ассистент фрилансера Александра Клычниковова (Python/AI/Telegram/MVP). "
-        "Оцени проект на соответствие стеку. Верни СТРОГО JSON с полями: "
-        "score, fit, reason, matched_skills, risks, suggested_project_type, "
-        "competition_level, recommendation."
-    )
+        block = match.group(1).strip()
+        if len(block) > 400 and "не подходит" in block.lower():
+            return block
+    return SCORING_SYSTEM_PROMPT
 
 
 def _extract_json(content: str) -> dict[str, Any]:
@@ -62,7 +117,67 @@ _COMPETITION_MAP = {
 }
 
 
-def _normalize_score_payload(raw: dict[str, Any]) -> dict[str, Any]:
+def _project_text(project: ProjectFull) -> str:
+    parts = [
+        project.title or "",
+        project.full_description or "",
+        " ".join(project.tags or []),
+        project.desired_budget or "",
+        project.max_budget or "",
+    ]
+    return " ".join(parts)
+
+
+def _filter_generic_risks(risks: list[str], project: ProjectFull) -> list[str]:
+    desc_len = len((project.full_description or "").strip())
+    has_budget = bool(project.desired_budget or project.max_budget)
+    filtered: list[str] = []
+    for risk in risks:
+        lower = risk.lower()
+        if any(re.search(p, lower) for p in _GENERIC_RISK_PATTERNS):
+            if "описан" in lower and desc_len >= 80:
+                continue
+            if "бюджет" in lower and has_budget:
+                continue
+            if "недопониман" in lower and desc_len >= 120:
+                continue
+        filtered.append(risk)
+    return filtered
+
+
+def _apply_score_guardrails(data: dict[str, Any], project: ProjectFull) -> dict[str, Any]:
+    text = _project_text(project)
+    risks = _filter_generic_risks(list(data.get("risks") or []), project)
+
+    if _NATIVE_MOBILE_RE.search(text):
+        if int(data.get("score", 0)) > 4:
+            data["score"] = min(int(data["score"]), 3)
+        data["fit"] = False
+        data["recommendation"] = "пропустить"
+        mobile_risk = (
+            "Нативные Android/iOS — нет в стеке GitHub-репозиториев "
+            "(Python/боты/AI/веб-MVP)"
+        )
+        if not any("android" in r.lower() or "ios" in r.lower() or "мобил" in r.lower() for r in risks):
+            risks.insert(0, mobile_risk)
+        reason = str(data.get("reason") or "")
+        if "мобил" not in reason.lower() and "android" not in reason.lower():
+            data["reason"] = (
+                f"{reason} Ключевая часть — mobile, в github_stack нет Kotlin/Swift/Flutter."
+            ).strip()
+
+    if not risks:
+        risks = [
+            f"Объём: {project.title[:80]} — проверить реализуемость в одиночку",
+        ]
+    data["risks"] = risks[:5]
+    data["fit"] = bool(data.get("fit")) and int(data.get("score", 0)) >= 7
+    if not data["fit"]:
+        data["recommendation"] = "пропустить"
+    return data
+
+
+def _normalize_score_payload(raw: dict[str, Any], project: ProjectFull) -> dict[str, Any]:
     data = dict(raw)
 
     score_raw = data.get("score", 0)
@@ -87,7 +202,9 @@ def _normalize_score_payload(raw: dict[str, Any]) -> dict[str, Any]:
         data["fit"] = data["score"] >= 7
 
     comp = str(data.get("competition_level", "")).strip().lower()
-    data["competition_level"] = _COMPETITION_MAP.get(comp, comp if comp in _COMPETITION_MAP.values() else "medium")
+    data["competition_level"] = _COMPETITION_MAP.get(
+        comp, comp if comp in _COMPETITION_MAP.values() else "medium"
+    )
 
     rec = str(data.get("recommendation", "")).strip().lower()
     for key in ("откликаться", "пропустить", "наблюдать"):
@@ -109,7 +226,7 @@ def _normalize_score_payload(raw: dict[str, Any]) -> dict[str, Any]:
     if not str(data.get("reason") or "").strip():
         data["reason"] = ""
 
-    return data
+    return _apply_score_guardrails(data, project)
 
 
 class GptScorer:
@@ -143,8 +260,13 @@ class GptScorer:
         examples: str = "",
     ) -> GptScoreResult:
         user_payload = {
+            "task": (
+                "Сопоставь требования заказа (заголовок, описание, теги, бюджет) со стеком "
+                "из github_stack (репозитории alexklychnikov-ui). lightrag_context — кейсы по этому ТЗ. "
+                "Риски — только по сути ЭТОГО заказа."
+            ),
             "project": project.model_dump(mode="json"),
-            "lightrag_context": lightrag_context,
+            "scoring_context": lightrag_context,
             "response_examples": examples,
         }
         body = {
@@ -156,7 +278,7 @@ class GptScorer:
                     "content": json.dumps(user_payload, ensure_ascii=False),
                 },
             ],
-            "temperature": 0.2,
+            "temperature": 0.15,
             "response_format": {"type": "json_object"},
         }
         url = f"{self.settings.openai_base_url.rstrip('/')}/chat/completions"
@@ -190,5 +312,5 @@ class GptScorer:
                 raise last_exc
         data = response.json()
         content = data["choices"][0]["message"]["content"]
-        parsed = _normalize_score_payload(_extract_json(content))
+        parsed = _normalize_score_payload(_extract_json(content), project)
         return GptScoreResult.model_validate(parsed)

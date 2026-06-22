@@ -132,6 +132,127 @@ OFFER_TEXT_SELECTOR = ".offer-description, [data-field='description'], textarea[
 OFFER_PRICE_SELECTOR = ".offer-price, [data-field='price'], input[name='price']"
 OFFER_SUBMIT_SELECTOR = ".offer-submit, [data-action='submit']"
 
+DESC_SELECTORS = (
+    'textarea[name="description"]',
+    "textarea.v-textarea",
+    ".wants-offer__description textarea",
+    "textarea",
+)
+PRICE_SELECTORS = (
+    "#offer-custom-price",
+    'input[name="price"]',
+    ".wants-offer__price input",
+    '[data-field="price"] input',
+    ".stages__stage-price-input",
+    'input[type="number"]',
+)
+TITLE_SELECTORS = (
+    'input[placeholder*="Название заказа"]',
+    'input[placeholder*="название заказа"]',
+)
+
+EXTRACT_ORDER_TITLE_ON_PAGE_JS = """
+() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+
+  const fromDetails = () => {
+    const headers = [...document.querySelectorAll('h2, h3, h4, div, span, p')].filter((el) =>
+      /^детали проекта$/i.test(norm(el.textContent))
+    );
+    for (const hdr of headers) {
+      const block =
+        hdr.closest('aside, section, [class*="detail"], [class*="info"], [class*="sidebar"]')
+        || hdr.parentElement?.parentElement;
+      if (!block) continue;
+      const link = block.querySelector('a[href*="/projects/"]');
+      if (link) {
+        const t = norm(link.textContent);
+        if (t.length >= 3 && t.length <= 70) return t;
+      }
+      const lines = norm(block.textContent)
+        .split(/\\n|(?<=\\. )/)
+        .map(norm)
+        .filter((line) => line.length >= 5 && line.length <= 70);
+      for (const line of lines) {
+        if (/детали проекта|бюджет|допустим|желаем|разработка и it|скрипты/i.test(line)) {
+          continue;
+        }
+        if (!/^\\d/.test(line)) return line;
+      }
+    }
+    return '';
+  };
+
+  const fromSelectors = () => {
+    const sels = [
+      '.wants-card__header-title a',
+      '.wants-card__header-title',
+      '.order-details a[href*="/projects/"]',
+      '[data-project-title]',
+    ];
+    for (const sel of sels) {
+      const el = document.querySelector(sel);
+      const t = norm(el?.textContent || el?.getAttribute('data-project-title') || '');
+      if (t.length >= 3 && t.length <= 70) return t;
+    }
+    return '';
+  };
+
+  return fromDetails() || fromSelectors();
+}
+"""
+
+READ_OFFER_FORM_JS = """
+() => {
+  const desc =
+    document.querySelector('textarea[name="description"]') ||
+    document.querySelector('textarea.v-textarea') ||
+    document.querySelector('.wants-offer__description textarea') ||
+    document.querySelector('textarea');
+  const priceInput =
+    document.querySelector('#offer-custom-price') ||
+    document.querySelector('input[name="price"]') ||
+    document.querySelector('.wants-offer__price input') ||
+    document.querySelector('input[type="number"]');
+  const titleInput = [...document.querySelectorAll('input[type="text"], input:not([type])')].find((inp) =>
+    /название заказа/i.test(inp.getAttribute('placeholder') || '')
+  ) || (() => {
+    const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+    const label = [...document.querySelectorAll('label, .form-field__name, .field-name, span')].find(
+      (el) => /^название заказа$/i.test(norm(el.textContent))
+    );
+    if (!label) return null;
+    const root = label.closest('.form-field, .form-item, .field, div') || label.parentElement;
+    return root?.querySelector('input[type="text"], input:not([type="hidden"])') || null;
+  })();
+  return {
+    url: location.href,
+    descLen: (desc?.value || '').length,
+    descPreview: (desc?.value || '').slice(0, 100),
+    price: (priceInput?.value || '').replace(/\\s/g, ''),
+    title: titleInput?.value || '',
+  };
+}
+"""
+
+TRIGGER_OFFER_AUTOSAVE_JS = """
+() => {
+  const fields = [
+    ...document.querySelectorAll('textarea, input[type="text"], input[type="number"], input[type="tel"]'),
+  ];
+  for (const el of fields) {
+    try {
+      el.focus();
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      el.blur();
+    } catch (e) {}
+  }
+  document.body.click();
+  return true;
+}
+"""
+
 
 OFFER_OPEN_JS = """
 (() => {
@@ -151,14 +272,16 @@ OFFER_OPEN_JS = """
 """
 
 
-def _build_offer_fill_js(text: str, price: str, delivery_days: int) -> str:
+def _build_offer_fill_js(text: str, price: str, *, order_title: str = "") -> str:
     payload = json.dumps(
-        {"text": text, "price": str(price), "days": delivery_days},
+        {"text": text, "price": str(price), "title": order_title},
         ensure_ascii=False,
     )
     return f"""
 (() => {{
   const payload = {payload};
+
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
 
   function setValue(el, value) {{
     if (!el) return;
@@ -182,6 +305,7 @@ def _build_offer_fill_js(text: str, price: str, delivery_days: int) -> str:
 
   let desc = null;
   let priceInput = null;
+  let titleInput = null;
   for (const root of roots) {{
     if (!desc) {{
       desc =
@@ -200,80 +324,32 @@ def _build_offer_fill_js(text: str, price: str, delivery_days: int) -> str:
         root.querySelector('input[type="number"]') ||
         root.querySelector('input[type="tel"].wMax');
     }}
+    if (!titleInput) {{
+      const label = [...document.querySelectorAll('label, .form-field__name, .field-name, span, div')].find(
+        (el) => /^название заказа$/i.test(norm(el.textContent))
+      );
+      if (label) {{
+        const root =
+          label.closest('.form-field, .form-item, .field, .offer-form__row, div') ||
+          label.parentElement;
+        titleInput = root?.querySelector('input[type="text"], input:not([type="hidden"])') || null;
+      }}
+    }}
+    if (!titleInput) {{
+      titleInput = [...root.querySelectorAll('input[type="text"], input:not([type])')].find((inp) =>
+        /название заказа/i.test(inp.getAttribute('placeholder') || '')
+      ) || null;
+    }}
   }}
 
   setValue(desc, payload.text);
   setValue(priceInput, payload.price);
+  if (titleInput && payload.title) setValue(titleInput, payload.title.slice(0, 70));
 
   const payCard = [...document.querySelectorAll('label, div, span, button')].find((el) =>
     /целиком.*заказ выполнен/i.test((el.textContent || '').replace(/\\s+/g, ' '))
   );
   if (payCard) payCard.click();
-
-  function dayLabel(days) {{
-    if (days % 10 === 1 && days % 100 !== 11) return days + ' день';
-    if (days % 10 >= 2 && days % 10 <= 4 && (days % 100 < 10 || days % 100 >= 20)) return days + ' дня';
-    return days + ' дней';
-  }}
-
-  function pickDeadlineOption(days) {{
-    const patterns = [
-      days + ' дн',
-      dayLabel(days),
-      String(days),
-    ];
-    const nodes = [
-      ...document.querySelectorAll('select option'),
-      ...document.querySelectorAll('.multiselect__option, .v-list-item, li[role="option"], [class*="option"]'),
-    ];
-    let best = null;
-    let bestDiff = Infinity;
-    for (const node of nodes) {{
-      const text = (node.textContent || '').replace(/\\s+/g, ' ').trim();
-      if (!text) continue;
-      if (patterns.some((p) => text.includes(p))) return node;
-      const m = text.match(/(\\d{{1,2}})\\s*дн/i);
-      if (m) {{
-        const diff = Math.abs(parseInt(m[1], 10) - days);
-        if (diff < bestDiff) {{
-          bestDiff = diff;
-          best = node;
-        }}
-      }}
-    }}
-    return best;
-  }}
-
-  function setDeadline(days) {{
-    for (const sel of document.querySelectorAll('select')) {{
-      const opt = pickDeadlineOption(days);
-      if (opt && opt.tagName === 'OPTION') {{
-        sel.value = opt.value;
-        sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        return true;
-      }}
-    }}
-
-    const triggers = [
-      ...document.querySelectorAll('.multiselect, .multiselect__select, [class*="deadline"], [class*="duration"]'),
-      ...[...document.querySelectorAll('label, .field-name, .form-field__name')].filter((el) =>
-        /срок выполнения/i.test(el.textContent || '')
-      ).map((el) => el.closest('.form-field, .field, .form-item, div')?.querySelector('.multiselect, input, button, [role="combobox"]'))
-        .filter(Boolean),
-    ];
-
-    for (const trigger of triggers) {{
-      try {{ trigger.click(); }} catch (e) {{}}
-      const opt = pickDeadlineOption(days);
-      if (opt) {{
-        try {{ opt.click(); }} catch (e) {{}}
-        return true;
-      }}
-    }}
-    return false;
-  }}
-
-  const daysSet = setDeadline(payload.days);
 
   const submitBtn = [...document.querySelectorAll('button, input[type="submit"]')].find((el) =>
     /^предложить$/i.test((el.textContent || el.value || '').trim())
@@ -283,15 +359,249 @@ def _build_offer_fill_js(text: str, price: str, delivery_days: int) -> str:
     ok: Boolean(desc && priceInput),
     hasDesc: Boolean(desc),
     hasPrice: Boolean(priceInput),
-    daysSet,
+    hasTitle: Boolean(titleInput && payload.title),
     submitFound: Boolean(submitBtn),
   }};
 }})()
 """
 
 
+DEADLINE_OPEN_JS = """
+(() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+
+  function findDeadlineField() {
+    const label = [...document.querySelectorAll('label, .form-field__name, .field-name, span, p, div')]
+      .find((el) => /^срок выполнения$/i.test(norm(el.textContent)));
+    if (label) {
+      const root = label.closest(
+        '.form-field, .form-item, .field, .offer-form__row, .wants-offer__field, .offer-field, div'
+      );
+      const ms = root?.querySelector('.multiselect');
+      if (ms) return ms;
+    }
+    return [...document.querySelectorAll('.multiselect')].find((ms) =>
+      /срок выполнения/i.test(norm(ms.textContent))
+    ) || null;
+  }
+
+  const ms = findDeadlineField();
+  if (!ms) {
+    return { ok: false, reason: 'multiselect_not_found' };
+  }
+
+  const openers = [
+    ms.querySelector('.multiselect__select'),
+    ms.querySelector('.multiselect__tags'),
+    ms.querySelector('.multiselect-single'),
+    ms,
+  ].filter(Boolean);
+
+  for (const opener of openers) {
+    try {
+      opener.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+      opener.click();
+    } catch (e) {}
+  }
+
+  return {
+    ok: true,
+    active: ms.classList.contains('multiselect--active'),
+    cls: String(ms.className || '').slice(0, 120),
+  };
+})()
+"""
+
+
+def _build_deadline_pick_js(delivery_days: int) -> str:
+    return f"""
+(() => {{
+  const targetDays = {delivery_days};
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+
+  function dayVariants(days) {{
+    const out = [
+      days + ' день',
+      days + ' дня',
+      days + ' дней',
+      days + ' дн.',
+      days + ' дн',
+      String(days),
+    ];
+    if (days >= 7 && days % 7 === 0) {{
+      const weeks = days / 7;
+      out.push(weeks + ' неделя', weeks + ' недели', weeks + ' недель', weeks + ' нед');
+    }}
+    return out;
+  }}
+
+  function scoreOption(text, days) {{
+    const m = text.match(/(\\d{{1,3}})/);
+    if (!m) return Infinity;
+    const n = parseInt(m[1], 10);
+    if (/нед/i.test(text)) return Math.abs(n * 7 - days);
+    return Math.abs(n - days);
+  }}
+
+  function collectOptions() {{
+    const nodes = [
+      ...document.querySelectorAll('.multiselect__content .multiselect__option'),
+      ...document.querySelectorAll('.multiselect__content-wrapper .multiselect__option'),
+      ...document.querySelectorAll('.multiselect--active .multiselect__option'),
+      ...document.querySelectorAll('.multiselect__option'),
+      ...document.querySelectorAll('[role="option"]'),
+      ...document.querySelectorAll('select option'),
+    ];
+    const out = [];
+    const seen = new Set();
+    for (const node of nodes) {{
+      const text = norm(node.textContent);
+      if (!text || text.length > 50 || !/\\d/.test(text)) continue;
+      if (!/дн|нед|day/i.test(text)) continue;
+      if (seen.has(text)) continue;
+      seen.add(text);
+      out.push({{ node, text }});
+    }}
+    return out;
+  }}
+
+  function pickFromSelect() {{
+    for (const sel of document.querySelectorAll('select')) {{
+      let best = null;
+      let bestScore = Infinity;
+      for (const opt of sel.options) {{
+        const text = norm(opt.textContent);
+        if (!/\\d/.test(text)) continue;
+        const score = scoreOption(text, targetDays);
+        if (score < bestScore) {{
+          bestScore = score;
+          best = opt;
+        }}
+      }}
+      if (best && bestScore <= 7) {{
+        sel.value = best.value;
+        sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        sel.dispatchEvent(new Event('input', {{ bubbles: true }}));
+        return {{ ok: true, picked: norm(best.textContent), method: 'native_select' }};
+      }}
+    }}
+    return null;
+  }}
+
+  const variants = dayVariants(targetDays);
+  const options = collectOptions();
+  for (const {{ node, text }} of options) {{
+    if (variants.some((v) => text.toLowerCase().includes(v.toLowerCase()))) {{
+      node.click();
+      return {{ ok: true, picked: text, method: 'exact', optionsCount: options.length }};
+    }}
+  }}
+
+  let best = null;
+  let bestScore = Infinity;
+  for (const item of options) {{
+    const score = scoreOption(item.text, targetDays);
+    if (score < bestScore) {{
+      bestScore = score;
+      best = item;
+    }}
+  }}
+  if (best && bestScore <= 7) {{
+    best.node.click();
+    return {{
+      ok: true,
+      picked: best.text,
+      method: 'nearest',
+      diff: bestScore,
+      optionsCount: options.length,
+    }};
+  }}
+
+  const native = pickFromSelect();
+  if (native) return native;
+
+  return {{
+    ok: false,
+    reason: 'option_not_found',
+    optionsCount: options.length,
+    sample: options.slice(0, 15).map((o) => o.text),
+  }};
+}})()
+"""
+
+
+def _fill_deadline(browser: BrowserClient, delivery_days: int) -> dict[str, Any]:
+    opened = browser.evaluate(DEADLINE_OPEN_JS)
+    if hasattr(browser, "wait_ms"):
+        browser.wait_ms(1500)
+    picked = browser.evaluate(_build_deadline_pick_js(delivery_days))
+    if isinstance(picked, dict) and not picked.get("ok") and hasattr(browser, "wait_ms"):
+        browser.wait_ms(800)
+        browser.evaluate(DEADLINE_OPEN_JS)
+        browser.wait_ms(1200)
+        picked = browser.evaluate(_build_deadline_pick_js(delivery_days))
+    if not isinstance(picked, dict):
+        return {"ok": False, "reason": "invalid_pick_result", "opened": opened}
+    picked["opened"] = opened
+    return picked
+
+
 def kwork_offer_form_url(project_id: str) -> str:
     return f"https://kwork.ru/new_offer?project={project_id}"
+
+
+def _fill_first(browser: BrowserClient, selectors: tuple[str, ...], value: str) -> bool:
+    if not value:
+        return False
+    for selector in selectors:
+        try:
+            browser.fill(selector, value)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+def _read_offer_form(browser: BrowserClient) -> dict[str, Any]:
+    data = browser.evaluate(READ_OFFER_FORM_JS)
+    return data if isinstance(data, dict) else {}
+
+
+def _resolve_order_title(
+    browser: BrowserClient, project_id: str, fallback: str
+) -> str:
+    try:
+        scraped = browser.evaluate(EXTRACT_ORDER_TITLE_ON_PAGE_JS)
+        if isinstance(scraped, str) and len(scraped.strip()) >= 3:
+            return scraped.strip()[:70]
+    except Exception:
+        pass
+    try:
+        view_url = f"https://kwork.ru/projects/{project_id}/view"
+        browser.navigate(view_url)
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(2500)
+        raw = browser.evaluate(PROJECT_EXTRACTOR_JS)
+        title = str(raw.get("title") or "").strip() if isinstance(raw, dict) else ""
+        if title:
+            browser.navigate(kwork_offer_form_url(project_id))
+            if hasattr(browser, "wait_ms"):
+                browser.wait_ms(3000)
+            return title[:70]
+    except Exception:
+        pass
+    return (fallback or "").strip()[:70]
+
+
+def _autosave_wait(browser: BrowserClient, *, wait_ms: int = 8000) -> None:
+    try:
+        browser.evaluate(TRIGGER_OFFER_AUTOSAVE_JS)
+    except Exception:
+        pass
+    if hasattr(browser, "wait_ms"):
+        browser.wait_ms(wait_ms)
+    if hasattr(browser, "save_storage_state"):
+        browser.save_storage_state()
 
 
 def _parse_listing_block(block: str) -> dict[str, Any] | None:
@@ -469,7 +779,7 @@ class KworkAdapter:
 
     def read_full(self, project_id: str) -> ProjectFull:
         self._ensure_auth()
-        url = f"https://kwork.ru/projects/{project_id}"
+        url = f"https://kwork.ru/projects/{project_id}/view"
         self.browser.navigate(url)
         raw = self.browser.evaluate(PROJECT_EXTRACTOR_JS)
         if not isinstance(raw, dict):
@@ -508,6 +818,7 @@ class KworkAdapter:
         price: str,
         *,
         delivery_days: int = 14,
+        order_title: str = "",
     ) -> SubmitResult:
         if self.kwork_credentials:
             self._ensure_session()
@@ -524,10 +835,10 @@ class KworkAdapter:
         else:
             self._ensure_auth()
 
-        url = f"https://kwork.ru/projects/{project_id}/view"
-        self.browser.navigate(url)
+        offer_url = kwork_offer_form_url(project_id)
+        self.browser.navigate(offer_url)
         if hasattr(self.browser, "wait_ms"):
-            self.browser.wait_ms(2000)
+            self.browser.wait_ms(4000)
 
         if not is_logged_in(self.browser):
             return SubmitResult(
@@ -536,35 +847,74 @@ class KworkAdapter:
                 message="not_logged_in: нужен логин Kwork на VPS",
             )
 
-        opened = self.browser.evaluate(OFFER_OPEN_JS)
-        if hasattr(self.browser, "wait_ms"):
-            self.browser.wait_ms(5000)
+        order_title = _resolve_order_title(
+            self.browser, project_id, order_title
+        )
 
-        if isinstance(opened, dict) and not opened.get("ok"):
-            return SubmitResult(
-                success=False,
-                project_id=project_id,
-                message=f"offer_button_not_found: {opened}",
+        desc_ok = _fill_first(self.browser, DESC_SELECTORS, text)
+        price_ok = _fill_first(self.browser, PRICE_SELECTORS, str(price))
+        title_ok = False
+        if order_title:
+            title_ok = _fill_first(self.browser, TITLE_SELECTORS, order_title[:70])
+
+        if hasattr(self.browser, "wait_ms"):
+            self.browser.wait_ms(500)
+
+        try:
+            self.browser.evaluate(
+                """
+                () => {
+                  const payCard = [...document.querySelectorAll('label, div, span, button')].find((el) =>
+                    /целиком.*заказ выполнен/i.test((el.textContent || '').replace(/\\s+/g, ' '))
+                  );
+                  if (payCard) payCard.click();
+                  return Boolean(payCard);
+                }
+                """
             )
+        except Exception:
+            pass
 
         fill_result = self.browser.evaluate(
-            _build_offer_fill_js(text, price, delivery_days)
+            _build_offer_fill_js(text, price, order_title=order_title)
         )
         if hasattr(self.browser, "wait_ms"):
-            self.browser.wait_ms(1000)
+            self.browser.wait_ms(800)
 
-        if not isinstance(fill_result, dict) or not fill_result.get("ok"):
-            details = fill_result if isinstance(fill_result, dict) else {}
+        deadline_result = _fill_deadline(self.browser, delivery_days)
+        days_set = bool(isinstance(deadline_result, dict) and deadline_result.get("ok"))
+
+        _autosave_wait(self.browser, wait_ms=8000)
+        readback = _read_offer_form(self.browser)
+        desc_len = int(readback.get("descLen") or 0)
+        read_price = str(readback.get("price") or "").replace(" ", "")
+        read_title = str(readback.get("title") or "").strip()
+        min_desc = min(150, max(50, len(text.strip()) // 3))
+
+        if not isinstance(fill_result, dict):
+            fill_result = {}
+        fill_result["daysSet"] = days_set
+        fill_result["deadline"] = deadline_result
+        fill_result["readback"] = readback
+        fill_result["playwrightDesc"] = desc_ok
+        fill_result["playwrightPrice"] = price_ok
+        fill_result["playwrightTitle"] = title_ok
+
+        if desc_len < min_desc or not read_price:
             return SubmitResult(
                 success=False,
                 project_id=project_id,
-                message=f"prepare_failed: {details}",
+                message=f"prepare_verify_failed: {fill_result}",
             )
+
+        message = f"prepared: verified desc={desc_len} price={read_price} title={read_title!r}"
+        if not days_set:
+            message += f"; deadline_not_set: {deadline_result}"
 
         return SubmitResult(
             success=True,
             project_id=project_id,
-            message="prepared: form filled, submit not clicked",
+            message=message,
         )
 
     def submit_response(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from src.analyzer.lightrag_client import LightRagClient
+from src.analyzer.lightrag_client import LightRagClient, GENERAL_STACK_QUERY
 from src.limits.daily import count_today_responses, is_daily_limit_reached
 from src.telegram_bot.bot import parse_callback_data
 
@@ -18,6 +18,8 @@ def test_lightrag_injectable_search() -> None:
     ctx = client.get_full_context()
     assert "ctx:mix" in ctx
     assert len(calls) == 2
+    assert not any("Чего НЕ делал" in q for q, _ in calls)
+    assert GENERAL_STACK_QUERY in calls[0][0] or calls[0][0] in GENERAL_STACK_QUERY
 
 
 def test_parse_callback_data() -> None:

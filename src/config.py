@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     lightrag_mcp: str = "user-lightrag"
     lightrag_base_url: str = ""
     lightrag_api_key: str = ""
+    github_username: str = "alexklychnikov-ui"
+    github_token: str = ""
+    github_stack_cache: str = "data/github_stack_cache.json"
 
     scan_interval_minutes: int = 30
     min_gpt_score: int = 7
