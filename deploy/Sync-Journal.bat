@@ -14,6 +14,7 @@ if %ERR% neq 0 (
 )
 echo.
 echo Journal: C:\Python\Projects\Zerocode2md\ResponseJournal\journal.xlsx
+echo Если строк нет в Excel — закрой файл и открой заново из проводника.
 explorer /select,"C:\Python\Projects\Zerocode2md\ResponseJournal\journal.xlsx"
 timeout /t 3 >nul
 endlocal

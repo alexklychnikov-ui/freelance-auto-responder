@@ -12,7 +12,7 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from src.journal.writer import JournalWriter
+from src.journal.writer import JournalWriter, format_offer_notes
 from src.responses.prepared_store import PreparedResponse
 
 VPS = os.environ.get("FREELANCE_VPS_HOST", "LightRAG_Naive")
@@ -20,6 +20,8 @@ REMOTE_PREPARED = "/opt/freelance-responder/data/prepared_responses"
 DEFAULT_JOURNAL = Path(
     r"C:\Python\Projects\Zerocode2md\ResponseJournal\journal.xlsx"
 )
+# Тестовые project_id — не писать в Excel (через запятую в JOURNAL_SKIP_PROJECT_IDS)
+DEFAULT_SKIP_PROJECT_IDS = {"3202099"}
 
 
 def _journal_path() -> Path:
@@ -59,6 +61,14 @@ def _journal_path() -> Path:
     return candidates[0] if candidates else DEFAULT_JOURNAL
 
 
+def _skip_project_ids() -> set[str]:
+    raw = os.environ.get("JOURNAL_SKIP_PROJECT_IDS", "").strip()
+    ids = set(DEFAULT_SKIP_PROJECT_IDS)
+    if raw:
+        ids.update(part.strip() for part in raw.split(",") if part.strip())
+    return ids
+
+
 def _run(cmd: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
     print("+", " ".join(cmd))
     return subprocess.run(cmd, check=check, text=True, capture_output=True)
@@ -94,30 +104,19 @@ def _mark_exported_on_vps(filename: str) -> None:
     _run(["ssh", VPS, f"python3 -c \"{script}\""])
 
 
-def _open_journal(path: Path) -> None:
-    path = path.resolve()
-    if not path.exists():
-        print(f"FAIL: не найден файл: {path}")
-        return
-    if sys.platform == "win32":
-        try:
-            os.startfile(str(path))  # type: ignore[attr-defined]
-        except OSError as exc:
-            print(f"WARN: Excel не открыт автоматически: {exc}")
-            print(f"Открой вручную: {path}")
-    else:
-        subprocess.run(["xdg-open", str(path)], check=False)
-
-
 def main() -> int:
     journal_path = _journal_path()
     if not journal_path.exists():
         print(f"FAIL: файл не найден: {journal_path}")
         return 1
 
+    writer = JournalWriter(journal_path)
+    existing_ids = writer.project_ids_in_journal()
+    skip_ids = _skip_project_ids()
+
     with tempfile.TemporaryDirectory(prefix="journal_sync_") as tmp_dir:
         files = _pull_prepared(Path(tmp_dir))
-        pending = []
+        pending: list[tuple[str, PreparedResponse]] = []
         for path in files:
             try:
                 item = PreparedResponse.from_dict(
@@ -126,27 +125,53 @@ def main() -> int:
             except (json.JSONDecodeError, ValueError, KeyError) as exc:
                 print(f"skip corrupt {path.name}: {exc}")
                 continue
-            if not item.journal_exported:
-                pending.append((path.name, item))
+
+            if item.project_id in skip_ids:
+                continue
+
+            in_journal = item.project_id in existing_ids
+            notes = format_offer_notes(
+                item.title,
+                price=item.price,
+                delivery_days=item.delivery_days,
+            )
+
+            if item.journal_exported and in_journal:
+                if writer.update_notes_by_project_id(item.project_id, notes):
+                    print(f"OK notes: {item.title}")
+                continue
+            if item.journal_exported and not in_journal:
+                print(
+                    f"re-sync {path.name}: exported на VPS, но нет в Excel"
+                )
+            pending.append((path.name, item))
 
         if not pending:
             print("Нет новых откликов для Excel.")
             print(f"Файл: {journal_path}")
+            if existing_ids:
+                print(
+                    "Если строки не видно — закрой Excel полностью и открой файл заново "
+                    "(открытый Excel не подхватывает изменения с диска)."
+                )
             return 0
 
-        writer = JournalWriter(journal_path)
         for filename, item in pending:
             row = writer.append_prepared(
                 item.project,
                 item.score,
                 item.response_text,
                 price=item.price,
+                delivery_days=item.delivery_days,
             )
+            existing_ids.add(item.project_id)
             _mark_exported_on_vps(filename)
             print(f"OK row {row}: {item.title}")
 
         print(f"Готово: {len(pending)} строк -> {journal_path}")
-        _open_journal(journal_path)
+        print(
+            "Закрой Excel, если был открыт, затем открой journal.xlsx из проводника."
+        )
         return 0
 
 

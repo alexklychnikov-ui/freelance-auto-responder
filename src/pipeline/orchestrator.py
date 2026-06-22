@@ -456,6 +456,7 @@ class PipelineOrchestrator:
                     item.score,
                     item.response_text,
                     price=item.price,
+                    delivery_days=item.delivery_days,
                 )
                 item.journal_exported = True
                 self.prepared_store.save(item)

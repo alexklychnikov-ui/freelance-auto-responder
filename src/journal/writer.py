@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from datetime import date
 from pathlib import Path
@@ -28,6 +29,17 @@ PLATFORM_DISPLAY = {
     "flru": "FL.ru",
     "telegram": "Telegram",
 }
+
+
+def format_offer_notes(
+    title: str,
+    *,
+    price: str | None = None,
+    delivery_days: int | None = None,
+) -> str:
+    price_text = f"{price} ₽" if price else "—"
+    days_text = f"{delivery_days} дн." if delivery_days else "—"
+    return f"{title}\nЦена: {price_text} · Срок: {days_text}"
 
 
 class JournalWriter:
@@ -89,6 +101,73 @@ class JournalWriter:
                 continue
         return max_n + 1
 
+    def project_ids_in_journal(self) -> set[str]:
+        if not self.journal_path.exists():
+            return set()
+        wb = load_workbook(self.journal_path, read_only=True, data_only=True)
+        ws = wb.active
+        ids: set[str] = set()
+        for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=4, max_col=4):
+            cell = row[0]
+            if cell.value is None:
+                continue
+            text = str(cell.value)
+            match = re.search(r"/projects/(\d+)", text.replace("\\", "/"))
+            if match:
+                ids.add(match.group(1))
+                continue
+            for part in text.replace("\\", "/").split("/"):
+                if part.isdigit() and len(part) >= 3:
+                    ids.add(part)
+        wb.close()
+        return ids
+
+    def _find_row_by_project_id(self, ws, project_id: str) -> int | None:
+        header = self._header_row(ws)
+        for row in range(header + 1, ws.max_row + 1):
+            cell = ws.cell(row=row, column=4)
+            if isinstance(cell, MergedCell):
+                continue
+            if project_id in str(cell.value or ""):
+                return row
+        return None
+
+    def update_notes_by_project_id(
+        self,
+        project_id: str,
+        notes: str,
+    ) -> bool:
+        if not self.journal_path.exists():
+            return False
+        wb = load_workbook(self.journal_path)
+        ws = wb.active
+        row = self._find_row_by_project_id(ws, project_id)
+        if row is None or not self._writable(ws, row, 8):
+            wb.close()
+            return False
+        ws.cell(row=row, column=8, value=notes)
+        wb.save(self.journal_path)
+        wb.close()
+        logger.info("journal_notes_updated project_id=%s row=%d", project_id, row)
+        return True
+
+    def remove_row_by_project_id(self, project_id: str) -> bool:
+        if not self.journal_path.exists():
+            return False
+        wb = load_workbook(self.journal_path)
+        ws = wb.active
+        row = self._find_row_by_project_id(ws, project_id)
+        if row is None:
+            wb.close()
+            return False
+        for col in range(1, len(JOURNAL_COLUMNS) + 1):
+            if self._writable(ws, row, col):
+                ws.cell(row=row, column=col, value=None)
+        wb.save(self.journal_path)
+        wb.close()
+        logger.info("journal_row_removed project_id=%s row=%d", project_id, row)
+        return True
+
     def append_submission(
         self,
         project: ProjectFull,
@@ -101,10 +180,8 @@ class JournalWriter:
         row = self._next_row(ws)
 
         platform_label = PLATFORM_DISPLAY.get(project.platform, project.platform)
-        notes = (
-            f"score={score.score}; buyer={project.buyer or '—'}; "
-            f"{response_text[:200]}"
-        )
+        price = project.desired_budget or project.max_budget
+        notes = format_offer_notes(project.title, price=price)
 
         ws.cell(row=row, column=1, value=self._next_number(ws))
         ws.cell(row=row, column=2, value=date.today())
@@ -130,6 +207,7 @@ class JournalWriter:
         response_text: str,
         *,
         price: str | None = None,
+        delivery_days: int | None = None,
     ) -> int:
         self._ensure_workbook()
         wb = load_workbook(self.journal_path)
@@ -137,9 +215,10 @@ class JournalWriter:
         row = self._next_row(ws)
 
         platform_label = PLATFORM_DISPLAY.get(project.platform, project.platform)
-        notes = (
-            f"score={score.score}; price={price or '—'}; buyer={project.buyer or '—'}; "
-            f"{response_text[:200]}"
+        notes = format_offer_notes(
+            project.title,
+            price=price,
+            delivery_days=delivery_days,
         )
 
         ws.cell(row=row, column=1, value=self._next_number(ws))

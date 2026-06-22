@@ -76,13 +76,30 @@ def test_journal_skips_merged_cells(
     wb.close()
 
     writer = JournalWriter(journal_path)
-    row = writer.append_prepared(project, score, "prepared text", price="5000")
+    row = writer.append_prepared(project, score, "prepared text", price="5000", delivery_days=14)
 
     assert row == 3
     wb = load_workbook(journal_path)
     ws = wb.active
     assert ws.cell(row=3, column=6).value == "Подготовлен"
+    assert "Test project" in str(ws.cell(row=3, column=8).value)
+    assert "5000" in str(ws.cell(row=3, column=8).value)
     wb.close()
+
+
+def test_format_offer_notes() -> None:
+    from src.journal.writer import format_offer_notes
+
+    text = format_offer_notes("Сайт", price="8000", delivery_days=10)
+    assert text == "Сайт\nЦена: 8000 ₽ · Срок: 10 дн."
+
+
+def test_project_ids_in_journal(journal_path: Path, project: ProjectFull, score: GptScoreResult) -> None:
+    writer = JournalWriter(journal_path)
+    assert writer.project_ids_in_journal() == set()
+
+    writer.append_prepared(project, score, "text", price="1000")
+    assert writer.project_ids_in_journal() == {"100"}
 
 
 def test_journal_template_header_row(
