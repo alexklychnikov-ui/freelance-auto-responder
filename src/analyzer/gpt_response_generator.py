@@ -13,6 +13,7 @@ from src.analyzer.response_qa import ResponseQaValidator, rule_check_alignment
 from src.analyzer.response_strategy import build_generation_strategy
 from src.config import Settings
 from src.models import ProjectFull
+from src.analyzer.response_text import strip_response_markdown
 from src.responses.portfolio_link import PORTFOLIO_URL, ensure_portfolio_link
 
 logger = logging.getLogger(__name__)
@@ -74,8 +75,8 @@ D: 3–5 предложений, без вступительной воды
 Из lightrag_context / github — только 1–2 факта, реально относящиеся к ЭТОМУ заказу.
 Портфолио: {PORTFOLIO_URL} — один раз, органично, не отдельным блоком «моё портфолио:».
 
-Длина: 900–2000 знаков (Kwork минимум ~150). Без markdown-заголовков и списков с «- » в начале каждой строки
-(можно короткие абзацы). Без цены в тексте — цена в форме отдельно.
+Длина: 900–2000 знаков (Kwork минимум ~150). Без markdown (**жирный**, заголовки #).
+Без списков с «- » в начале каждой строки (можно короткие абзацы). Без цены в тексте — цена в форме отдельно.
 
 Верни только текст отклика.
 """
@@ -198,8 +199,9 @@ class GptResponseGenerator:
         )
 
         text = self._call_api(body, project.project_id)
+        text = strip_response_markdown(text)
         text = self._postprocess_with_checks(project, user_payload, body, text)
-        return ensure_portfolio_link(text)
+        return ensure_portfolio_link(strip_response_markdown(text))
 
     def _postprocess_with_checks(
         self,
@@ -223,6 +225,7 @@ class GptResponseGenerator:
             body["messages"][1]["content"] = json.dumps(retry_payload, ensure_ascii=False)
             body["temperature"] = 0.9
             text = self._call_api(body, project.project_id)
+            text = strip_response_markdown(text)
 
         for attempt in range(2):
             qa = self._qa.validate(project, text)
@@ -246,5 +249,6 @@ class GptResponseGenerator:
             body["messages"][1]["content"] = json.dumps(retry_payload, ensure_ascii=False)
             body["temperature"] = 0.65
             text = self._call_api(body, project.project_id)
+            text = strip_response_markdown(text)
 
-        return text
+        return strip_response_markdown(text)

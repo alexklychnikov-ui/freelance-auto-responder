@@ -22,6 +22,26 @@ def _budget_amounts(project: ProjectFull) -> list[int]:
     return amounts
 
 
+def parse_budget_ceiling_rub(project: ProjectFull) -> int | None:
+    """Верхний предел оплаты (допустимый бюджет Kwork), ₽."""
+    amounts = _parse_amounts(project.max_budget)
+    if not amounts:
+        return None
+    return max(amounts)
+
+
+def price_exceeds_budget_ceiling(
+    estimated_price: int,
+    project: ProjectFull,
+    *,
+    multiplier: float = 2.0,
+) -> bool:
+    ceiling = parse_budget_ceiling_rub(project)
+    if ceiling is None or estimated_price <= 0:
+        return False
+    return estimated_price > int(ceiling * multiplier)
+
+
 def clamp_price_to_budget(price: int, project: ProjectFull) -> int:
     amounts = _budget_amounts(project)
     if not amounts:

@@ -79,6 +79,7 @@ def _make_orchestrator(
     mock_estimator.estimate.return_value = OfferTerms(
         price_rub=5000, delivery_days=14, plan_summary=""
     )
+    mock_estimator.estimate_market_cost.return_value = 5000
     mock_estimator.close = MagicMock()
 
     mock_scorer = MagicMock()
@@ -95,6 +96,7 @@ def _make_orchestrator(
     mock_tg = MagicMock()
     mock_tg.send_review_card = AsyncMock(return_value=1)
     mock_tg.send_offer_link = AsyncMock(return_value=2)
+    mock_tg.send_form_prepared_ready = AsyncMock(return_value=3)
     mock_tg.mark_review_skipped = AsyncMock()
     mock_tg.mark_review_approved = AsyncMock()
     mock_tg.send_photo = AsyncMock()
@@ -152,6 +154,67 @@ async def test_pipeline_scan_score_submit(
     assert repo.is_known("kwork", "kwork_dev_it", "999")
     state = repo.get_scan_state("kwork_dev_it")
     assert state is not None
+
+
+def test_price_exceeds_budget_ceiling() -> None:
+    from src.adapters.kwork_pricing import price_exceeds_budget_ceiling
+    from src.models import ProjectFull
+
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="1",
+        url="https://kwork.ru/projects/1/view",
+        title="Test",
+        full_description="desc",
+        max_budget="до 25 000 ₽",
+    )
+    assert price_exceeds_budget_ceiling(60_000, project, multiplier=2.0) is True
+    assert price_exceeds_budget_ceiling(50_000, project, multiplier=2.0) is False
+    assert price_exceeds_budget_ceiling(50_001, project, multiplier=2.0) is True
+
+    no_ceiling = project.model_copy(update={"max_budget": None})
+    assert price_exceeds_budget_ceiling(100_000, no_ceiling) is False
+
+
+@pytest.mark.asyncio
+async def test_pipeline_skips_over_budget_ceiling(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    project_full = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="1001",
+        url="https://kwork.ru/projects/1001/view",
+        title="Heavy project",
+        full_description="Big integration",
+        max_budget="до 25 000 ₽",
+    )
+    preview = ProjectPreview(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="1001",
+        url=project_full.url,
+        title=project_full.title,
+    )
+    orch, mock_adapter = _make_orchestrator(
+        settings, previews=[preview], project_full=project_full, score=score
+    )
+    orch.offer_estimator.estimate_market_cost.return_value = 60_000
+
+    totals = await orch.run_scan_cycle()
+
+    assert totals["new"] == 1
+    orch.review_service.tg_bot.send_review_card.assert_not_called()
+    mock_adapter.prepare_response.assert_not_called()
+    repo = ProjectRepository(settings.database_path)
+    with repo._conn() as conn:
+        row = conn.execute(
+            "SELECT status FROM projects WHERE project_id = ?",
+            ("1001",),
+        ).fetchone()
+    assert row is not None
+    assert row["status"] == "skipped"
 
 
 @pytest.mark.asyncio
@@ -249,6 +312,53 @@ async def test_handle_approved_unknown_source_notifies(
 
 
 @pytest.mark.asyncio
+async def test_journal_confirm_writes_excel(
+    settings: Settings, project_full: ProjectFull, score: GptScoreResult
+) -> None:
+    from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
+    from unittest.mock import MagicMock
+
+    orch, _ = _make_orchestrator(
+        settings, previews=[], project_full=project_full, score=score
+    )
+    store = PreparedResponseStore(
+        Path(settings.database_path).parent / "prepared"
+    )
+    orch.prepared_store = store
+    item = PreparedResponse(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="999",
+        url=project_full.url,
+        title=project_full.title,
+        project=project_full,
+        score=score,
+        response_text="text",
+        price="5000",
+        delivery_days=7,
+    )
+    store.save(item)
+
+    callback = MagicMock()
+    callback.answer = AsyncMock()
+    orch.review_service.tg_bot.mark_journal_confirmed = AsyncMock()
+    orch.review_service.tg_bot.notify = AsyncMock()
+
+    await orch.handle_journal_confirm(
+        "kwork", "kwork_dev_it", "999", callback
+    )
+
+    saved = store.load("kwork", "kwork_dev_it", "999")
+    assert saved is not None
+    assert saved.journal_confirmed is True
+    assert saved.journal_exported is True
+    from openpyxl import load_workbook
+
+    wb = load_workbook(settings.response_journal)
+    assert wb.active.max_row >= 2
+
+
+@pytest.mark.asyncio
 async def test_prepare_success_always_notifies(
     settings: Settings, project_full: ProjectFull, score: GptScoreResult
 ) -> None:
@@ -278,6 +388,6 @@ async def test_prepare_success_always_notifies(
         response_text="Готовый текст отклика для формы.",
     )
     await orch._prepare_offer_on_site(offer)
-    notify_texts = [c[0][0] for c in orch.review_service.tg_bot.notify.call_args_list]
-    assert any("Форма заполнена на Kwork" in t for t in notify_texts)
-    assert any("new_offer?project=" in t for t in notify_texts)
+    orch.review_service.tg_bot.send_form_prepared_ready.assert_called_once()
+    call_kw = orch.review_service.tg_bot.send_form_prepared_ready.call_args.kwargs
+    assert "new_offer?project=" in call_kw["offer_url"]

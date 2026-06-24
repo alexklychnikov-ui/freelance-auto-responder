@@ -6,6 +6,10 @@ import re
 from datetime import datetime
 from typing import Any
 
+from src.adapters.kwork_delivery import (
+    KWORK_DELIVERY_DAY_OPTIONS,
+    snap_delivery_days,
+)
 from src.adapters.kwork_auth import (
     KworkAuthError,
     KworkCredentials,
@@ -75,26 +79,28 @@ LISTING_EXTRACTOR_JS = """
 
 PROJECT_EXTRACTOR_JS = """
 (() => {
-  const root = document.querySelector('main.project-page, [data-project-id]') || document;
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const root = document.querySelector('main.project-page, [data-project-id], .want-view, main') || document;
   const projectId = root.getAttribute?.('data-project-id')
     || (location.pathname.match(/\\/projects\\/(\\d+)/) || [])[1]
     || null;
-  const titleEl = root.querySelector('.project-title, h1');
-  const descEl = root.querySelector('.project-description, [data-description]');
-  const expandBtn = root.querySelector('.show-full-description, [data-expand-description]');
+  const titleEl =
+    root.querySelector('.project-title, .wants-card__header-title, .want-card__header a, [data-project-title]') ||
+    root.querySelector('h1');
+  const descEl =
+    root.querySelector('.project-description, .want-card__description-text, [data-description], .breakwords');
+  const expandBtn = root.querySelector('.show-full-description, [data-expand-description], .kw-link-dashed');
   if (expandBtn && !expandBtn.dataset.clicked) {
-    expandBtn.click();
-    expandBtn.dataset.clicked = '1';
+    try { expandBtn.click(); expandBtn.dataset.clicked = '1'; } catch (e) {}
   }
-  const tags = [...root.querySelectorAll('.tags .tag, .tag-list .tag')]
-    .map(el => el.textContent.trim())
+  const tags = [...root.querySelectorAll('.tags .tag, .tag-list .tag, .kw-tag')]
+    .map(el => norm(el.textContent))
     .filter(Boolean);
 
-  const pageText = (root.textContent || '').replace(/\\s+/g, ' ');
-  const findBudget = (pattern) => {
-    const re = new RegExp(pattern + '[^₽]{0,40}([\\d\\s]+)\\s*₽', 'i');
-    const m = pageText.match(re);
-    return m ? m[1].replace(/\\s/g, ' ').trim() + ' ₽' : null;
+  const pageText = norm(document.body?.innerText || root.textContent || '');
+  const budgetAfter = (labelRe) => {
+    const m = pageText.match(new RegExp(labelRe + '[^\\d]{0,30}([\\d\\s]+)\\s*₽', 'i'));
+    return m ? norm(m[1]) + ' ₽' : null;
   };
 
   const offersRaw = root.querySelector('.offers-count, [data-offers]');
@@ -103,25 +109,56 @@ PROJECT_EXTRACTOR_JS = """
     const n = parseInt(offersRaw.getAttribute('data-offers') || offersRaw.textContent.replace(/\\D/g, ''), 10);
     offers = Number.isFinite(n) ? n : null;
   }
+  if (offers == null) {
+    const m = pageText.match(/предложени[яй][^\\d]{0,12}(\\d+)/i);
+    if (m) offers = parseInt(m[1], 10);
+  }
+
+  const buyerEl =
+    root.querySelector('.buyer-link, [data-buyer], .want-card__user-name a, .user-name a');
+  let buyer = buyerEl ? norm(buyerEl.textContent) : null;
+  if (!buyer) {
+    const buyerBlock = [...root.querySelectorAll('div, section, aside')].find((el) =>
+      /покупатель/i.test(el.textContent || '')
+    );
+    const link = buyerBlock?.querySelector('a[href*="/user/"]');
+    if (link) buyer = norm(link.textContent);
+  }
+
+  let buyerHire =
+    root.querySelector('.buyer-hire-rate, [data-buyer-hire-rate]')?.textContent?.trim() || null;
+  if (!buyerHire) {
+    const m = pageText.match(/(\\d{1,3})\\s*%\\s*(?:найм|выбор)/i)
+      || pageText.match(/найм[а-яё\\s]{0,20}(\\d{1,3})\\s*%/i);
+    if (m) buyerHire = m[1] + '%';
+  }
+
+  let timeLeft =
+    root.querySelector('.time-left, [data-time-left], [class*="timer"], [class*="countdown"]')
+      ?.textContent?.trim() || null;
+  if (!timeLeft) {
+    const m = pageText.match(/(\\d+\\s*(?:д\\.?|дн|дней|ч\\.?|мин\\.?)[\\s\\d\\.чмин]{0,25})/i);
+    if (m) timeLeft = norm(m[1]);
+  }
 
   return {
     project_id: projectId,
     url: location.href,
-    title: (titleEl?.textContent || '').trim(),
-    full_description: (descEl?.textContent || descEl?.getAttribute('data-description') || '').trim(),
+    title: norm(titleEl?.textContent || ''),
+    full_description: norm(descEl?.textContent || descEl?.getAttribute('data-description') || ''),
     desired_budget:
-      root.querySelector('.desired-budget, [data-desired-budget]')?.textContent?.trim()
-      || findBudget('желаем')
+      norm(root.querySelector('.desired-budget, [data-desired-budget]')?.textContent || '')
+      || budgetAfter('желаем(?:ый|ого)?\\s+бюджет')
       || null,
     max_budget:
-      root.querySelector('.max-budget, [data-max-budget]')?.textContent?.trim()
-      || findBudget('допустим')
-      || findBudget('до')
+      norm(root.querySelector('.max-budget, [data-max-budget]')?.textContent || '')
+      || budgetAfter('допустим(?:ый|ого)?')
+      || budgetAfter('до')
       || null,
     offers_count: offers,
-    buyer: root.querySelector('.buyer-link, [data-buyer]')?.textContent?.trim() || null,
-    buyer_hire_rate: root.querySelector('.buyer-hire-rate, [data-buyer-hire-rate]')?.textContent?.trim() || null,
-    time_left: root.querySelector('.time-left, [data-time-left]')?.textContent?.trim() || null,
+    buyer,
+    buyer_hire_rate: buyerHire ? norm(buyerHire) : null,
+    time_left: timeLeft ? norm(timeLeft) : null,
     tags,
   };
 })()
@@ -149,7 +186,49 @@ PRICE_SELECTORS = (
 TITLE_SELECTORS = (
     'input[placeholder*="Название заказа"]',
     'input[placeholder*="название заказа"]',
+    'input[name="name"]',
+    'input[name="order_name"]',
+    '.wants-offer__title input',
+    '.wants-offer input[type="text"]',
 )
+
+FIND_TITLE_INPUT_JS = """
+() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const byPlaceholder = [...document.querySelectorAll('input[type="text"], input:not([type])')].find((inp) =>
+    /название заказа/i.test(inp.getAttribute('placeholder') || '')
+  );
+  if (byPlaceholder) return byPlaceholder;
+
+  const label = [...document.querySelectorAll('label, .form-field__name, .field-name, span, div, p')].find(
+    (el) => /^название заказа$/i.test(norm(el.textContent))
+  );
+  if (label) {
+    const root =
+      label.closest('.form-field, .form-item, .field, .offer-form__row, .wants-offer__field, div')
+      || label.parentElement;
+    const inp = root?.querySelector('input[type="text"], input:not([type="hidden"])');
+    if (inp) return inp;
+    let sib = label.nextElementSibling;
+    while (sib) {
+      const found = sib.querySelector?.('input[type="text"], input:not([type="hidden"])') || null;
+      if (found) return found;
+      sib = sib.nextElementSibling;
+    }
+  }
+
+  const counter = [...document.querySelectorAll('span, div, p')].find((el) =>
+    /из\\s*70\\s*символ/i.test(el.textContent || '')
+  );
+  if (counter) {
+    const root = counter.closest('.form-field, .field, .wants-offer__field, div') || counter.parentElement;
+    const inp = root?.querySelector('input[type="text"], input:not([type="hidden"])');
+    if (inp) return inp;
+  }
+
+  return null;
+}
+"""
 
 EXTRACT_ORDER_TITLE_ON_PAGE_JS = """
 () => {
@@ -214,16 +293,27 @@ READ_OFFER_FORM_JS = """
     document.querySelector('input[name="price"]') ||
     document.querySelector('.wants-offer__price input') ||
     document.querySelector('input[type="number"]');
-  const titleInput = [...document.querySelectorAll('input[type="text"], input:not([type])')].find((inp) =>
-    /название заказа/i.test(inp.getAttribute('placeholder') || '')
-  ) || (() => {
+  const titleInput = (() => {
     const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-    const label = [...document.querySelectorAll('label, .form-field__name, .field-name, span')].find(
+    const byPh = [...document.querySelectorAll('input[type="text"], input:not([type])')].find((inp) =>
+      /название заказа/i.test(inp.getAttribute('placeholder') || '')
+    );
+    if (byPh) return byPh;
+    const label = [...document.querySelectorAll('label, span, div, p')].find(
       (el) => /^название заказа$/i.test(norm(el.textContent))
     );
-    if (!label) return null;
-    const root = label.closest('.form-field, .form-item, .field, div') || label.parentElement;
-    return root?.querySelector('input[type="text"], input:not([type="hidden"])') || null;
+    if (label) {
+      const root = label.closest('.form-field, .field, div') || label.parentElement;
+      return root?.querySelector('input[type="text"], input:not([type="hidden"])') || null;
+    }
+  const counter = [...document.querySelectorAll('span, div')].find((el) =>
+      /из\\s*70\\s*символ/i.test(el.textContent || '')
+    );
+    if (counter) {
+      const root = counter.closest('.form-field, .field, div') || counter.parentElement;
+      return root?.querySelector('input[type="text"], input:not([type="hidden"])') || null;
+    }
+    return null;
   })();
   return {
     url: location.href,
@@ -342,6 +432,11 @@ def _build_offer_fill_js(text: str, price: str, *, order_title: str = "") -> str
     }}
   }}
 
+  if (!titleInput) {{
+    const findTitle = {FIND_TITLE_INPUT_JS};
+    titleInput = findTitle();
+  }}
+
   setValue(desc, payload.text);
   setValue(priceInput, payload.price);
   if (titleInput && payload.title) setValue(titleInput, payload.title.slice(0, 70));
@@ -414,10 +509,21 @@ DEADLINE_OPEN_JS = """
 
 
 def _build_deadline_pick_js(delivery_days: int) -> str:
+    snapped = snap_delivery_days(delivery_days)
+    allowed = list(KWORK_DELIVERY_DAY_OPTIONS)
     return f"""
 (() => {{
-  const targetDays = {delivery_days};
+  const targetDays = {snapped};
+  const allowed = {json.dumps(allowed)};
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+
+  function extractDays(text) {{
+    const m = text.match(/(\\d{{1,3}})/);
+    if (!m) return null;
+    let n = parseInt(m[1], 10);
+    if (/нед/i.test(text)) n *= 7;
+    return n;
+  }}
 
   function dayVariants(days) {{
     const out = [
@@ -433,14 +539,6 @@ def _build_deadline_pick_js(delivery_days: int) -> str:
       out.push(weeks + ' неделя', weeks + ' недели', weeks + ' недель', weeks + ' нед');
     }}
     return out;
-  }}
-
-  function scoreOption(text, days) {{
-    const m = text.match(/(\\d{{1,3}})/);
-    if (!m) return Infinity;
-    const n = parseInt(m[1], 10);
-    if (/нед/i.test(text)) return Math.abs(n * 7 - days);
-    return Math.abs(n - days);
   }}
 
   function collectOptions() {{
@@ -460,72 +558,48 @@ def _build_deadline_pick_js(delivery_days: int) -> str:
       if (!/дн|нед|day/i.test(text)) continue;
       if (seen.has(text)) continue;
       seen.add(text);
-      out.push({{ node, text }});
+      const days = extractDays(text);
+      if (days == null || !allowed.includes(days)) continue;
+      out.push({{ node, text, days }});
     }}
     return out;
   }}
 
   function pickFromSelect() {{
     for (const sel of document.querySelectorAll('select')) {{
-      let best = null;
-      let bestScore = Infinity;
       for (const opt of sel.options) {{
         const text = norm(opt.textContent);
-        if (!/\\d/.test(text)) continue;
-        const score = scoreOption(text, targetDays);
-        if (score < bestScore) {{
-          bestScore = score;
-          best = opt;
+        const days = extractDays(text);
+        if (days === targetDays) {{
+          sel.value = opt.value;
+          sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
+          sel.dispatchEvent(new Event('input', {{ bubbles: true }}));
+          return {{ ok: true, picked: text, method: 'native_select', targetDays }};
         }}
-      }}
-      if (best && bestScore <= 7) {{
-        sel.value = best.value;
-        sel.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        sel.dispatchEvent(new Event('input', {{ bubbles: true }}));
-        return {{ ok: true, picked: norm(best.textContent), method: 'native_select' }};
       }}
     }}
     return null;
   }}
 
-  const variants = dayVariants(targetDays);
-  const options = collectOptions();
-  for (const {{ node, text }} of options) {{
-    if (variants.some((v) => text.toLowerCase().includes(v.toLowerCase()))) {{
-      node.click();
-      return {{ ok: true, picked: text, method: 'exact', optionsCount: options.length }};
-    }}
-  }}
-
-  let best = null;
-  let bestScore = Infinity;
-  for (const item of options) {{
-    const score = scoreOption(item.text, targetDays);
-    if (score < bestScore) {{
-      bestScore = score;
-      best = item;
-    }}
-  }}
-  if (best && bestScore <= 7) {{
-    best.node.click();
-    return {{
-      ok: true,
-      picked: best.text,
-      method: 'nearest',
-      diff: bestScore,
-      optionsCount: options.length,
-    }};
-  }}
-
   const native = pickFromSelect();
   if (native) return native;
 
-  return {{
-    ok: false,
-    reason: 'option_not_found',
-    optionsCount: options.length,
-    sample: options.slice(0, 15).map((o) => o.text),
-  }};
+  const variants = dayVariants(targetDays);
+  const options = collectOptions();
+  for (const {{ node, text, days }} of options) {{
+    if (days === targetDays && variants.some((v) => text.toLowerCase().includes(v.toLowerCase()))) {{
+      node.click();
+      return {{ ok: true, picked: text, method: 'exact', targetDays, optionsCount: options.length }};
+    }}
+  }}
+  for (const {{ node, text, days }} of options) {{
+    if (days === targetDays) {{
+      node.click();
+      return {{ ok: true, picked: text, method: 'allowed', targetDays, optionsCount: options.length }};
+    }}
+  }}
+
+  return {{ ok: false, reason: 'no_allowed_match', targetDays, optionsCount: options.length }};
 }})()
 """
 
@@ -570,6 +644,7 @@ def _read_offer_form(browser: BrowserClient) -> dict[str, Any]:
 def _resolve_order_title(
     browser: BrowserClient, project_id: str, fallback: str
 ) -> str:
+    fb = (fallback or "").strip()[:70]
     try:
         scraped = browser.evaluate(EXTRACT_ORDER_TITLE_ON_PAGE_JS)
         if isinstance(scraped, str) and len(scraped.strip()) >= 3:
@@ -590,7 +665,38 @@ def _resolve_order_title(
             return title[:70]
     except Exception:
         pass
-    return (fallback or "").strip()[:70]
+    return fb
+
+
+def _fill_order_title(browser: BrowserClient, title: str) -> bool:
+    value = (title or "").strip()[:70]
+    if not value:
+        return False
+    if _fill_first(browser, TITLE_SELECTORS, value):
+        return True
+    try:
+        ok = browser.evaluate(
+            f"""
+            () => {{
+              const value = {json.dumps(value)};
+              const findTitle = {FIND_TITLE_INPUT_JS};
+              const inp = findTitle();
+              if (!inp) return false;
+              const proto = HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+              if (setter) setter.call(inp, value);
+              else inp.value = value;
+              inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+              inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+              inp.focus();
+              inp.blur();
+              return true;
+            }}
+            """
+        )
+        return bool(ok)
+    except Exception:
+        return False
 
 
 def _autosave_wait(browser: BrowserClient, *, wait_ms: int = 8000) -> None:
@@ -677,29 +783,105 @@ def parse_project_from_html(html: str, project_id: str | None = None) -> dict[st
     if not pid:
         pid = _first_group(r'/projects/(\d+)', root) or ""
 
-    title = _first_group(r'class="project-title"[^>]*>([^<]+)', root) or ""
+    title = (
+        _first_group(r'class="project-title"[^>]*>([^<]+)', root)
+        or _first_group(r'class="wants-card__header-title[^"]*"[^>]*>\s*<a[^>]*>([^<]+)', root)
+        or _first_group(r"<h1[^>]*>([^<]+)", root)
+        or ""
+    )
     description = _first_group(r'class="project-description"[^>]*>([^<]+)', root)
     if not description:
         description = _first_group(r'data-description="([^"]+)"', root) or ""
+    if not description:
+        description = _first_group(
+            r'class="want-card__description-text"[^>]*>([^<]+)', root
+        ) or ""
 
     tags = re.findall(r'class="tag"[^>]*>([^<]+)', root, flags=re.IGNORECASE)
+    plain = re.sub(r"<[^>]+>", " ", root)
+    plain = re.sub(r"\s+", " ", plain)
+
     offers_raw = _first_group(r'data-offers="(\d+)"', root)
     if not offers_raw:
         offers_raw = _first_group(r'class="offers-count"[^>]*>(\d+)', root)
+    if not offers_raw:
+        m = re.search(r"предложени[яй][^\d]{0,12}(\d+)", plain, re.I)
+        offers_raw = m.group(1) if m else None
+
+    desired = _optional_text(r'class="desired-budget"[^>]*>([^<]+)', root)
+    if not desired:
+        m = re.search(r"желаем(?:ый|ого)?\s+бюджет[^₽\d]{0,30}([\d\s]+)\s*₽", plain, re.I)
+        desired = f"до {m.group(1).strip()} ₽" if m else None
+
+    max_b = _optional_text(r'class="max-budget"[^>]*>([^<]+)', root)
+    if not max_b:
+        m = re.search(r"допустим(?:ый|ого)?[^₽\d]{0,30}([\d\s]+)\s*₽", plain, re.I)
+        max_b = f"до {m.group(1).strip()} ₽" if m else None
+
+    buyer = _optional_text(r'class="buyer-link"[^>]*>([^<]+)', root)
+    if not buyer:
+        buyer = _optional_text(r'href="/user/[^"]+"[^>]*>([^<]+)', root)
+
+    hire = _optional_text(r'class="buyer-hire-rate"[^>]*>([^<]+)', root)
+    if not hire:
+        m = re.search(r"(\d{1,3})\s*%\s*(?:найм|выбор)", plain, re.I)
+        hire = f"{m.group(1)}%" if m else None
+
+    time_left = _optional_text(r'class="time-left"[^>]*>([^<]+)', root)
+    if not time_left:
+        m = re.search(r"(\d+\s*(?:д\.?|дн|дней|ч\.?|мин\.?)[\s\d\.чмин]{0,25})", plain, re.I)
+        time_left = m.group(1).strip() if m else None
 
     return {
         "project_id": pid,
-        "url": f"https://kwork.ru/projects/{pid}" if pid else "",
+        "url": f"https://kwork.ru/projects/{pid}/view" if pid else "",
         "title": title.strip(),
         "full_description": description.strip(),
-        "desired_budget": _optional_text(r'class="desired-budget"[^>]*>([^<]+)', root),
-        "max_budget": _optional_text(r'class="max-budget"[^>]*>([^<]+)', root),
+        "desired_budget": desired,
+        "max_budget": max_b,
         "offers_count": int(offers_raw) if offers_raw else None,
-        "buyer": _optional_text(r'class="buyer-link"[^>]*>([^<]+)', root),
-        "buyer_hire_rate": _optional_text(r'class="buyer-hire-rate"[^>]*>([^<]+)', root),
-        "time_left": _optional_text(r'class="time-left"[^>]*>([^<]+)', root),
+        "buyer": buyer,
+        "buyer_hire_rate": hire,
+        "time_left": time_left,
         "tags": [t.strip() for t in tags if t.strip()],
     }
+
+
+def _merge_project_raw(
+    primary: dict[str, Any], fallback: dict[str, Any]
+) -> dict[str, Any]:
+    merged = dict(fallback)
+    merged.update({k: v for k, v in primary.items() if v not in (None, "", [])})
+    for key in (
+        "desired_budget",
+        "max_budget",
+        "offers_count",
+        "buyer",
+        "buyer_hire_rate",
+        "time_left",
+        "title",
+        "full_description",
+    ):
+        if not merged.get(key) and fallback.get(key):
+            merged[key] = fallback[key]
+    return merged
+
+
+def merge_preview_into_full(
+    full: ProjectFull, preview: ProjectPreview | None
+) -> ProjectFull:
+    if preview is None:
+        return full
+    data = full.model_dump()
+    if preview.title and not data.get("title"):
+        data["title"] = preview.title
+    if preview.responses_count is not None and not data.get("offers_count"):
+        data["offers_count"] = preview.responses_count
+    if preview.budget_text:
+        bt = preview.budget_text.strip()
+        if not data.get("desired_budget"):
+            data["desired_budget"] = bt if "₽" in bt else f"{bt} ₽"
+    return ProjectFull.model_validate(data)
 
 
 def _first_group(pattern: str, text: str) -> str | None:
@@ -781,10 +963,14 @@ class KworkAdapter:
         self._ensure_auth()
         url = f"https://kwork.ru/projects/{project_id}/view"
         self.browser.navigate(url)
+        if hasattr(self.browser, "wait_ms"):
+            self.browser.wait_ms(2000)
         raw = self.browser.evaluate(PROJECT_EXTRACTOR_JS)
         if not isinstance(raw, dict):
-            snapshot = self.browser.snapshot()
-            raw = parse_project_from_html(snapshot, project_id=project_id)
+            raw = {}
+        snapshot = self.browser.snapshot()
+        parsed = parse_project_from_html(snapshot, project_id=project_id)
+        raw = _merge_project_raw(raw, parsed)
 
         return ProjectFull(
             platform=self.platform_id,
@@ -835,6 +1021,8 @@ class KworkAdapter:
         else:
             self._ensure_auth()
 
+        delivery_days = snap_delivery_days(delivery_days)
+
         offer_url = kwork_offer_form_url(project_id)
         self.browser.navigate(offer_url)
         if hasattr(self.browser, "wait_ms"):
@@ -853,9 +1041,7 @@ class KworkAdapter:
 
         desc_ok = _fill_first(self.browser, DESC_SELECTORS, text)
         price_ok = _fill_first(self.browser, PRICE_SELECTORS, str(price))
-        title_ok = False
-        if order_title:
-            title_ok = _fill_first(self.browser, TITLE_SELECTORS, order_title[:70])
+        title_ok = _fill_order_title(self.browser, order_title)
 
         if hasattr(self.browser, "wait_ms"):
             self.browser.wait_ms(500)
@@ -878,11 +1064,15 @@ class KworkAdapter:
         fill_result = self.browser.evaluate(
             _build_offer_fill_js(text, price, order_title=order_title)
         )
+        if order_title:
+            title_ok = _fill_order_title(self.browser, order_title) or title_ok
         if hasattr(self.browser, "wait_ms"):
             self.browser.wait_ms(800)
 
         deadline_result = _fill_deadline(self.browser, delivery_days)
         days_set = bool(isinstance(deadline_result, dict) and deadline_result.get("ok"))
+        if order_title:
+            title_ok = _fill_order_title(self.browser, order_title) or title_ok
 
         _autosave_wait(self.browser, wait_ms=8000)
         readback = _read_offer_form(self.browser)

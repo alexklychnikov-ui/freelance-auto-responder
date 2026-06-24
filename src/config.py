@@ -51,6 +51,7 @@ class Settings(BaseSettings):
 
     scan_interval_minutes: int = 30
     min_gpt_score: int = 7
+    budget_ceiling_price_multiplier: float = 2.0
     max_daily_responses: int = 5
     require_telegram_approval: bool = True
     scan_bootstrap_skip_pipeline: bool = True

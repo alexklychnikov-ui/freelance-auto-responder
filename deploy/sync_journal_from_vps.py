@@ -129,6 +129,9 @@ def main() -> int:
             if item.project_id in skip_ids:
                 continue
 
+            if not item.journal_confirmed:
+                continue
+
             in_journal = item.project_id in existing_ids
             notes = format_offer_notes(
                 item.title,

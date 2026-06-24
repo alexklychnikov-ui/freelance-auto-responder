@@ -8,12 +8,16 @@ from typing import Any
 
 import httpx
 
-from src.adapters.kwork_auth import KworkAuthError
-from src.adapters.kwork import KworkAdapter, kwork_offer_form_url
+from src.adapters.kwork_pricing import (
+    parse_budget_ceiling_rub,
+    price_exceeds_budget_ceiling,
+)
+from src.adapters.kwork import KworkAdapter, kwork_offer_form_url, merge_preview_into_full
 from src.adapters.kwork_auth import KworkCredentials
 from src.analyzer.examples_loader import load_response_examples
 from src.analyzer.gpt_offer_estimator import GptOfferEstimator
 from src.analyzer.gpt_response_generator import GptResponseGenerator
+from src.analyzer.response_text import strip_response_markdown
 from src.analyzer.gpt_scorer import GptScorer
 from src.analyzer.lightrag_client import LightRagClient
 from src.analyzer.project_brief import build_project_brief
@@ -61,6 +65,7 @@ class PipelineOrchestrator:
         self._browser = browser
         self._adapter_factory = adapter_factory or self._default_adapter
         self.review_service.set_approve_handler(self.handle_approve_click)
+        self.review_service.set_journal_confirm_handler(self.handle_journal_confirm)
         self.review_service.set_submit_text_handler(self.handle_user_response_text)
 
     def close(self) -> None:
@@ -203,6 +208,7 @@ class PipelineOrchestrator:
 
     async def _process_new_project(self, source: SourceConfig, preview: Any) -> None:
         full = await asyncio.to_thread(self._read_full_listing, source, preview.project_id)
+        full = merge_preview_into_full(full, preview)
         context = await asyncio.to_thread(self.lightrag.get_scoring_context, full)
         examples = await asyncio.to_thread(
             load_response_examples, self.settings.response_examples_dir
@@ -220,6 +226,17 @@ class PipelineOrchestrator:
         )
 
         if not score.fit or score.score < self.settings.min_gpt_score:
+            self.repository.update_status(
+                full.platform,
+                full.source_key,
+                full.project_id,
+                "skipped",
+                fit=score.fit,
+                score=float(score.score),
+            )
+            return
+
+        if await self._skip_over_budget_ceiling(full, context):
             self.repository.update_status(
                 full.platform,
                 full.source_key,
@@ -252,6 +269,30 @@ class PipelineOrchestrator:
                 await self.handle_approved(
                     full.platform, full.source_key, full.project_id, offer
                 )
+
+    async def _skip_over_budget_ceiling(
+        self, full: ProjectFull, lightrag_context: str
+    ) -> bool:
+        if parse_budget_ceiling_rub(full) is None:
+            return False
+        estimated = await asyncio.to_thread(
+            self.offer_estimator.estimate_market_cost, full, lightrag_context
+        )
+        if price_exceeds_budget_ceiling(
+            estimated,
+            full,
+            multiplier=self.settings.budget_ceiling_price_multiplier,
+        ):
+            ceiling = parse_budget_ceiling_rub(full)
+            logger.info(
+                "skip_budget_ceiling project_id=%s estimated=%s ceiling=%s mult=%s",
+                full.project_id,
+                estimated,
+                ceiling,
+                self.settings.budget_ceiling_price_multiplier,
+            )
+            return True
+        return False
 
     async def _refresh_offer_project(self, offer: PendingOffer) -> ProjectFull:
         brief = build_project_brief(offer.project)
@@ -305,7 +346,11 @@ class PipelineOrchestrator:
 
     async def _ensure_response_text(self, offer: PendingOffer) -> str:
         if (offer.response_text or "").strip():
-            return offer.response_text.strip()
+            text = strip_response_markdown(offer.response_text.strip())
+            if text != offer.response_text:
+                offer.response_text = text
+                self.review_service.store.save(offer)
+            return text
         text = await self._generate_response_text(offer)
         offer.response_text = text
         self.review_service.store.save(offer)
@@ -487,19 +532,73 @@ class PipelineOrchestrator:
             result.message and "deadline_not_set" in result.message
         )
         offer_url = kwork_offer_form_url(offer.project_id)
-        deadline_warn = ""
-        if deadline_manual:
-            deadline_warn = "\n⚠️ Срок в форме — выбери вручную в dropdown"
-        await self.review_service.tg_bot.notify(
-            f"✅ Форма заполнена на Kwork (без отправки)\n"
-            f"{html.escape(offer.title)}\n"
-            f"Цена: {price} ₽ · Срок: {delivery_days} дн.\n"
-            f"🔗 {offer_url}\n"
-            "Открой ссылку <b>под тем же аккаунтом Kwork</b>, что на VPS.\n"
-            "Описание и цена должны подтянуться — проверь и нажми «Предложить»."
-            f"{deadline_warn}\n"
-            "Excel: Sync-Journal.bat на ПК"
+        await self.review_service.tg_bot.send_form_prepared_ready(
+            offer,
+            price=price,
+            delivery_days=delivery_days,
+            offer_url=offer_url,
+            deadline_manual=deadline_manual,
         )
+
+    async def handle_journal_confirm(
+        self,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        callback: Any,
+    ) -> None:
+        item = self.prepared_store.load(platform, source_key, project_id)
+        if item is None:
+            await callback.answer("Отклик не найден", show_alert=True)
+            return
+        if item.journal_confirmed:
+            await callback.answer("Уже в журнале", show_alert=True)
+            return
+        if item.project_id in self.journal.project_ids_in_journal():
+            item.journal_confirmed = True
+            item.journal_exported = True
+            self.prepared_store.save(item)
+            await self.review_service.tg_bot.mark_journal_confirmed(callback)
+            await callback.answer("Уже в журнале")
+            return
+
+        item.journal_confirmed = True
+        self.prepared_store.save(item)
+
+        try:
+            row = self.journal.append_prepared(
+                item.project,
+                item.score,
+                item.response_text,
+                price=item.price,
+                delivery_days=item.delivery_days,
+            )
+        except Exception as exc:
+            item.journal_confirmed = False
+            self.prepared_store.save(item)
+            logger.exception("journal_confirm_failed project_id=%s", project_id)
+            await callback.answer("Ошибка записи в Excel", show_alert=True)
+            await self.review_service.tg_bot.notify(
+                f"⚠️ Не удалось записать в журнал: {html.escape(str(exc))}"
+            )
+            return
+
+        item.journal_exported = True
+        self.prepared_store.save(item)
+
+        offer = self.review_service.store.load(platform, source_key, project_id)
+        if offer is not None:
+            offer.status = "submitted"
+            self.review_service.store.save(offer)
+        self.repository.update_status(platform, source_key, project_id, "submitted")
+
+        await self.review_service.tg_bot.mark_journal_confirmed(callback)
+        await callback.answer("Записано в журнал")
+        await self.review_service.tg_bot.notify(
+            f"📒 Журнал: строка {row} · {html.escape(item.title)}\n"
+            "На ПК: Sync-Journal.bat подтянет с VPS, если Excel локальный."
+        )
+        logger.info("journal_confirmed project_id=%s row=%s", project_id, row)
 
     async def _save_prepared_response(
         self,
@@ -532,7 +631,11 @@ class PipelineOrchestrator:
             )
 
     async def export_prepared_to_journal(self, message: Any = None) -> int:
-        items = self.prepared_store.list_not_exported()
+        items = [
+            i
+            for i in self.prepared_store.list_not_exported()
+            if i.journal_confirmed
+        ]
         if not items:
             text = "ℹ️ Нет подготовленных откликов для Excel"
             await self.review_service.tg_bot.notify(text)

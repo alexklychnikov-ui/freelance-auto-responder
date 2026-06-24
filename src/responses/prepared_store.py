@@ -27,6 +27,7 @@ class PreparedResponse:
         payment_method: str = "Целиком, когда заказ выполнен",
         prepared_at: datetime | None = None,
         journal_exported: bool = False,
+        journal_confirmed: bool = False,
         screenshot_path: str | None = None,
     ) -> None:
         self.platform = platform
@@ -42,6 +43,7 @@ class PreparedResponse:
         self.payment_method = payment_method
         self.prepared_at = prepared_at or datetime.now(timezone.utc)
         self.journal_exported = journal_exported
+        self.journal_confirmed = journal_confirmed
         self.screenshot_path = screenshot_path
 
     def to_dict(self) -> dict:
@@ -59,6 +61,7 @@ class PreparedResponse:
             "payment_method": self.payment_method,
             "prepared_at": self.prepared_at.isoformat(),
             "journal_exported": self.journal_exported,
+            "journal_confirmed": self.journal_confirmed,
             "screenshot_path": self.screenshot_path,
         }
 
@@ -78,6 +81,7 @@ class PreparedResponse:
             payment_method=data.get("payment_method", "Целиком, когда заказ выполнен"),
             prepared_at=datetime.fromisoformat(data["prepared_at"]),
             journal_exported=bool(data.get("journal_exported", False)),
+            journal_confirmed=bool(data.get("journal_confirmed", False)),
             screenshot_path=data.get("screenshot_path"),
         )
 

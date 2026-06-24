@@ -28,6 +28,7 @@ PLATFORM_LABELS = {
 
 CALLBACK_APPROVE = "approve"
 CALLBACK_REJECT = "reject"
+CALLBACK_JOURNAL_CONFIRM = "journal_ok"
 CALLBACK_OPEN = "open"
 
 
@@ -66,6 +67,15 @@ def parse_callback_data(data: str) -> tuple[str, str, str, str] | None:
     return parts[0], parts[1], parts[2], parts[3]
 
 
+def _format_budget(value: str | None) -> str:
+    if not value:
+        return "—"
+    text = value.strip()
+    if "₽" in text:
+        return text
+    return f"{text} ₽"
+
+
 def format_review_card(offer: PendingOffer) -> str:
     project = offer.project
     score = offer.score
@@ -73,13 +83,16 @@ def format_review_card(offer: PendingOffer) -> str:
     desc_preview = (project.full_description or "")[:300]
     skills = ", ".join(score.matched_skills) if score.matched_skills else "—"
     risks = ", ".join(score.risks) if score.risks else "—"
+    desired = _format_budget(project.desired_budget)
+    max_b = _format_budget(project.max_budget)
+    hire = project.buyer_hire_rate or "—"
 
     return (
         f"🆕 {platform_label} · {offer.source_key}\n"
         f"📌 {offer.title}\n"
-        f"💰 {project.desired_budget or '—'} / {project.max_budget or '—'}\n"
-        f"👥 Откликов: {project.offers_count or '—'} · "
-        f"Покупатель: {project.buyer or '—'} ({project.buyer_hire_rate or '—'})\n"
+        f"💰 {desired} / {max_b}\n"
+        f"👥 Откликов: {project.offers_count if project.offers_count is not None else '—'} · "
+        f"Покупатель: {project.buyer or '—'} ({hire})\n"
         f"⏱ {project.time_left or '—'}\n"
         f"🔗 {offer.url}\n\n"
         f"📊 Оценка GPT: {score.score}/10 — {score.reason}\n"
@@ -107,6 +120,20 @@ def build_review_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="👁 Открыть",
                     url=offer.url,
+                ),
+            ],
+        ]
+    )
+
+
+def build_journal_confirm_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
+    p, s, pid = offer.platform, offer.source_key, offer.project_id
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить отклик",
+                    callback_data=_callback_data(CALLBACK_JOURNAL_CONFIRM, p, s, pid),
                 ),
             ],
         ]
@@ -142,6 +169,7 @@ class TelegramReviewBot:
         on_reject: Any,
         on_response_text: Any | None = None,
         on_export_journal: Any | None = None,
+        on_journal_confirm: Any | None = None,
     ) -> None:
         @self._dp.callback_query(F.data.startswith(f"{CALLBACK_APPROVE}:"))
         async def handle_approve(callback: CallbackQuery) -> None:
@@ -161,6 +189,17 @@ class TelegramReviewBot:
                 return
             _, platform, source_key, project_id = parsed
             await on_reject(platform, source_key, project_id, callback)
+
+        if on_journal_confirm is not None:
+
+            @self._dp.callback_query(F.data.startswith(f"{CALLBACK_JOURNAL_CONFIRM}:"))
+            async def handle_journal_confirm(callback: CallbackQuery) -> None:
+                parsed = parse_callback_data(callback.data or "")
+                if not parsed:
+                    await callback.answer("Некорректный callback")
+                    return
+                _, platform, source_key, project_id = parsed
+                await on_journal_confirm(platform, source_key, project_id, callback)
 
         @self._dp.message(Command("start"))
         async def handle_start(message: Message) -> None:
@@ -199,6 +238,35 @@ class TelegramReviewBot:
         )
         return msg.message_id
 
+    async def send_form_prepared_ready(
+        self,
+        offer: PendingOffer,
+        *,
+        price: str,
+        delivery_days: int,
+        offer_url: str,
+        deadline_manual: bool = False,
+    ) -> int:
+        safe_title = html.escape(offer.title, quote=False)
+        text = (
+            f"✅ <b>Форма заполнена на Kwork</b> (без отправки)\n"
+            f"{safe_title}\n"
+            f"Цена: {html.escape(str(price))} ₽ · {delivery_days} дн.\n"
+            f"🔗 {html.escape(offer_url, quote=True)}\n"
+            "Открой ссылку <b>под тем же аккаунтом Kwork</b>, что на VPS.\n"
+            "Проверь форму и нажми «Предложить» на Kwork.\n"
+            "Затем нажми <b>Подтвердить отклик</b> ниже — только тогда запишу в журнал Excel."
+        )
+        if deadline_manual:
+            text += "\n⚠️ Срок в форме — выбери вручную в dropdown"
+        msg = await self._bot.send_message(
+            chat_id=self.chat_id,
+            text=text,
+            reply_markup=build_journal_confirm_keyboard(offer),
+            disable_web_page_preview=True,
+        )
+        return msg.message_id
+
     async def send_prepared_offer_details(
         self,
         offer: PendingOffer,
@@ -232,6 +300,16 @@ class TelegramReviewBot:
                 text=f"{label}\n\n{chunk}",
                 parse_mode=None,
             )
+
+    async def mark_journal_confirmed(self, callback: CallbackQuery) -> None:
+        if callback.message is None:
+            return
+        base = callback.message.text or callback.message.caption or ""
+        await callback.message.edit_text(
+            f"{base}\n\n📒 <b>Записано в журнал</b>",
+            reply_markup=None,
+            disable_web_page_preview=True,
+        )
 
     async def mark_review_skipped(self, callback: CallbackQuery) -> None:
         if callback.message is None:

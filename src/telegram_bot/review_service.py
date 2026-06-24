@@ -21,6 +21,7 @@ ApproveHandler = Callable[
 ]
 SubmitTextHandler = Callable[[PendingOffer, str], Awaitable[None]]
 ExportJournalHandler = Callable[[Message], Awaitable[None]]
+JournalConfirmHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 
 
 class ReviewService:
@@ -34,6 +35,7 @@ class ReviewService:
         on_approve: ApproveHandler | None = None,
         on_submit_text: SubmitTextHandler | None = None,
         on_export_journal: ExportJournalHandler | None = None,
+        on_journal_confirm: JournalConfirmHandler | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -42,11 +44,13 @@ class ReviewService:
         self._on_approve = on_approve
         self._on_submit_text = on_submit_text
         self._on_export_journal = on_export_journal
+        self._on_journal_confirm = on_journal_confirm
         self.tg_bot.register_handlers(
             on_approve=self._handle_approve,
             on_reject=self._handle_reject,
             on_response_text=self._handle_response_text,
             on_export_journal=self._handle_export_journal,
+            on_journal_confirm=self._handle_journal_confirm,
         )
 
     def set_approve_handler(self, handler: ApproveHandler) -> None:
@@ -57,6 +61,9 @@ class ReviewService:
 
     def set_export_journal_handler(self, handler: ExportJournalHandler) -> None:
         self._on_export_journal = handler
+
+    def set_journal_confirm_handler(self, handler: JournalConfirmHandler) -> None:
+        self._on_journal_confirm = handler
 
     async def request_review(
         self,
@@ -166,6 +173,22 @@ class ReviewService:
             return
 
         await self._on_submit_text(offer, message.text.strip())
+
+    async def _handle_journal_confirm(
+        self,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        callback: CallbackQuery,
+    ) -> None:
+        if self._on_journal_confirm is None:
+            await callback.answer("Недоступно", show_alert=True)
+            return
+        chat_id = str(self.settings.telegram_chat_id)
+        if callback.message and str(callback.message.chat.id) != chat_id:
+            await callback.answer("Недоступно", show_alert=True)
+            return
+        await self._on_journal_confirm(platform, source_key, project_id, callback)
 
     async def _handle_export_journal(self, message: Message) -> None:
         if self._on_export_journal is None:
