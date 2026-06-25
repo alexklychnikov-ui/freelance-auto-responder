@@ -256,6 +256,25 @@ FIND_TITLE_INPUT_JS = """
 }
 """
 
+FIND_DEADLINE_INPUT_JS = """
+() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const byPh = document.querySelector('input.vs__search[placeholder="Срок выполнения"]');
+  if (byPh) return byPh;
+  const label = [...document.querySelectorAll('label, span, div, p')].find(
+    (el) => /^Срок выполнения$/i.test(norm(el.textContent))
+  );
+  if (label) {
+    const root =
+      label.closest('.modal-individual-message__column, .form-field, .field, .form-item, div')
+      || label.parentElement;
+    const inp = root?.querySelector('input.vs__search');
+    if (inp) return inp;
+  }
+  return null;
+}
+"""
+
 FIND_PRICE_INPUT_JS = """
 () => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
@@ -390,7 +409,13 @@ READ_OFFER_FORM_JS = f"""
     descPreview: (desc?.value || '').slice(0, 100),
     price: (priceInput?.value || '').replace(/\\s/g, ''),
     title: titlePlain,
-    deadline: (document.querySelector('input.vs__search[placeholder="Срок выполнения"]')?.value || '').trim(),
+    deadline: (() => {{
+      const findDeadline = {FIND_DEADLINE_INPUT_JS};
+      const el = findDeadline();
+      return (el?.value || '').trim();
+    }})(),
+    deadlineLabel: (document.querySelector('.duration-select .vs__selected-options, .duration-select .vs__selected')?.textContent || '')
+      .replace(/\\s+/g, ' ').trim(),
   }};
 }}
 """
@@ -726,25 +751,53 @@ def _fill_price(browser: BrowserClient, value: str) -> bool:
 
 def _fill_deadline_vueselect(browser: BrowserClient, delivery_days: int) -> dict[str, Any]:
     days = snap_delivery_days(delivery_days)
-    selector = 'input.vs__search[placeholder="Срок выполнения"]'
-    if hasattr(browser, "fill_sequential"):
+    if hasattr(browser, "fill_sequential") and hasattr(browser, "_ensure_page"):
+        page = browser._ensure_page()
         try:
-            browser.fill_sequential(selector, str(days))
-            if hasattr(browser, "_ensure_page"):
-                page = browser._ensure_page()
+            found = browser.evaluate(
+                f"""
+                () => {{
+                  const findDeadline = {FIND_DEADLINE_INPUT_JS};
+                  const el = findDeadline();
+                  if (!el) return null;
+                  el.setAttribute('data-fr-deadline', '1');
+                  return true;
+                }}
+                """
+            )
+            if not found:
+                return {"ok": False, "reason": "deadline_input_not_found", "targetDays": days}
+            selector = "input.vs__search[data-fr-deadline='1']"
+            loc = page.locator(selector).first
+            loc.click(force=True)
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+            loc.press_sequentially(str(days), delay=60)
+            page.wait_for_timeout(600)
+            option = page.locator(".vs__dropdown-option").filter(has_text=str(days)).first
+            if option.count() > 0:
+                option.click(force=True)
+            else:
                 page.keyboard.press("Enter")
+            page.keyboard.press("Tab")
             if hasattr(browser, "wait_ms"):
                 browser.wait_ms(800)
             read = browser.evaluate(
                 f"""
                 () => {{
-                  const el = document.querySelector({json.dumps(selector)});
+                  const findDeadline = {FIND_DEADLINE_INPUT_JS};
+                  const el = findDeadline();
                   return (el?.value || '').trim();
                 }}
                 """
             )
             if str(read).strip():
-                return {"ok": True, "method": "vueselect_playwright", "targetDays": days, "picked": read}
+                return {
+                    "ok": True,
+                    "method": "vueselect_playwright",
+                    "targetDays": days,
+                    "picked": read,
+                }
         except Exception as exc:
             return {"ok": False, "reason": f"vueselect_error:{exc}", "targetDays": days}
     try:
@@ -1297,7 +1350,11 @@ class KworkAdapter:
             self.browser.wait_ms(800)
 
         deadline_result = _fill_deadline(self.browser, delivery_days)
-        days_set = bool(isinstance(deadline_result, dict) and deadline_result.get("ok"))
+        days_set = bool(
+            isinstance(deadline_result, dict)
+            and deadline_result.get("ok")
+            and (read_deadline or re.search(r"\d", str(deadline_result.get("picked") or "")))
+        )
         price_ok = _fill_price(self.browser, str(price)) or price_ok
         if order_title:
             title_ok = _fill_order_title(self.browser, order_title) or title_ok
@@ -1307,6 +1364,9 @@ class KworkAdapter:
         desc_len = int(readback.get("descLen") or 0)
         read_price = str(readback.get("price") or "").replace(" ", "")
         read_title = str(readback.get("title") or "").strip()
+        read_deadline = str(
+            readback.get("deadline") or readback.get("deadlineLabel") or ""
+        ).strip()
         min_desc = min(150, max(50, len(text.strip()) // 3))
 
         if not isinstance(fill_result, dict):
