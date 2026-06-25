@@ -184,6 +184,7 @@ PRICE_SELECTORS = (
     ".stages__stage-price-input",
 )
 TITLE_SELECTORS = (
+    'textarea[name="name"]',
     'input[placeholder*="Название заказа"]',
     'input[placeholder*="название заказа"]',
     'input[name="name"]',
@@ -192,10 +193,41 @@ TITLE_SELECTORS = (
     '.wants-offer input[type="text"]',
 )
 
+TRUMBOWYG_SET_JS = """
+(name, plainText) => {
+  const raw = String(plainText || '');
+  const limit = name === 'name' ? 70 : 20000;
+  const text = raw.slice(0, limit);
+  const ta = document.querySelector(`textarea[name="${name}"]`);
+  if (!ta) return false;
+  const box = ta.closest('.trumbowyg-box') || ta.parentElement;
+  const editor = box?.querySelector('.trumbowyg-editor');
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const lines = text.split(/\\n+/).map((l) => l.trim()).filter(Boolean);
+  const html = lines.length
+    ? lines.map((l) => `<p>${esc(l)}</p>`).join('')
+    : '<div><br></div>';
+  if (editor) {
+    editor.innerHTML = html;
+    editor.classList.remove('is-placeholder-mobile', 'force-placeholder');
+  }
+  ta.value = html;
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  ta.dispatchEvent(new Event('change', { bubbles: true }));
+  if (editor) {
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+    editor.dispatchEvent(new Event('blur', { bubbles: true }));
+  }
+  return true;
+}
+"""
+
 FIND_TITLE_INPUT_JS = """
 () => {
+  const ta = document.querySelector('textarea[name="name"]');
+  if (ta) return ta;
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-  const byPlaceholder = [...document.querySelectorAll('input[type="text"], input:not([type])')].find((inp) =>
+  const byPlaceholder = [...document.querySelectorAll('input[type="text"], textarea')].find((inp) =>
     /название заказа/i.test(inp.getAttribute('placeholder') || '')
   );
   if (byPlaceholder) return byPlaceholder;
@@ -207,14 +239,8 @@ FIND_TITLE_INPUT_JS = """
     const root =
       label.closest('.form-field, .form-item, .field, .offer-form__row, .wants-offer__field, div')
       || label.parentElement;
-    const inp = root?.querySelector('input[type="text"], input:not([type="hidden"])');
-    if (inp) return inp;
-    let sib = label.nextElementSibling;
-    while (sib) {
-      const found = sib.querySelector?.('input[type="text"], input:not([type="hidden"])') || null;
-      if (found) return found;
-      sib = sib.nextElementSibling;
-    }
+    const inp = root?.querySelector('textarea[name="name"], input[type="text"]:not([type="hidden"])');
+    if (inp && inp.id !== 'offer-custom-price' && inp.type !== 'tel') return inp;
   }
 
   const counter = [...document.querySelectorAll('span, div, p')].find((el) =>
@@ -222,8 +248,8 @@ FIND_TITLE_INPUT_JS = """
   );
   if (counter) {
     const root = counter.closest('.form-field, .field, .wants-offer__field, div') || counter.parentElement;
-    const inp = root?.querySelector('input[type="text"], input:not([type="hidden"])');
-    if (inp) return inp;
+    const inp = root?.querySelector('textarea[name="name"], input[type="text"]:not([type="hidden"])');
+    if (inp && inp.id !== 'offer-custom-price' && inp.type !== 'tel') return inp;
   }
 
   return null;
@@ -354,12 +380,17 @@ READ_OFFER_FORM_JS = f"""
     }}
     return null;
   }})();
+  const titleTa = document.querySelector('textarea[name="name"]');
+  const titlePlain = titleTa
+    ? (titleTa.value || '').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim()
+    : '';
   return {{
     url: location.href,
     descLen: (desc?.value || '').length,
     descPreview: (desc?.value || '').slice(0, 100),
     price: (priceInput?.value || '').replace(/\\s/g, ''),
-    title: titleInput?.value || '',
+    title: titlePlain,
+    deadline: (document.querySelector('input.vs__search[placeholder="Срок выполнения"]')?.value || '').trim(),
   }};
 }}
 """
@@ -637,7 +668,114 @@ def _build_deadline_pick_js(delivery_days: int) -> str:
 """
 
 
+def _set_trumbowyg(browser: BrowserClient, field_name: str, text: str) -> bool:
+    value = (text or "").strip()
+    if not value and field_name != "name":
+        return False
+    try:
+        return bool(
+            browser.evaluate(
+                f"({TRUMBOWYG_SET_JS})({json.dumps(field_name)}, {json.dumps(value)})"
+            )
+        )
+    except Exception:
+        return False
+
+
+def _fill_description(browser: BrowserClient, text: str) -> bool:
+    if _set_trumbowyg(browser, "description", text):
+        return True
+    return _fill_first(browser, DESC_SELECTORS, text)
+
+
+def _fill_price(browser: BrowserClient, value: str) -> bool:
+    if not value:
+        return False
+    if hasattr(browser, "fill_sequential"):
+        try:
+            browser.fill_sequential("#offer-custom-price", str(value))
+            return True
+        except Exception:
+            pass
+    if _fill_first(browser, PRICE_SELECTORS, value):
+        return True
+    try:
+        ok = browser.evaluate(
+            f"""
+            () => {{
+              const val = {json.dumps(str(value))};
+              const findPrice = {FIND_PRICE_INPUT_JS};
+              const inp = findPrice();
+              if (!inp) return false;
+              const proto = HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+              if (setter) setter.call(inp, val);
+              else inp.value = val;
+              inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+              inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+              inp.focus();
+              inp.blur();
+              return true;
+            }}
+            """
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _fill_deadline_vueselect(browser: BrowserClient, delivery_days: int) -> dict[str, Any]:
+    days = snap_delivery_days(delivery_days)
+    selector = 'input.vs__search[placeholder="Срок выполнения"]'
+    if hasattr(browser, "fill_sequential"):
+        try:
+            browser.fill_sequential(selector, str(days))
+            if hasattr(browser, "_ensure_page"):
+                page = browser._ensure_page()
+                page.keyboard.press("Enter")
+            if hasattr(browser, "wait_ms"):
+                browser.wait_ms(800)
+            read = browser.evaluate(
+                f"""
+                () => {{
+                  const el = document.querySelector({json.dumps(selector)});
+                  return (el?.value || '').trim();
+                }}
+                """
+            )
+            if str(read).strip():
+                return {"ok": True, "method": "vueselect_playwright", "targetDays": days, "picked": read}
+        except Exception as exc:
+            return {"ok": False, "reason": f"vueselect_error:{exc}", "targetDays": days}
+    try:
+        picked = browser.evaluate(
+            f"""
+            () => {{
+              const days = {days};
+              const el = document.querySelector('input.vs__search[placeholder="Срок выполнения"]');
+              if (!el) return {{ ok: false, reason: 'deadline_input_not_found' }};
+              el.focus();
+              el.click();
+              el.value = String(days);
+              el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+              el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+              el.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', bubbles: true }}));
+              el.blur();
+              return {{ ok: true, method: 'vueselect_js', picked: el.value, targetDays: days }};
+            }}
+            """
+        )
+        if isinstance(picked, dict):
+            return picked
+    except Exception as exc:
+        return {"ok": False, "reason": str(exc), "targetDays": days}
+    return {"ok": False, "reason": "deadline_fill_failed", "targetDays": days}
+
+
 def _fill_deadline(browser: BrowserClient, delivery_days: int) -> dict[str, Any]:
+    vue = _fill_deadline_vueselect(browser, delivery_days)
+    if vue.get("ok"):
+        return vue
     opened = browser.evaluate(DEADLINE_OPEN_JS)
     if hasattr(browser, "wait_ms"):
         browser.wait_ms(1500)
@@ -648,8 +786,9 @@ def _fill_deadline(browser: BrowserClient, delivery_days: int) -> dict[str, Any]
         browser.wait_ms(1200)
         picked = browser.evaluate(_build_deadline_pick_js(delivery_days))
     if not isinstance(picked, dict):
-        return {"ok": False, "reason": "invalid_pick_result", "opened": opened}
+        return {"ok": False, "reason": "invalid_pick_result", "opened": opened, "vue": vue}
     picked["opened"] = opened
+    picked["vue_attempt"] = vue
     return picked
 
 
@@ -701,36 +840,6 @@ def _resolve_order_title(
     return fb
 
 
-def _fill_price(browser: BrowserClient, value: str) -> bool:
-    if not value:
-        return False
-    if _fill_first(browser, PRICE_SELECTORS, value):
-        return True
-    try:
-        ok = browser.evaluate(
-            f"""
-            () => {{
-              const val = {json.dumps(str(value))};
-              const findPrice = {FIND_PRICE_INPUT_JS};
-              const inp = findPrice();
-              if (!inp) return false;
-              const proto = HTMLInputElement.prototype;
-              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-              if (setter) setter.call(inp, val);
-              else inp.value = val;
-              inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
-              inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
-              inp.focus();
-              inp.blur();
-              return true;
-            }}
-            """
-        )
-        return bool(ok)
-    except Exception:
-        return False
-
-
 def _read_form_price_bounds(browser: BrowserClient) -> tuple[int | None, int | None]:
     try:
         raw = browser.evaluate(EXTRACT_FORM_BOUNDS_JS)
@@ -777,6 +886,8 @@ def _fill_order_title(browser: BrowserClient, title: str) -> bool:
     value = (title or "").strip()[:70]
     if not value:
         return False
+    if _set_trumbowyg(browser, "name", value):
+        return True
     if _fill_first(browser, TITLE_SELECTORS, value):
         return True
     try:
@@ -1153,8 +1264,10 @@ class KworkAdapter:
             form_max=form_max,
         )
 
-        desc_ok = _fill_first(self.browser, DESC_SELECTORS, text)
         price_ok = _fill_price(self.browser, str(price))
+        if hasattr(self.browser, "wait_ms"):
+            self.browser.wait_ms(400)
+        desc_ok = _fill_description(self.browser, text)
         title_ok = _fill_order_title(self.browser, order_title)
 
         if hasattr(self.browser, "wait_ms"):

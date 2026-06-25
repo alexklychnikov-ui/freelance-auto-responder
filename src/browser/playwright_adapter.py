@@ -56,6 +56,16 @@ class PlaywrightBrowserAdapter:
         page = self._ensure_page()
         page.fill(ref_or_selector, text, timeout=15000)
 
+    def fill_sequential(self, selector: str, text: str) -> None:
+        page = self._ensure_page()
+        loc = page.locator(selector).first
+        loc.wait_for(state="visible", timeout=15000)
+        loc.click()
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        loc.press_sequentially(str(text), delay=40)
+        page.keyboard.press("Tab")
+
     def evaluate(self, js: str) -> Any:
         return self._ensure_page().evaluate(js)
 
