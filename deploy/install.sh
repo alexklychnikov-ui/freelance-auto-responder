@@ -55,4 +55,26 @@ if [[ ! -f "$APP_DIR/data/response_journal.xlsx" ]]; then
   touch "$APP_DIR/data/response_journal.xlsx"
 fi
 
-echo "[6/6] done — run: cd $APP_DIR && $VENV/bin/python -m src.scheduler run-test"
+echo "[6/7] headroom proxy (Linux, optional)"
+HEADROOM_WHEEL="https://github.com/headroomlabs-ai/headroom/releases/download/v0.27.0/headroom_ai-0.27.0-cp310-abi3-manylinux_2_28_x86_64.whl"
+if "$VENV/bin/python" -m pip install -q "$HEADROOM_WHEEL" "headroom-ai[proxy,mcp]==0.27.0" 2>/dev/null; then
+  cat > /etc/systemd/system/headroom-proxy.service <<'UNIT'
+[Unit]
+Description=Headroom context compression proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/freelance-responder/.venv/bin/headroom proxy --host 127.0.0.1 --port 8787
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable --now headroom-proxy.service 2>/dev/null || true
+fi
+
+echo "[7/7] done — run: cd $APP_DIR && $VENV/bin/python -m src.scheduler run-test"

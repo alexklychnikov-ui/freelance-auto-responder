@@ -21,6 +21,7 @@ data/pending_offers/
 data/*.xlsx
 logs/*.log
 logs/agent-worklog.txt
+deploy/headroom-wheel/
 
 # os / ide
 .DS_Store

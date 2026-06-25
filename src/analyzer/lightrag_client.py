@@ -4,8 +4,10 @@ import logging
 from collections.abc import Callable
 from pathlib import Path
 
+from src.analyzer.context_compress import compress_context_text
 from src.analyzer.github_stack import load_github_stack
 from src.analyzer.lightrag_http import search_lightrag_http
+from src.config import Settings, get_settings
 from src.models import ProjectFull
 
 GENERAL_STACK_QUERY = (
@@ -55,7 +57,9 @@ class LightRagClient:
         github_username: str = "alexklychnikov-ui",
         github_token: str = "",
         github_stack_cache: str = "data/github_stack_cache.json",
+        settings: Settings | None = None,
     ) -> None:
+        self._settings = settings or get_settings()
         self._github_username = github_username
         self._github_token = github_token
         self._github_stack_cache = github_stack_cache
@@ -84,15 +88,25 @@ class LightRagClient:
             cache_path=Path(self._github_stack_cache),
         )
 
+    def _maybe_compress(self, text: str) -> str:
+        if not self._settings.headroom_compress_context:
+            return text
+        return compress_context_text(
+            text,
+            model=self._settings.openai_model,
+            proxy_url=self._settings.headroom_proxy_url,
+            min_chars=self._settings.headroom_context_min_chars,
+        )
+
     def search_stack_context(self) -> str:
-        return self._search_fn(GENERAL_STACK_QUERY, "mix")
+        return self._maybe_compress(self._search_fn(GENERAL_STACK_QUERY, "mix"))
 
     def search_project_context(self, project: ProjectFull) -> str:
         query = build_project_stack_query(project)
-        return self._search_fn(query, "mix")
+        return self._maybe_compress(self._search_fn(query, "mix"))
 
     def search_response_rules(self) -> str:
-        return self._search_fn(RULES_QUERY, "mix")
+        return self._maybe_compress(self._search_fn(RULES_QUERY, "mix"))
 
     def get_scoring_context(self, project: ProjectFull) -> str:
         github_stack = self.get_github_stack()

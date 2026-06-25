@@ -211,14 +211,13 @@ TRUMBOWYG_SET_JS = """
   if (editor) {
     editor.innerHTML = html;
     editor.classList.remove('is-placeholder-mobile', 'force-placeholder');
+    editor.focus();
+    editor.dispatchEvent(new Event('input', { bubbles: true }));
+    editor.dispatchEvent(new Event('blur', { bubbles: true }));
   }
   ta.value = html;
   ta.dispatchEvent(new Event('input', { bubbles: true }));
   ta.dispatchEvent(new Event('change', { bubbles: true }));
-  if (editor) {
-    editor.dispatchEvent(new Event('input', { bubbles: true }));
-    editor.dispatchEvent(new Event('blur', { bubbles: true }));
-  }
   return true;
 }
 """
@@ -531,8 +530,8 @@ def _build_offer_fill_js(text: str, price: str, *, order_title: str = "") -> str
   setValue(priceInput, payload.price);
   if (titleInput && payload.title) setValue(titleInput, payload.title.slice(0, 70));
 
-  const payCard = [...document.querySelectorAll('label, div, span, button')].find((el) =>
-    /по мере выполнения|частями по мере/i.test((el.textContent || '').replace(/\\s+/g, ' '))
+  const payCard = [...document.querySelectorAll('.offer-payment-type__item')].find((el) =>
+    /по мере выполнения задач/i.test((el.textContent || '').replace(/\\s+/g, ' '))
   );
   if (payCard) payCard.click();
 
@@ -971,18 +970,28 @@ def _fill_order_title(browser: BrowserClient, title: str) -> bool:
 
 def _select_milestone_payment(browser: BrowserClient) -> bool:
     try:
+        if hasattr(browser, "_ensure_page"):
+            page = browser._ensure_page()
+            item = page.locator(".offer-payment-type__item").filter(
+                has_text=re.compile(r"По мере выполнения задач", re.I)
+            ).first
+            if item.count() > 0:
+                item.click(force=True)
+                if hasattr(browser, "wait_ms"):
+                    browser.wait_ms(800)
+                return True
+    except Exception:
+        pass
+    try:
         return bool(
             browser.evaluate(
                 """
                 () => {
-                  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-                  const hit = [...document.querySelectorAll('label, div, span, button, p')].find((el) => {
-                    const t = norm(el.textContent);
-                    return /по мере выполнения/i.test(t) || /частями по мере/i.test(t);
-                  });
-                  if (!hit) return false;
-                  const clickable = hit.closest('label, button, [role="button"]') || hit;
-                  clickable.click();
+                  const item = [...document.querySelectorAll('.offer-payment-type__item')].find((el) =>
+                    /по мере выполнения задач/i.test((el.textContent || '').replace(/\\s+/g, ' '))
+                  );
+                  if (!item) return false;
+                  item.click();
                   return true;
                 }
                 """
@@ -1025,14 +1034,28 @@ def _fill_offer_stages(
     _ensure_stage_rows(browser, len(stages))
 
     filled: list[dict[str, Any]] = []
+    page = browser._ensure_page() if hasattr(browser, "_ensure_page") else None
     for idx, (title, amount) in enumerate(stages, start=1):
         title_ok = _set_trumbowyg(browser, f"stageTitle-{idx}", title)
-        price_ok = False
-        if hasattr(browser, "fill_sequential") and hasattr(browser, "_ensure_page"):
+        if page and not title_ok:
             try:
-                page = browser._ensure_page()
+                editor = page.locator(
+                    f'div:has(textarea[name="stageTitle-{idx}"]) .trumbowyg-editor'
+                ).first
+                editor.click(force=True)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                editor.press_sequentially(title[:70], delay=30)
+                page.keyboard.press("Tab")
+                title_ok = True
+            except Exception:
+                title_ok = False
+        price_ok = False
+        if page is not None:
+            try:
                 loc = page.locator(".stages__stage-price-input").nth(idx - 1)
-                loc.click(force=True)
+                loc.scroll_into_view_if_needed(timeout=5000)
+                loc.click(force=True, timeout=5000)
                 page.keyboard.press("Control+A")
                 page.keyboard.press("Backspace")
                 loc.press_sequentially(str(amount), delay=40)
@@ -1055,10 +1078,15 @@ def _fill_offer_stages(
     read = browser.evaluate(
         """
         () => {
-          const rows = [...document.querySelectorAll('textarea[name^="stageTitle-"]')].map((ta) => ({
-            name: ta.name,
-            title: (ta.value || '').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 70),
-          }));
+          const rows = [...document.querySelectorAll('textarea[name^="stageTitle-"]')].map((ta) => {
+            const ed = ta.closest('.trumbowyg-box')?.querySelector('.trumbowyg-editor');
+            const title = (ed?.textContent || ta.value || '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\\s+/g, ' ')
+              .trim()
+              .slice(0, 70);
+            return { name: ta.name, title };
+          });
           const prices = [...document.querySelectorAll('.stages__stage-price-input')].map((inp) =>
             (inp.value || '').replace(/\\s/g, '')
           );
@@ -1069,6 +1097,13 @@ def _fill_offer_stages(
     ok = len(filled) >= 2 and all(
         item["titleOk"] and item["priceOk"] for item in filled[:2]
     )
+    if isinstance(read, dict):
+        rows = read.get("rows") or []
+        prices = read.get("prices") or []
+        if len(rows) >= 2 and prices[:2] and all(prices[:2]):
+            titles_ok = all((r.get("title") or "").strip() for r in rows[: len(stages)])
+            if titles_ok:
+                ok = True
     return {"ok": ok, "selected": selected, "filled": filled, "read": read}
 
 
@@ -1430,23 +1465,14 @@ class KworkAdapter:
         if hasattr(self.browser, "wait_ms"):
             self.browser.wait_ms(500)
 
-        stages = plan_offer_stages(int(price), project)
-        stages_result = _fill_offer_stages(self.browser, stages)
-
-        fill_result = self.browser.evaluate(
-            _build_offer_fill_js(text, price, order_title=order_title)
-        )
-        if order_title:
-            title_ok = _fill_order_title(self.browser, order_title) or title_ok
-        if hasattr(self.browser, "wait_ms"):
-            self.browser.wait_ms(800)
-
         deadline_result = _fill_deadline(self.browser, delivery_days)
         price_ok = _fill_price(self.browser, str(price)) or price_ok
         if order_title:
             title_ok = _fill_order_title(self.browser, order_title) or title_ok
-        if not stages_result.get("ok"):
-            stages_result = _fill_offer_stages(self.browser, stages)
+
+        stages = plan_offer_stages(int(price), project)
+        stages_result = _fill_offer_stages(self.browser, stages)
+        fill_result: dict[str, Any] = {}
 
         _autosave_wait(self.browser, wait_ms=8000)
         readback = _read_offer_form(self.browser)
@@ -1465,6 +1491,9 @@ class KworkAdapter:
 
         if not isinstance(fill_result, dict):
             fill_result = {}
+        fill_result["hasDesc"] = desc_ok
+        fill_result["hasPrice"] = price_ok
+        fill_result["hasTitle"] = title_ok
         fill_result["daysSet"] = days_set
         fill_result["deadline"] = deadline_result
         fill_result["readback"] = readback

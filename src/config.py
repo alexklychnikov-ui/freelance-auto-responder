@@ -45,6 +45,9 @@ class Settings(BaseSettings):
     lightrag_mcp: str = "user-lightrag"
     lightrag_base_url: str = ""
     lightrag_api_key: str = ""
+    headroom_proxy_url: str = "http://127.0.0.1:8787"
+    headroom_compress_context: bool = True
+    headroom_context_min_chars: int = 2500
     github_username: str = "alexklychnikov-ui"
     github_token: str = ""
     github_stack_cache: str = "data/github_stack_cache.json"
