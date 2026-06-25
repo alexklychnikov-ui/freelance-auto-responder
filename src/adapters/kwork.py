@@ -11,6 +11,7 @@ from src.adapters.kwork_delivery import (
     snap_delivery_days,
 )
 from src.adapters.kwork_pricing import clamp_price_to_budget, parse_form_price_bounds
+from src.adapters.kwork_stages import plan_offer_stages
 from src.adapters.kwork_auth import (
     KworkAuthError,
     KworkCredentials,
@@ -196,7 +197,7 @@ TITLE_SELECTORS = (
 TRUMBOWYG_SET_JS = """
 (name, plainText) => {
   const raw = String(plainText || '');
-  const limit = name === 'name' ? 70 : 20000;
+  const limit = (name === 'name' || String(name).startsWith('stageTitle')) ? 70 : 20000;
   const text = raw.slice(0, limit);
   const ta = document.querySelector(`textarea[name="${name}"]`);
   if (!ta) return false;
@@ -531,7 +532,7 @@ def _build_offer_fill_js(text: str, price: str, *, order_title: str = "") -> str
   if (titleInput && payload.title) setValue(titleInput, payload.title.slice(0, 70));
 
   const payCard = [...document.querySelectorAll('label, div, span, button')].find((el) =>
-    /целиком.*заказ выполнен/i.test((el.textContent || '').replace(/\\s+/g, ' '))
+    /по мере выполнения|частями по мере/i.test((el.textContent || '').replace(/\\s+/g, ' '))
   );
   if (payCard) payCard.click();
 
@@ -968,6 +969,109 @@ def _fill_order_title(browser: BrowserClient, title: str) -> bool:
         return False
 
 
+def _select_milestone_payment(browser: BrowserClient) -> bool:
+    try:
+        return bool(
+            browser.evaluate(
+                """
+                () => {
+                  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                  const hit = [...document.querySelectorAll('label, div, span, button, p')].find((el) => {
+                    const t = norm(el.textContent);
+                    return /по мере выполнения/i.test(t) || /частями по мере/i.test(t);
+                  });
+                  if (!hit) return false;
+                  const clickable = hit.closest('label, button, [role="button"]') || hit;
+                  clickable.click();
+                  return true;
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _ensure_stage_rows(browser: BrowserClient, needed: int) -> None:
+    for _ in range(8):
+        count = browser.evaluate(
+            """() => document.querySelectorAll('textarea[name^="stageTitle-"]').length"""
+        )
+        if not isinstance(count, int) or count >= needed:
+            return
+        browser.evaluate(
+            """
+            () => {
+              const btn = [...document.querySelectorAll('a, button, span, div')].find((el) =>
+                /добавить задачу/i.test((el.textContent || '').replace(/\\s+/g, ' '))
+              );
+              if (btn) btn.click();
+              return Boolean(btn);
+            }
+            """
+        )
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(400)
+
+
+def _fill_offer_stages(
+    browser: BrowserClient, stages: list[tuple[str, int]]
+) -> dict[str, Any]:
+    if len(stages) < 2:
+        return {"ok": False, "reason": "need_min_2_stages"}
+    selected = _select_milestone_payment(browser)
+    if hasattr(browser, "wait_ms"):
+        browser.wait_ms(800)
+    _ensure_stage_rows(browser, len(stages))
+
+    filled: list[dict[str, Any]] = []
+    for idx, (title, amount) in enumerate(stages, start=1):
+        title_ok = _set_trumbowyg(browser, f"stageTitle-{idx}", title)
+        price_ok = False
+        if hasattr(browser, "fill_sequential") and hasattr(browser, "_ensure_page"):
+            try:
+                page = browser._ensure_page()
+                loc = page.locator(".stages__stage-price-input").nth(idx - 1)
+                loc.click(force=True)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                loc.press_sequentially(str(amount), delay=40)
+                page.keyboard.press("Tab")
+                price_ok = True
+            except Exception:
+                price_ok = False
+        filled.append(
+            {
+                "idx": idx,
+                "title": title,
+                "amount": amount,
+                "titleOk": title_ok,
+                "priceOk": price_ok,
+            }
+        )
+
+    if hasattr(browser, "wait_ms"):
+        browser.wait_ms(500)
+    read = browser.evaluate(
+        """
+        () => {
+          const rows = [...document.querySelectorAll('textarea[name^="stageTitle-"]')].map((ta) => ({
+            name: ta.name,
+            title: (ta.value || '').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, 70),
+          }));
+          const prices = [...document.querySelectorAll('.stages__stage-price-input')].map((inp) =>
+            (inp.value || '').replace(/\\s/g, '')
+          );
+          return { rows, prices };
+        }
+        """
+    )
+    ok = len(filled) >= 2 and all(
+        item["titleOk"] and item["priceOk"] for item in filled[:2]
+    )
+    return {"ok": ok, "selected": selected, "filled": filled, "read": read}
+
+
 def _autosave_wait(browser: BrowserClient, *, wait_ms: int = 8000) -> None:
     try:
         browser.evaluate(TRIGGER_OFFER_AUTOSAVE_JS)
@@ -1326,20 +1430,8 @@ class KworkAdapter:
         if hasattr(self.browser, "wait_ms"):
             self.browser.wait_ms(500)
 
-        try:
-            self.browser.evaluate(
-                """
-                () => {
-                  const payCard = [...document.querySelectorAll('label, div, span, button')].find((el) =>
-                    /целиком.*заказ выполнен/i.test((el.textContent || '').replace(/\\s+/g, ' '))
-                  );
-                  if (payCard) payCard.click();
-                  return Boolean(payCard);
-                }
-                """
-            )
-        except Exception:
-            pass
+        stages = plan_offer_stages(int(price), project)
+        stages_result = _fill_offer_stages(self.browser, stages)
 
         fill_result = self.browser.evaluate(
             _build_offer_fill_js(text, price, order_title=order_title)
@@ -1350,14 +1442,11 @@ class KworkAdapter:
             self.browser.wait_ms(800)
 
         deadline_result = _fill_deadline(self.browser, delivery_days)
-        days_set = bool(
-            isinstance(deadline_result, dict)
-            and deadline_result.get("ok")
-            and (read_deadline or re.search(r"\d", str(deadline_result.get("picked") or "")))
-        )
         price_ok = _fill_price(self.browser, str(price)) or price_ok
         if order_title:
             title_ok = _fill_order_title(self.browser, order_title) or title_ok
+        if not stages_result.get("ok"):
+            stages_result = _fill_offer_stages(self.browser, stages)
 
         _autosave_wait(self.browser, wait_ms=8000)
         readback = _read_offer_form(self.browser)
@@ -1367,6 +1456,11 @@ class KworkAdapter:
         read_deadline = str(
             readback.get("deadline") or readback.get("deadlineLabel") or ""
         ).strip()
+        days_set = bool(
+            isinstance(deadline_result, dict)
+            and deadline_result.get("ok")
+            and (read_deadline or re.search(r"\d", str(deadline_result.get("picked") or "")))
+        )
         min_desc = min(150, max(50, len(text.strip()) // 3))
 
         if not isinstance(fill_result, dict):
@@ -1377,6 +1471,8 @@ class KworkAdapter:
         fill_result["playwrightDesc"] = desc_ok
         fill_result["playwrightPrice"] = price_ok
         fill_result["playwrightTitle"] = title_ok
+        fill_result["stages"] = stages_result
+        fill_result["stagesPlan"] = [{"title": t, "amount": a} for t, a in stages]
 
         if desc_len < min_desc or not read_price:
             return SubmitResult(
@@ -1397,6 +1493,12 @@ class KworkAdapter:
                 success=False,
                 project_id=project_id,
                 message=f"prepare_title_empty: {fill_result}",
+            )
+        if not stages_result.get("ok"):
+            return SubmitResult(
+                success=False,
+                project_id=project_id,
+                message=f"prepare_stages_failed: {fill_result}",
             )
 
         message = f"prepared: verified desc={desc_len} price={read_price} title={read_title!r}"
