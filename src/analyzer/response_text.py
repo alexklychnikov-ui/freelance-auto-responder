@@ -3,6 +3,9 @@ from __future__ import annotations
 
 import re
 
+from src.analyzer.project_brief import buyer_checklist_issues
+from src.models import ProjectFull
+
 _KWORK_VIOLATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("off_platform_call", re.compile(r"созвон", re.I)),
     ("phone_call", re.compile(r"позвон(им|ить|ю)?|звонок|перезвон", re.I)),
@@ -36,3 +39,34 @@ def kwork_compliance_issues(text: str) -> list[str]:
         if pattern.search(text):
             issues.append(name)
     return issues
+
+
+def append_missing_checklist_answers(
+    text: str,
+    project: ProjectFull,
+    *,
+    price_rub: int | None = None,
+    delivery_days: int | None = None,
+) -> str:
+    missing = buyer_checklist_issues(project, text)
+    if not missing:
+        return text
+    extras: list[str] = []
+    if "checklist:стоимость" in missing and price_rub:
+        extras.append(f"Стоимость: {price_rub} ₽.")
+    if "checklist:срок" in missing and delivery_days:
+        extras.append(f"Срок: {delivery_days} дн.")
+    if "checklist:стек" in missing:
+        extras.append("Стек: Python, aiogram, SQLAlchemy, PostgreSQL или SQLite.")
+    if "checklist:код" in missing:
+        extras.append(
+            "Готов сначала посмотреть текущий код и наработки предыдущего исполнителя."
+        )
+    if "checklist:передача" in missing:
+        extras.append(
+            "В передачу входят исходный код, база данных, инструкция по запуску "
+            "и проверка основных сценариев."
+        )
+    if not extras:
+        return text
+    return text.rstrip() + "\n\n" + "\n".join(extras)

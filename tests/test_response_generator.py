@@ -82,6 +82,23 @@ def test_strip_markdown_links() -> None:
     assert "https://github.com/foo/bar" in strip_response_markdown(text)
 
 
+def test_append_missing_checklist() -> None:
+    from src.analyzer.project_brief import extract_buyer_checklist
+    from src.analyzer.response_text import append_missing_checklist_answers
+    from tests.test_project_brief_checklist import _bots_project
+
+    project = _bots_project()
+    assert extract_buyer_checklist(project)
+    base = "Понял задачу: два Telegram-бота по ТЗ."
+    enriched = append_missing_checklist_answers(
+        base, project, price_rub=42000, delivery_days=14
+    )
+    assert "42000" in enriched
+    assert "14 дн" in enriched
+    assert "aiogram" in enriched.lower()
+    assert "исходный код" in enriched.lower()
+
+
 def test_kwork_compliance_detects_call() -> None:
     from src.analyzer.response_text import kwork_compliance_issues
 
@@ -89,6 +106,15 @@ def test_kwork_compliance_detects_call() -> None:
         "Давайте созвонимся и обсудим детали!"
     )
     assert not kwork_compliance_issues("Разработаю Telegram-бота для учёта расходов.")
+
+
+def test_topic_mismatch_flags_parsing_on_bot_project() -> None:
+    from src.analyzer.gpt_response_generator import _topic_mismatch_issues
+    from tests.test_project_brief_checklist import _bots_project
+
+    project = _bots_project()
+    bad = "Задача по парсингу данных из Telegram полностью понятна."
+    assert _topic_mismatch_issues(project, bad) == ["topic:парсинг_не_в_тз"]
 
 
 def test_banned_phrase_triggers_retry(monkeypatch) -> None:

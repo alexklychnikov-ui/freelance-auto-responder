@@ -17,7 +17,7 @@ from src.adapters.kwork_auth import KworkCredentials
 from src.analyzer.examples_loader import load_response_examples
 from src.analyzer.gpt_offer_estimator import GptOfferEstimator
 from src.analyzer.gpt_response_generator import GptResponseGenerator
-from src.analyzer.response_text import strip_response_markdown
+from src.analyzer.response_text import append_missing_checklist_answers, strip_response_markdown
 from src.analyzer.gpt_scorer import GptScorer
 from src.analyzer.lightrag_client import LightRagClient
 from src.analyzer.project_brief import build_project_brief
@@ -453,6 +453,7 @@ class PipelineOrchestrator:
             return
 
         response_text = await self._ensure_response_text(offer)
+        await self._refresh_offer_project(offer)
         context = await asyncio.to_thread(self.lightrag.get_full_context)
         terms = await asyncio.to_thread(
             self.offer_estimator.estimate,
@@ -462,6 +463,12 @@ class PipelineOrchestrator:
         )
         price = str(terms.price_rub)
         delivery_days = terms.delivery_days
+        response_text = append_missing_checklist_answers(
+            response_text,
+            offer.project,
+            price_rub=terms.price_rub,
+            delivery_days=delivery_days,
+        )
 
         def _run_prepare():
             browser = get_browser_client(self.settings)
@@ -474,7 +481,8 @@ class PipelineOrchestrator:
                     response_text,
                     price,
                     delivery_days=delivery_days,
-                    order_title=offer.title,
+                    order_title=offer.title or offer.project.title,
+                    project=offer.project,
                 )
                 return result
             finally:

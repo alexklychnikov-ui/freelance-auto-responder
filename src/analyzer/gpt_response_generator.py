@@ -8,7 +8,12 @@ from typing import Any
 
 import httpx
 
-from src.analyzer.project_brief import build_project_brief, extract_tz_facts
+from src.analyzer.project_brief import (
+    build_project_brief,
+    buyer_checklist_issues,
+    extract_buyer_checklist,
+    extract_tz_facts,
+)
 from src.analyzer.response_qa import ResponseQaValidator, rule_check_alignment
 from src.analyzer.response_strategy import build_generation_strategy
 from src.config import Settings
@@ -68,9 +73,16 @@ D: 3–5 предложений, без вступительной воды
 
 Согласованность с ТЗ (критично):
 - Сначала прочитай project_brief и tz_facts в payload.
+- Опиши суть задачи своими словами строго по ТЗ. Не придумывай парсинг/скрапинг, если их нет в project_brief.
 - Если в ТЗ уже указаны источник (LinkedIn, сайт), что собирать (ссылки, посты) — НЕ спрашивай «откуда» и «какие данные».
-- Покажи понимание своими словами: что парсим, откуда, куда отдаём.
 - Вопрос в конце — только если в ТЗ реально не хватает детали (авторизация, объём, периодичность, формат файла).
+
+Чеклист заказчика (если buyer_checklist не пуст):
+- Ответь на КАЖДЫЙ пункт явно, коротким абзацем или фразой с меткой (Стоимость / Срок / Стек / Код / Передача).
+- Стоимость и срок — в тексте тоже (дублируй поля формы: «Стоимость: … ₽», «Срок: … дней»).
+- Стек: Python, aiogram, БД (PostgreSQL/SQLite) — по задаче.
+- Готовность смотреть код: да, сначала аудит наработок.
+- Передача: исходники, БД, инструкция по запуску, тест основных сценариев.
 
 Из lightrag_context / github — только 1–2 факта, реально относящиеся к ЭТОМУ заказу.
 Портфолио: {PORTFOLIO_URL} — один раз, органично, не отдельным блоком «моё портфолио:».
@@ -171,6 +183,7 @@ class GptResponseGenerator:
         strategy = build_generation_strategy(project)
         brief = build_project_brief(project)
         tz_facts = extract_tz_facts(project)
+        buyer_checklist = extract_buyer_checklist(project)
         user_payload = {
             "task": (
                 "Напиши уникальный отклик под этот заказ. Следуй strategy и tz_facts. "
@@ -181,6 +194,7 @@ class GptResponseGenerator:
             "project": project.model_dump(mode="json"),
             "project_brief": brief,
             "tz_facts": tz_facts,
+            "buyer_checklist": buyer_checklist,
             "strategy": strategy,
             "lightrag_context": lightrag_context,
             "response_examples": examples,
@@ -219,7 +233,9 @@ class GptResponseGenerator:
     ) -> str:
         issues = _soft_banned_check(text) + [
             f"kwork:{v}" for v in kwork_compliance_issues(text)
-        ]
+        ] + [
+            f"checklist:{v}" for v in buyer_checklist_issues(project, text)
+        ] + _topic_mismatch_issues(project, text)
         if issues:
             logger.info(
                 "gpt_generate_response retry banned phrases project_id=%s %s",
@@ -236,6 +252,15 @@ class GptResponseGenerator:
                     " Убери созвон/звонок/мессенджеры/контакты вне Kwork. "
                     "Финал — вопрос по ТЗ или готовность ответить в чате Kwork."
                 )
+            if any("checklist" in i for i in issues):
+                retry_payload["task"] += (
+                    " Ответь на все пункты buyer_checklist явно "
+                    "(стоимость, срок, стек, аудит кода, состав передачи)."
+                )
+            if any("topic:" in i for i in issues):
+                retry_payload["task"] += (
+                    " Убери парсинг/скрапинг — их нет в ТЗ. Опиши задачу как в project_brief."
+                )
             body["messages"][1]["content"] = json.dumps(retry_payload, ensure_ascii=False)
             body["temperature"] = 0.9
             text = self._call_api(body, project.project_id)
@@ -246,7 +271,15 @@ class GptResponseGenerator:
             rule_issues = rule_check_alignment(project, text)
             all_issues = list(qa.get("issues") or []) + rule_issues
             all_issues += [f"kwork:{v}" for v in kwork_compliance_issues(text)]
-            if qa.get("aligned", True) and not rule_issues and not kwork_compliance_issues(text):
+            all_issues += [f"checklist:{v}" for v in buyer_checklist_issues(project, text)]
+            all_issues += _topic_mismatch_issues(project, text)
+            if (
+                qa.get("aligned", True)
+                and not rule_issues
+                and not kwork_compliance_issues(text)
+                and not buyer_checklist_issues(project, text)
+                and not _topic_mismatch_issues(project, text)
+            ):
                 return text
             logger.info(
                 "gpt_generate_response qa_retry project_id=%s issues=%s attempt=%s",
@@ -268,3 +301,17 @@ class GptResponseGenerator:
             text = strip_response_markdown(text)
 
         return strip_response_markdown(text)
+
+
+_PARSE_HALLUCINATION_RE = re.compile(r"парс\w*|скрап\w*", re.I)
+_BOT_BRIEF_RE = re.compile(r"telegram[- ]?бот|aiogram|телеграм[- ]?бот", re.I)
+
+
+def _topic_mismatch_issues(project: ProjectFull, text: str) -> list[str]:
+    brief = build_project_brief(project)
+    if not brief or re.search(r"парс\w*|скрап\w*", brief, re.I):
+        return []
+    if _BOT_BRIEF_RE.search(brief) and _PARSE_HALLUCINATION_RE.search(text):
+        return ["topic:парсинг_не_в_тз"]
+    return []
+

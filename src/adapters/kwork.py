@@ -10,6 +10,7 @@ from src.adapters.kwork_delivery import (
     KWORK_DELIVERY_DAY_OPTIONS,
     snap_delivery_days,
 )
+from src.adapters.kwork_pricing import clamp_price_to_budget, parse_form_price_bounds
 from src.adapters.kwork_auth import (
     KworkAuthError,
     KworkCredentials,
@@ -181,7 +182,6 @@ PRICE_SELECTORS = (
     ".wants-offer__price input",
     '[data-field="price"] input',
     ".stages__stage-price-input",
-    'input[type="number"]',
 )
 TITLE_SELECTORS = (
     'input[placeholder*="Название заказа"]',
@@ -230,6 +230,41 @@ FIND_TITLE_INPUT_JS = """
 }
 """
 
+FIND_PRICE_INPUT_JS = """
+() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const label = [...document.querySelectorAll('label, .form-field__name, .field-name, span, div, p')].find(
+    (el) => /^стоимость$/i.test(norm(el.textContent))
+  );
+  if (label) {
+    const root =
+      label.closest('.form-field, .form-item, .field, .offer-form__row, .wants-offer__field, div')
+      || label.parentElement;
+    const inp =
+      root?.querySelector('#offer-custom-price, input[name="price"], input[type="number"], input[type="tel"]')
+      || null;
+    if (inp) return inp;
+  }
+  return (
+    document.querySelector('#offer-custom-price') ||
+    document.querySelector('input[name="price"]') ||
+    document.querySelector('.wants-offer__price input') ||
+    document.querySelector('[data-field="price"] input') ||
+    null
+  );
+}
+"""
+
+EXTRACT_FORM_BOUNDS_JS = """
+() => {
+  const text = (document.body?.innerText || '').replace(/\\s+/g, ' ');
+  const m = text.match(/от\\s*([\\d\\s]+)\\s*руб\\W*\\s*до\\s*([\\d\\s]+)\\s*руб/i);
+  if (!m) return null;
+  const parse = (s) => parseInt(s.replace(/\\s/g, ''), 10);
+  return { min: parse(m[1]), max: parse(m[2]) };
+}
+"""
+
 EXTRACT_ORDER_TITLE_ON_PAGE_JS = """
 () => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
@@ -274,6 +309,11 @@ EXTRACT_ORDER_TITLE_ON_PAGE_JS = """
       const t = norm(el?.textContent || el?.getAttribute('data-project-title') || '');
       if (t.length >= 3 && t.length <= 70) return t;
     }
+    const h1 = document.querySelector('h1');
+    if (h1) {
+      const t = norm(h1.textContent);
+      if (t.length >= 3 && t.length <= 70 && !/отклик|предлож|услуг/i.test(t)) return t;
+    }
     return '';
   };
 
@@ -281,19 +321,18 @@ EXTRACT_ORDER_TITLE_ON_PAGE_JS = """
 }
 """
 
-READ_OFFER_FORM_JS = """
-() => {
+READ_OFFER_FORM_JS = f"""
+() => {{
   const desc =
     document.querySelector('textarea[name="description"]') ||
     document.querySelector('textarea.v-textarea') ||
     document.querySelector('.wants-offer__description textarea') ||
     document.querySelector('textarea');
-  const priceInput =
-    document.querySelector('#offer-custom-price') ||
-    document.querySelector('input[name="price"]') ||
-    document.querySelector('.wants-offer__price input') ||
-    document.querySelector('input[type="number"]');
-  const titleInput = (() => {
+  const priceInput = (() => {{
+    const findPrice = {FIND_PRICE_INPUT_JS};
+    return findPrice();
+  }})();
+  const titleInput = (() => {{
     const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
     const byPh = [...document.querySelectorAll('input[type="text"], input:not([type])')].find((inp) =>
       /название заказа/i.test(inp.getAttribute('placeholder') || '')
@@ -302,27 +341,27 @@ READ_OFFER_FORM_JS = """
     const label = [...document.querySelectorAll('label, span, div, p')].find(
       (el) => /^название заказа$/i.test(norm(el.textContent))
     );
-    if (label) {
+    if (label) {{
       const root = label.closest('.form-field, .field, div') || label.parentElement;
       return root?.querySelector('input[type="text"], input:not([type="hidden"])') || null;
-    }
+    }}
   const counter = [...document.querySelectorAll('span, div')].find((el) =>
       /из\\s*70\\s*символ/i.test(el.textContent || '')
     );
-    if (counter) {
+    if (counter) {{
       const root = counter.closest('.form-field, .field, div') || counter.parentElement;
       return root?.querySelector('input[type="text"], input:not([type="hidden"])') || null;
-    }
+    }}
     return null;
-  })();
-  return {
+  }})();
+  return {{
     url: location.href,
     descLen: (desc?.value || '').length,
     descPreview: (desc?.value || '').slice(0, 100),
     price: (priceInput?.value || '').replace(/\\s/g, ''),
     title: titleInput?.value || '',
-  };
-}
+  }};
+}}
 """
 
 TRIGGER_OFFER_AUTOSAVE_JS = """
@@ -405,14 +444,8 @@ def _build_offer_fill_js(text: str, price: str, *, order_title: str = "") -> str
         root.querySelector('textarea');
     }}
     if (!priceInput) {{
-      priceInput =
-        root.querySelector('#offer-custom-price') ||
-        root.querySelector('input[name="price"]') ||
-        root.querySelector('.wants-offer__price input') ||
-        root.querySelector('[data-field="price"] input') ||
-        root.querySelector('.stages__stage-price-input') ||
-        root.querySelector('input[type="number"]') ||
-        root.querySelector('input[type="tel"].wMax');
+      const findPrice = {FIND_PRICE_INPUT_JS};
+      priceInput = findPrice();
     }}
     if (!titleInput) {{
       const label = [...document.querySelectorAll('label, .form-field__name, .field-name, span, div')].find(
@@ -666,6 +699,78 @@ def _resolve_order_title(
     except Exception:
         pass
     return fb
+
+
+def _fill_price(browser: BrowserClient, value: str) -> bool:
+    if not value:
+        return False
+    if _fill_first(browser, PRICE_SELECTORS, value):
+        return True
+    try:
+        ok = browser.evaluate(
+            f"""
+            () => {{
+              const val = {json.dumps(str(value))};
+              const findPrice = {FIND_PRICE_INPUT_JS};
+              const inp = findPrice();
+              if (!inp) return false;
+              const proto = HTMLInputElement.prototype;
+              const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+              if (setter) setter.call(inp, val);
+              else inp.value = val;
+              inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+              inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+              inp.focus();
+              inp.blur();
+              return true;
+            }}
+            """
+        )
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _read_form_price_bounds(browser: BrowserClient) -> tuple[int | None, int | None]:
+    try:
+        raw = browser.evaluate(EXTRACT_FORM_BOUNDS_JS)
+        if isinstance(raw, dict) and raw.get("min") and raw.get("max"):
+            return int(raw["min"]), int(raw["max"])
+    except Exception:
+        pass
+    try:
+        snap = browser.snapshot()
+        return parse_form_price_bounds(snap)
+    except Exception:
+        return None, None
+
+
+def _normalize_offer_price(
+    price: str,
+    project: ProjectFull | None,
+    *,
+    form_min: int | None = None,
+    form_max: int | None = None,
+) -> str:
+    if project is None:
+        project = ProjectFull(
+            platform="kwork",
+            source_key="kwork",
+            project_id="0",
+            url="",
+            title="",
+            full_description="",
+        )
+    digits = re.sub(r"\D", "", str(price) or "")
+    value = int(digits) if digits else 0
+    if value < 500:
+        from src.adapters.kwork_pricing import suggest_offer_price
+
+        value = int(suggest_offer_price(project, form_min=form_min, form_max=form_max))
+    value = clamp_price_to_budget(
+        value, project, form_min=form_min, form_max=form_max
+    )
+    return str(value)
 
 
 def _fill_order_title(browser: BrowserClient, title: str) -> bool:
@@ -1005,6 +1110,7 @@ class KworkAdapter:
         *,
         delivery_days: int = 14,
         order_title: str = "",
+        project: ProjectFull | None = None,
     ) -> SubmitResult:
         if self.kwork_credentials:
             self._ensure_session()
@@ -1039,8 +1145,16 @@ class KworkAdapter:
             self.browser, project_id, order_title
         )
 
+        form_min, form_max = _read_form_price_bounds(self.browser)
+        price = _normalize_offer_price(
+            price,
+            project,
+            form_min=form_min,
+            form_max=form_max,
+        )
+
         desc_ok = _fill_first(self.browser, DESC_SELECTORS, text)
-        price_ok = _fill_first(self.browser, PRICE_SELECTORS, str(price))
+        price_ok = _fill_price(self.browser, str(price))
         title_ok = _fill_order_title(self.browser, order_title)
 
         if hasattr(self.browser, "wait_ms"):
@@ -1071,6 +1185,7 @@ class KworkAdapter:
 
         deadline_result = _fill_deadline(self.browser, delivery_days)
         days_set = bool(isinstance(deadline_result, dict) and deadline_result.get("ok"))
+        price_ok = _fill_price(self.browser, str(price)) or price_ok
         if order_title:
             title_ok = _fill_order_title(self.browser, order_title) or title_ok
 
@@ -1095,6 +1210,20 @@ class KworkAdapter:
                 success=False,
                 project_id=project_id,
                 message=f"prepare_verify_failed: {fill_result}",
+            )
+
+        read_price_int = int(re.sub(r"\D", "", read_price) or 0)
+        if form_min and read_price_int < form_min:
+            return SubmitResult(
+                success=False,
+                project_id=project_id,
+                message=f"prepare_price_below_min: {read_price_int} < {form_min} {fill_result}",
+            )
+        if order_title and not read_title:
+            return SubmitResult(
+                success=False,
+                project_id=project_id,
+                message=f"prepare_title_empty: {fill_result}",
             )
 
         message = f"prepared: verified desc={desc_len} price={read_price} title={read_title!r}"
