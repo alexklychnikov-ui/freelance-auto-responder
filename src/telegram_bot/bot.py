@@ -11,6 +11,7 @@ from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -29,6 +30,7 @@ PLATFORM_LABELS = {
 CALLBACK_APPROVE = "approve"
 CALLBACK_REJECT = "reject"
 CALLBACK_JOURNAL_CONFIRM = "journal_ok"
+CALLBACK_PREPARE_RETRY = "prepare_retry"
 CALLBACK_OPEN = "open"
 
 
@@ -140,6 +142,26 @@ def build_journal_confirm_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
     )
 
 
+def build_prepare_retry_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
+    p, s, pid = offer.platform, offer.source_key, offer.project_id
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Заполнить форму снова",
+                    callback_data=_callback_data(CALLBACK_PREPARE_RETRY, p, s, pid),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="👁 Открыть проект",
+                    url=_project_view_url(offer.url),
+                ),
+            ],
+        ]
+    )
+
+
 class TelegramReviewBot:
     def __init__(
         self,
@@ -170,6 +192,7 @@ class TelegramReviewBot:
         on_response_text: Any | None = None,
         on_export_journal: Any | None = None,
         on_journal_confirm: Any | None = None,
+        on_prepare_retry: Any | None = None,
     ) -> None:
         @self._dp.callback_query(F.data.startswith(f"{CALLBACK_APPROVE}:"))
         async def handle_approve(callback: CallbackQuery) -> None:
@@ -201,13 +224,31 @@ class TelegramReviewBot:
                 _, platform, source_key, project_id = parsed
                 await on_journal_confirm(platform, source_key, project_id, callback)
 
+        if on_prepare_retry is not None:
+
+            @self._dp.callback_query(F.data.startswith(f"{CALLBACK_PREPARE_RETRY}:"))
+            async def handle_prepare_retry(callback: CallbackQuery) -> None:
+                parsed = parse_callback_data(callback.data or "")
+                if not parsed:
+                    await callback.answer("Некорректный callback")
+                    return
+                _, platform, source_key, project_id = parsed
+                await callback.answer("Повторяю заполнение формы…")
+                await on_prepare_retry(platform, source_key, project_id, callback)
+
         @self._dp.message(Command("start"))
         async def handle_start(message: Message) -> None:
             await message.answer(
                 "Freelance Auto-Responder\n"
                 "Отклик: карточка → автозаполнение формы на Kwork (VPS).\n"
-                "Excel: запусти Sync-Journal.bat на ПК."
+                "Excel: команда /journal_sync в этом чате."
             )
+
+        @self._dp.message(Command("journal", "journal_sync"))
+        async def handle_journal_sync(message: Message) -> None:
+            if on_export_journal is None:
+                return
+            await on_export_journal(message)
 
         if on_response_text is not None:
 
@@ -263,6 +304,27 @@ class TelegramReviewBot:
             chat_id=self.chat_id,
             text=text,
             reply_markup=build_journal_confirm_keyboard(offer),
+            disable_web_page_preview=True,
+        )
+        return msg.message_id
+
+    async def send_prepare_retry(
+        self,
+        offer: PendingOffer,
+        *,
+        error: str,
+    ) -> int:
+        safe_title = html.escape(offer.title, quote=False)
+        safe_error = html.escape(error[:1200], quote=False)
+        text = (
+            f"⚠️ <b>Форма не заполнена:</b> {safe_title}\n"
+            f"{safe_error}\n\n"
+            "Нажми <b>«Заполнить форму снова»</b> ниже — повторю автозаполнение на Kwork."
+        )
+        msg = await self._bot.send_message(
+            chat_id=self.chat_id,
+            text=text,
+            reply_markup=build_prepare_retry_keyboard(offer),
             disable_web_page_preview=True,
         )
         return msg.message_id
@@ -338,6 +400,13 @@ class TelegramReviewBot:
         await self._bot.send_photo(
             chat_id=self.chat_id,
             photo=BufferedInputFile(image, filename="kwork-form.png"),
+            caption=caption,
+        )
+
+    async def send_document(self, path: str, caption: str | None = None) -> None:
+        await self._bot.send_document(
+            chat_id=self.chat_id,
+            document=FSInputFile(path),
             caption=caption,
         )
 

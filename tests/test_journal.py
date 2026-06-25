@@ -66,6 +66,7 @@ def test_journal_append_row(journal_path: Path, project: ProjectFull, score: Gpt
         assert cell_date == expected.isoformat()
     assert ws.cell(row=2, column=3).value == "Kwork"
     assert ws.cell(row=2, column=4).value == project.url
+    assert ws.cell(row=2, column=4).hyperlink is not None
     assert ws.cell(row=2, column=5).value == "Telegram-бот"
     assert ws.cell(row=2, column=6).value == "Отправлен"
     wb.close()
@@ -92,6 +93,36 @@ def test_journal_skips_merged_cells(
     wb.close()
 
 
+def test_infer_project_type() -> None:
+    from src.journal.writer import infer_project_type
+
+    assert infer_project_type("Доработать 2 Telegram-бота") == "Telegram-бот"
+    assert infer_project_type("Парсер объявлений") == "Парсинг"
+    assert infer_project_type("Сайт на WordPress") == "Веб-MVP"
+    assert infer_project_type("Что-то непонятное") == "Другое"
+
+
+def test_repair_row_fills_type_and_hyperlink(tmp_path: Path) -> None:
+    journal_path = tmp_path / "journal.xlsx"
+    JournalWriter.create_template_copy(journal_path)
+    wb = load_workbook(journal_path)
+    ws = wb.active
+    ws.cell(row=2, column=4, value="https://kwork.ru/projects/3204427")
+    ws.cell(row=2, column=5, value="—")
+    ws.cell(row=2, column=8, value="Доработать 2 Telegram-бота по готовому ТЗ")
+    wb.save(journal_path)
+    wb.close()
+
+    writer = JournalWriter(journal_path)
+    assert writer.repair_row_by_project_id("3204427") is True
+
+    wb = load_workbook(journal_path)
+    ws = wb.active
+    assert ws.cell(row=2, column=4).hyperlink is not None
+    assert ws.cell(row=2, column=5).value == "Telegram-бот"
+    wb.close()
+
+
 def test_format_offer_notes() -> None:
     from src.journal.writer import format_offer_notes
 
@@ -105,6 +136,35 @@ def test_project_ids_in_journal(journal_path: Path, project: ProjectFull, score:
 
     writer.append_prepared(project, score, "text", price="1000")
     assert writer.project_ids_in_journal() == {"100"}
+
+
+def test_update_status_by_project_id(
+    journal_path: Path, project: ProjectFull, score: GptScoreResult
+) -> None:
+    writer = JournalWriter(journal_path)
+    writer.append_prepared(project, score, "text", price="1000")
+
+    changed = writer.update_status_by_project_id(
+        project.project_id,
+        status="Отправлен",
+        result="Жду ответа",
+    )
+    assert changed is True
+
+    wb = load_workbook(journal_path)
+    ws = wb.active
+    assert ws.cell(row=2, column=6).value == "Отправлен"
+    assert ws.cell(row=2, column=7).value == "Жду ответа"
+    wb.close()
+
+    assert (
+        writer.update_status_by_project_id(
+            project.project_id,
+            status="Отправлен",
+            result="Жду ответа",
+        )
+        is False
+    )
 
 
 def test_journal_template_header_row(

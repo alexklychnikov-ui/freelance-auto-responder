@@ -37,10 +37,12 @@ def _needs_three_stages(brief: str) -> bool:
 def plan_offer_stages(total: int, project: ProjectFull | None = None) -> list[tuple[str, int]]:
     """Разбить сумму отклика на этапы оплаты (минимум 2)."""
     brief = build_project_brief(project) if project else ""
+    title = (project.title or "") if project else ""
+    combined = f"{title}\n{brief}".strip()
     total_rub = max(MIN_STAGE_RUB * 2, int(total or 0))
 
-    if _needs_three_stages(brief):
-        low = brief.lower()
+    if _needs_three_stages(combined):
+        low = combined.lower()
         if "контакт" in low and ("поддерж" in low or "клиент" in low):
             names = [
                 "Аудит наработок и согласование плана",

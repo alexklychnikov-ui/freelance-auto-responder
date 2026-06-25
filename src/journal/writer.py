@@ -8,6 +8,7 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
+from openpyxl.styles import Font
 
 from src.models import GptScoreResult, ProjectFull
 
@@ -31,6 +32,27 @@ PLATFORM_DISPLAY = {
 }
 
 
+def kwork_project_url(project_id: str) -> str:
+    return f"https://kwork.ru/projects/{project_id}/view"
+
+
+def infer_project_type(title: str) -> str:
+    low = (title or "").lower()
+    if any(x in low for x in ("telegram", "телеграм", "бот")):
+        return "Telegram-бот"
+    if "парс" in low or "parser" in low or "scrap" in low:
+        return "Парсинг"
+    if any(x in low for x in ("rag", "llm", "gpt", "ии ", " ai", "нейро")):
+        return "AI/RAG"
+    if any(x in low for x in ("сайт", "лендинг", "wordpress", "веб", "frontend", "backend")):
+        return "Веб-MVP"
+    if any(x in low for x in ("интеграц", "api", "crm", "1с")):
+        return "Интеграция"
+    if any(x in low for x in ("автомат", "скрипт", "excel", "google sheet")):
+        return "Автоматизация"
+    return "Другое"
+
+
 def format_offer_notes(
     title: str,
     *,
@@ -45,6 +67,19 @@ def format_offer_notes(
 class JournalWriter:
     def __init__(self, journal_path: str | Path) -> None:
         self.journal_path = Path(journal_path)
+
+    @staticmethod
+    def _url_from_cell(cell) -> str:
+        link = getattr(cell, "hyperlink", None)
+        if link is not None and getattr(link, "target", None):
+            return str(link.target)
+        return str(cell.value or "")
+
+    @staticmethod
+    def _set_url_cell(ws, row: int, url: str) -> None:
+        cell = ws.cell(row=row, column=4, value=url)
+        cell.hyperlink = url
+        cell.font = Font(color="0563C1", underline="single")
 
     def _ensure_workbook(self) -> None:
         if not self.journal_path.exists():
@@ -111,7 +146,7 @@ class JournalWriter:
             cell = row[0]
             if cell.value is None:
                 continue
-            text = str(cell.value)
+            text = self._url_from_cell(cell)
             match = re.search(r"/projects/(\d+)", text.replace("\\", "/"))
             if match:
                 ids.add(match.group(1))
@@ -128,9 +163,46 @@ class JournalWriter:
             cell = ws.cell(row=row, column=4)
             if isinstance(cell, MergedCell):
                 continue
-            if project_id in str(cell.value or ""):
+            if project_id in self._url_from_cell(cell):
                 return row
         return None
+
+    def update_status_by_project_id(
+        self,
+        project_id: str,
+        *,
+        status: str,
+        result: str | None = None,
+    ) -> bool:
+        if not self.journal_path.exists():
+            return False
+        wb = load_workbook(self.journal_path)
+        ws = wb.active
+        row = self._find_row_by_project_id(ws, project_id)
+        if row is None:
+            wb.close()
+            return False
+        changed = False
+        if self._writable(ws, row, 6):
+            current = str(ws.cell(row=row, column=6).value or "").strip()
+            if current != status:
+                ws.cell(row=row, column=6, value=status)
+                changed = True
+        if result is not None and self._writable(ws, row, 7):
+            current_result = str(ws.cell(row=row, column=7).value or "").strip()
+            if current_result != result:
+                ws.cell(row=row, column=7, value=result)
+                changed = True
+        if changed:
+            wb.save(self.journal_path)
+            logger.info(
+                "journal_status_updated project_id=%s row=%d status=%r",
+                project_id,
+                row,
+                status,
+            )
+        wb.close()
+        return changed
 
     def update_notes_by_project_id(
         self,
@@ -168,6 +240,94 @@ class JournalWriter:
         logger.info("journal_row_removed project_id=%s row=%d", project_id, row)
         return True
 
+    def _repair_row_cells(
+        self,
+        ws,
+        row: int,
+        project_id: str,
+        *,
+        title: str = "",
+        project_type: str | None = None,
+    ) -> bool:
+        changed = False
+        url_text = self._url_from_cell(ws.cell(row=row, column=4)).strip()
+        if url_text.startswith("http"):
+            url_cell = ws.cell(row=row, column=4)
+            link = getattr(url_cell, "hyperlink", None)
+            if link is None or not getattr(link, "target", None):
+                self._set_url_cell(ws, row, url_text)
+                changed = True
+
+        type_val = str(ws.cell(row=row, column=5).value or "").strip()
+        if type_val in ("", "—", "-"):
+            notes = str(ws.cell(row=row, column=8).value or "")
+            infer_title = title or notes.split("\n")[0]
+            new_type = (project_type or "").strip() or infer_project_type(infer_title)
+            ws.cell(row=row, column=5, value=new_type)
+            changed = True
+        return changed
+
+    def repair_row_by_project_id(
+        self,
+        project_id: str,
+        *,
+        title: str = "",
+        project_type: str | None = None,
+    ) -> bool:
+        if not self.journal_path.exists():
+            return False
+        wb = load_workbook(self.journal_path)
+        ws = wb.active
+        row = self._find_row_by_project_id(ws, project_id)
+        if row is None:
+            wb.close()
+            return False
+        changed = self._repair_row_cells(
+            ws,
+            row,
+            project_id,
+            title=title,
+            project_type=project_type,
+        )
+        if changed:
+            wb.save(self.journal_path)
+        wb.close()
+        return changed
+
+    def repair_all_rows(
+        self,
+        *,
+        titles: dict[str, str] | None = None,
+        project_types: dict[str, str] | None = None,
+    ) -> int:
+        if not self.journal_path.exists():
+            return 0
+        titles = titles or {}
+        project_types = project_types or {}
+        wb = load_workbook(self.journal_path)
+        ws = wb.active
+        changed_rows = 0
+        for row in range(2, ws.max_row + 1):
+            if not self._writable(ws, row, 4):
+                continue
+            url_text = self._url_from_cell(ws.cell(row=row, column=4))
+            match = re.search(r"/projects/(\d+)", url_text.replace("\\", "/"))
+            if not match:
+                continue
+            project_id = match.group(1)
+            if self._repair_row_cells(
+                ws,
+                row,
+                project_id,
+                title=titles.get(project_id, ""),
+                project_type=project_types.get(project_id),
+            ):
+                changed_rows += 1
+        if changed_rows:
+            wb.save(self.journal_path)
+        wb.close()
+        return changed_rows
+
     def append_submission(
         self,
         project: ProjectFull,
@@ -186,7 +346,7 @@ class JournalWriter:
         ws.cell(row=row, column=1, value=self._next_number(ws))
         ws.cell(row=row, column=2, value=date.today())
         ws.cell(row=row, column=3, value=platform_label)
-        ws.cell(row=row, column=4, value=project.url)
+        self._set_url_cell(ws, row, project.url)
         ws.cell(row=row, column=5, value=score.suggested_project_type)
         ws.cell(row=row, column=6, value="Отправлен")
         ws.cell(row=row, column=7, value="Жду ответа")
@@ -224,7 +384,7 @@ class JournalWriter:
         ws.cell(row=row, column=1, value=self._next_number(ws))
         ws.cell(row=row, column=2, value=date.today())
         ws.cell(row=row, column=3, value=platform_label)
-        ws.cell(row=row, column=4, value=project.url)
+        self._set_url_cell(ws, row, project.url)
         ws.cell(row=row, column=5, value=score.suggested_project_type)
         ws.cell(row=row, column=6, value="Подготовлен")
         ws.cell(row=row, column=7, value="Жду ответа")
@@ -235,6 +395,41 @@ class JournalWriter:
             "journal_prepared project_id=%s row=%d",
             project.project_id,
             row,
+        )
+        return row
+
+    def append_kwork_offer_status(
+        self,
+        *,
+        project_id: str,
+        title: str,
+        status: str,
+        result: str,
+        project_type: str | None = None,
+    ) -> int:
+        self._ensure_workbook()
+        wb = load_workbook(self.journal_path)
+        ws = wb.active
+        row = self._next_row(ws)
+        url = kwork_project_url(project_id)
+        type_label = (project_type or "").strip() or infer_project_type(title)
+
+        ws.cell(row=row, column=1, value=self._next_number(ws))
+        ws.cell(row=row, column=2, value=date.today())
+        ws.cell(row=row, column=3, value="Kwork")
+        self._set_url_cell(ws, row, url)
+        ws.cell(row=row, column=5, value=type_label)
+        ws.cell(row=row, column=6, value=status)
+        ws.cell(row=row, column=7, value=result)
+        ws.cell(row=row, column=8, value=title.strip())
+
+        wb.save(self.journal_path)
+        wb.close()
+        logger.info(
+            "journal_offer_synced project_id=%s row=%d status=%r",
+            project_id,
+            row,
+            status,
         )
         return row
 

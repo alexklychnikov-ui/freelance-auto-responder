@@ -201,6 +201,20 @@ TRUMBOWYG_SET_JS = """
   const text = raw.slice(0, limit);
   const ta = document.querySelector(`textarea[name="${name}"]`);
   if (!ta) return false;
+  const $ = window.jQuery || window.$;
+  if ($ && typeof $(ta).trumbowyg === 'function') {
+    const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+    const html = text ? `<p>${esc(text)}</p>` : '<div><br></div>';
+    $(ta).trumbowyg('html', html);
+    $(ta).trigger('tbwchange');
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+    ta.dispatchEvent(new Event('change', { bubbles: true }));
+    if (String(name).startsWith('stageTitle')) {
+      const hidden = ta.closest('.stages__stage-name')?.querySelector('.stages__stage-text');
+      if (hidden) hidden.textContent = text;
+    }
+    return true;
+  }
   const box = ta.closest('.trumbowyg-box') || ta.parentElement;
   const editor = box?.querySelector('.trumbowyg-editor');
   const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
@@ -259,6 +273,10 @@ FIND_TITLE_INPUT_JS = """
 FIND_DEADLINE_INPUT_JS = """
 () => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const durationSelected = document.querySelector('.duration-select__selected-option');
+  if (durationSelected) return durationSelected;
+  const durationSearch = document.querySelector('.duration-select input.vs__search');
+  if (durationSearch) return durationSearch;
   const byPh = document.querySelector('input.vs__search[placeholder="Срок выполнения"]');
   if (byPh) return byPh;
   const label = [...document.querySelectorAll('label, span, div, p')].find(
@@ -266,9 +284,9 @@ FIND_DEADLINE_INPUT_JS = """
   );
   if (label) {
     const root =
-      label.closest('.modal-individual-message__column, .form-field, .field, .form-item, div')
+      label.closest('.duration-select, .modal-individual-message__column, .form-field, .field, .form-item, div')
       || label.parentElement;
-    const inp = root?.querySelector('input.vs__search');
+    const inp = root?.querySelector('input.duration-select__selected-option, input.vs__search');
     if (inp) return inp;
   }
   return null;
@@ -410,11 +428,16 @@ READ_OFFER_FORM_JS = f"""
     price: (priceInput?.value || '').replace(/\\s/g, ''),
     title: titlePlain,
     deadline: (() => {{
+      const selected = document.querySelector('.duration-select__selected-option');
+      if (selected?.value) return selected.value.trim();
       const findDeadline = {FIND_DEADLINE_INPUT_JS};
       const el = findDeadline();
       return (el?.value || '').trim();
     }})(),
-    deadlineLabel: (document.querySelector('.duration-select .vs__selected-options, .duration-select .vs__selected')?.textContent || '')
+    deadlineLabel: (document.querySelector('.duration-select .vs__selected, .duration-select__selected-option')?.textContent
+      || document.querySelector('.duration-select .vs__selected-options')?.textContent
+      || document.querySelector('.duration-select .vs__selected-options, .duration-select .vs__selected')?.textContent
+      || '')
       .replace(/\\s+/g, ' ').trim(),
   }};
 }}
@@ -555,16 +578,18 @@ DEADLINE_OPEN_JS = """
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
 
   function findDeadlineField() {
+    const duration = document.querySelector('.duration-select');
+    if (duration) return duration;
     const label = [...document.querySelectorAll('label, .form-field__name, .field-name, span, p, div')]
       .find((el) => /^срок выполнения$/i.test(norm(el.textContent)));
     if (label) {
       const root = label.closest(
         '.form-field, .form-item, .field, .offer-form__row, .wants-offer__field, .offer-field, div'
       );
-      const ms = root?.querySelector('.multiselect');
+      const ms = root?.querySelector('.multiselect, .duration-select');
       if (ms) return ms;
     }
-    return [...document.querySelectorAll('.multiselect')].find((ms) =>
+    return [...document.querySelectorAll('.multiselect, .duration-select')].find((ms) =>
       /срок выполнения/i.test(norm(ms.textContent))
     ) || null;
   }
@@ -575,9 +600,11 @@ DEADLINE_OPEN_JS = """
   }
 
   const openers = [
+    ms.querySelector('.vs__dropdown-toggle'),
     ms.querySelector('.multiselect__select'),
     ms.querySelector('.multiselect__tags'),
     ms.querySelector('.multiselect-single'),
+    ms.querySelector('input.duration-select__selected-option'),
     ms,
   ].filter(Boolean);
 
@@ -749,6 +776,146 @@ def _fill_price(browser: BrowserClient, value: str) -> bool:
         return False
 
 
+def _wait_duration_ready(browser: BrowserClient, *, attempts: int = 24) -> bool:
+    for _ in range(attempts):
+        try:
+            ready = browser.evaluate(
+                """() => {
+                  const root = document.querySelector('.duration-select');
+                  if (!root) return false;
+                  const txt = (root.textContent || '').replace(/\\s+/g, ' ');
+                  return !/loading/i.test(txt);
+                }"""
+            )
+            if ready:
+                return True
+        except Exception:
+            pass
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(500)
+    return False
+
+
+def _read_description_len(browser: BrowserClient) -> int:
+    try:
+        raw = browser.evaluate(
+            """
+            () => {
+              const ta = document.querySelector('textarea[name="description"]');
+              const ed = ta?.closest('.trumbowyg-box')?.querySelector('.trumbowyg-editor');
+              const plain = (ed?.innerText || ta?.value || '')
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/\\s+/g, ' ')
+                .trim();
+              return plain.length;
+            }
+            """
+        )
+        return int(raw or 0)
+    except Exception:
+        return 0
+
+
+def _fill_deadline_duration_select(
+    browser: BrowserClient, delivery_days: int
+) -> dict[str, Any]:
+    days = snap_delivery_days(delivery_days)
+    _wait_duration_ready(browser)
+
+    try:
+        vue_set = browser.evaluate(
+            f"""
+            () => {{
+              const root = document.querySelector('.duration-select');
+              const vm = root?.__vue__;
+              const offer = document.querySelector('.offer-custom')?.__vue__;
+              const targets = [vm, offer].filter(Boolean);
+              for (const t of targets) {{
+                if ('duration' in t) t.duration = {days};
+                if ('durationDays' in t) t.durationDays = {days};
+                if ('durationLocal' in t) t.durationLocal = {days};
+                if (typeof t.onChangeDuration === 'function') t.onChangeDuration({days});
+                if (typeof t.setDuration === 'function') t.setDuration({days});
+              }}
+              const inp = document.querySelector('.duration-select__selected-option');
+              if (inp) {{
+                inp.focus();
+                inp.value = String({days});
+                inp.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                inp.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                inp.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', bubbles: true }}));
+                inp.blur();
+              }}
+              const picked = (document.querySelector('.duration-select__selected-option')?.value || '').trim();
+              if (picked && /\\d/.test(picked)) {{
+                return {{ ok: true, method: 'duration_vue', picked, targetDays: {days} }};
+              }}
+              return {{ ok: false, reason: 'duration_vue_empty', targetDays: {days} }};
+            }}
+            """
+        )
+        if isinstance(vue_set, dict) and vue_set.get("ok"):
+            return vue_set
+    except Exception as exc:
+        vue_set = {"ok": False, "reason": f"duration_vue_error:{exc}", "targetDays": days}
+
+    if hasattr(browser, "_ensure_page"):
+        page = browser._ensure_page()
+        try:
+            root = page.locator(".duration-select").first
+            root.scroll_into_view_if_needed(timeout=8000)
+            root.locator(".vs__dropdown-toggle").click(force=True, timeout=5000)
+            if hasattr(browser, "wait_ms"):
+                browser.wait_ms(800)
+            for sel in (
+                "input.duration-select__selected-option",
+                "input.vs__search.js-only-integer",
+                "input.vs__search",
+            ):
+                loc = root.locator(sel).first
+                if loc.count() == 0:
+                    continue
+                loc.click(force=True, timeout=3000)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                loc.press_sequentially(str(days), delay=40)
+                if hasattr(browser, "wait_ms"):
+                    browser.wait_ms(700)
+                opt = page.locator(
+                    ".duration-select__dropdown .vs__dropdown-option, .vs__dropdown-option"
+                ).filter(has_text=str(days)).first
+                if opt.count() > 0:
+                    opt.click(force=True)
+                else:
+                    page.keyboard.press("Enter")
+                page.keyboard.press("Tab")
+                break
+            if hasattr(browser, "wait_ms"):
+                browser.wait_ms(500)
+            read = browser.evaluate(
+                """() => (document.querySelector('.duration-select__selected-option')?.value || '').trim()"""
+            )
+            if str(read).strip() and re.search(r"\d", str(read)):
+                return {
+                    "ok": True,
+                    "method": "duration_playwright",
+                    "picked": read,
+                    "targetDays": days,
+                    "vue_attempt": vue_set,
+                }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": f"duration_pw:{exc}",
+                "targetDays": days,
+                "vue_attempt": vue_set,
+            }
+
+    if isinstance(vue_set, dict):
+        return vue_set
+    return {"ok": False, "reason": "duration_select_failed", "targetDays": days}
+
+
 def _fill_deadline_vueselect(browser: BrowserClient, delivery_days: int) -> dict[str, Any]:
     days = snap_delivery_days(delivery_days)
     if hasattr(browser, "fill_sequential") and hasattr(browser, "_ensure_page"):
@@ -826,6 +993,9 @@ def _fill_deadline_vueselect(browser: BrowserClient, delivery_days: int) -> dict
 
 
 def _fill_deadline(browser: BrowserClient, delivery_days: int) -> dict[str, Any]:
+    duration = _fill_deadline_duration_select(browser, delivery_days)
+    if duration.get("ok"):
+        return duration
     vue = _fill_deadline_vueselect(browser, delivery_days)
     if vue.get("ok"):
         return vue
@@ -847,6 +1017,72 @@ def _fill_deadline(browser: BrowserClient, delivery_days: int) -> dict[str, Any]
 
 def kwork_offer_form_url(project_id: str) -> str:
     return f"https://kwork.ru/new_offer?project={project_id}"
+
+
+def _read_offer_form_state(browser: BrowserClient) -> dict[str, Any]:
+    try:
+        raw = browser.evaluate(
+            """
+            () => {
+              const text = (document.body?.innerText || '').replace(/\\s+/g, ' ');
+              const path = location.pathname || '';
+              return {
+                url: location.href,
+                hasForm: Boolean(
+                  document.querySelector(
+                    '.custom-kwork-offer__wrapper, .offer-custom, textarea[name="description"]'
+                  )
+                ),
+                listingRedirect: path === '/projects' || path.endsWith('/projects'),
+                projectClosed: /оставить отзыв|опубликовать похожий проект/i.test(text),
+              };
+            }
+            """
+        )
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _project_on_my_offers(browser: BrowserClient, project_id: str) -> bool:
+    try:
+        browser.navigate("https://kwork.ru/offers")
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(3000)
+        return bool(
+            browser.evaluate(
+                f"""
+                () => [...document.querySelectorAll('a[href*="/projects/{project_id}"]')].length > 0
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _check_offer_form_available(
+    browser: BrowserClient, project_id: str
+) -> SubmitResult | None:
+    state = _read_offer_form_state(browser)
+    if state.get("hasForm"):
+        return None
+
+    on_offers = _project_on_my_offers(browser, project_id)
+    if on_offers or state.get("projectClosed"):
+        return SubmitResult(
+            success=False,
+            project_id=project_id,
+            message=(
+                "offer_already_submitted: отклик уже есть на Kwork "
+                f"(project_id={project_id}, url={state.get('url')})"
+            ),
+        )
+
+    return SubmitResult(
+        success=False,
+        project_id=project_id,
+        message=f"offer_form_unavailable: {state}",
+    )
 
 
 def _fill_first(browser: BrowserClient, selectors: tuple[str, ...], value: str) -> bool:
@@ -935,12 +1171,81 @@ def _normalize_offer_price(
     return str(value)
 
 
+def _read_order_title(browser: BrowserClient) -> str:
+    try:
+        raw = browser.evaluate(
+            """
+            () => {
+              const ta = document.querySelector('textarea[name="name"]');
+              const ed = ta?.closest('.trumbowyg-box')?.querySelector('.trumbowyg-editor');
+              const plain = (ed?.innerText || ed?.textContent || ta?.value || '')
+                .replace(/<[^>]+>/g, ' ')
+                .replace(/\\s+/g, ' ')
+                .trim();
+              return plain;
+            }
+            """
+        )
+        return str(raw or "").strip()
+    except Exception:
+        return ""
+
+
+def _is_milestone_payment_selected(browser: BrowserClient) -> bool:
+    try:
+        return bool(
+            browser.evaluate(
+                """
+                () => {
+                  const items = [...document.querySelectorAll('.offer-payment-type__item')];
+                  const milestone = items.find((el) =>
+                    /по мере выполнения задач/i.test((el.textContent || '').replace(/\\s+/g, ' '))
+                  );
+                  if (!milestone) return false;
+                  if (milestone.classList.contains('active') || milestone.classList.contains('selected')) {
+                    return true;
+                  }
+                  const input = milestone.querySelector('input[type="radio"], input[type="checkbox"]');
+                  if (input?.checked) return true;
+                  return milestone.classList.contains('active')
+                    || milestone.classList.contains('selected')
+                    || milestone.getAttribute('aria-checked') === 'true';
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
 def _fill_order_title(browser: BrowserClient, title: str) -> bool:
     value = (title or "").strip()[:70]
     if not value:
         return False
+    if hasattr(browser, "_ensure_page"):
+        try:
+            page = browser._ensure_page()
+            editor = page.locator(
+                'div:has(textarea[name="name"]) .trumbowyg-editor'
+            ).first
+            if editor.count() > 0:
+                editor.scroll_into_view_if_needed(timeout=8000)
+                editor.click(force=True, timeout=5000)
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                editor.press_sequentially(value, delay=20)
+                page.keyboard.press("Tab")
+                if hasattr(browser, "wait_ms"):
+                    browser.wait_ms(200)
+                read = _read_order_title(browser)
+                if read and read.lower() != "undefined":
+                    return True
+        except Exception:
+            pass
     if _set_trumbowyg(browser, "name", value):
-        return True
+        read = _read_order_title(browser)
+        if read:
+            return True
     if _fill_first(browser, TITLE_SELECTORS, value):
         return True
     try:
@@ -969,6 +1274,8 @@ def _fill_order_title(browser: BrowserClient, title: str) -> bool:
 
 
 def _select_milestone_payment(browser: BrowserClient) -> bool:
+    if _is_milestone_payment_selected(browser):
+        return True
     try:
         if hasattr(browser, "_ensure_page"):
             page = browser._ensure_page()
@@ -976,10 +1283,14 @@ def _select_milestone_payment(browser: BrowserClient) -> bool:
                 has_text=re.compile(r"По мере выполнения задач", re.I)
             ).first
             if item.count() > 0:
+                item.scroll_into_view_if_needed(timeout=8000)
                 item.click(force=True)
+                radio = item.locator('input[type="radio"]').first
+                if radio.count() > 0:
+                    radio.click(force=True)
                 if hasattr(browser, "wait_ms"):
-                    browser.wait_ms(800)
-                return True
+                    browser.wait_ms(1000)
+                return _is_milestone_payment_selected(browser)
     except Exception:
         pass
     try:
@@ -992,6 +1303,60 @@ def _select_milestone_payment(browser: BrowserClient) -> bool:
                   );
                   if (!item) return false;
                   item.click();
+                  const input = item.querySelector('input[type="radio"], input[type="checkbox"]');
+                  if (input) input.click();
+                  return item.classList.contains('active')
+                    || item.classList.contains('selected')
+                    || Boolean(input?.checked);
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _count_visible_stage_slots(browser: BrowserClient) -> int:
+    try:
+        raw = browser.evaluate(
+            """
+            () => {
+              const stages = [...document.querySelectorAll('.stages__stage')]
+                .filter((row) => row.offsetParent).length;
+              const prices = [...document.querySelectorAll('.stages__stage-price-input')]
+                .filter((i) => i.offsetParent).length;
+              return Math.max(stages, prices);
+            }
+            """
+        )
+        return int(raw) if isinstance(raw, int) else 0
+    except Exception:
+        return 0
+
+
+def _click_add_stage_row(browser: BrowserClient) -> bool:
+    try:
+        if hasattr(browser, "_ensure_page"):
+            page = browser._ensure_page()
+            btn = page.locator(".stages span").filter(
+                has_text=re.compile(r"^Добавить задачу$", re.I)
+            )
+            if btn.count() > 0:
+                btn.first.scroll_into_view_if_needed(timeout=5000)
+                btn.first.click(force=True, timeout=5000)
+                return True
+    except Exception:
+        pass
+    try:
+        return bool(
+            browser.evaluate(
+                """
+                () => {
+                  const btn = [...document.querySelectorAll('.stages span')].find((el) =>
+                    (el.textContent || '').trim().toLowerCase() === 'добавить задачу'
+                  );
+                  if (!btn) return false;
+                  btn.click();
                   return true;
                 }
                 """
@@ -1002,25 +1367,335 @@ def _select_milestone_payment(browser: BrowserClient) -> bool:
 
 
 def _ensure_stage_rows(browser: BrowserClient, needed: int) -> None:
-    for _ in range(8):
-        count = browser.evaluate(
-            """() => document.querySelectorAll('textarea[name^="stageTitle-"]').length"""
-        )
-        if not isinstance(count, int) or count >= needed:
+    for _ in range(10):
+        visible = _count_visible_stage_slots(browser)
+        if visible >= needed:
             return
+        before = visible
+        if not _click_add_stage_row(browser):
+            return
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(700)
+        after = _count_visible_stage_slots(browser)
+        if after <= before:
+            return
+
+
+STAGE_VUE_SET_JS = """
+(idx, plainText, amount) => {
+  const text = plainText == null ? null : String(plainText || '').slice(0, 70);
+  const price = amount == null ? null : Number(amount);
+  const rows = [...document.querySelectorAll('.stages__list .stages__stage')];
+  const row = rows[idx - 1];
+  if (!row) return false;
+  const vm = row.__vue__;
+  const parent = document.querySelector('.stages')?.__vue__;
+  if (!vm || !parent) return false;
+
+  const stage = parent.localStages?.[idx - 1];
+  if (text != null && text !== '') {
+    vm.titleLocal = text;
+    if (stage) stage.title = text;
+    const ta = row.querySelector('textarea[name^="stageTitle-"]');
+    const $ = window.jQuery || window.$;
+    if (ta && $ && typeof $(ta).trumbowyg === 'function') {
+      const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+      $(ta).trumbowyg('html', `<p>${esc(text)}</p>`);
+      $(ta).trigger('tbwchange');
+    }
+    const hidden = row.querySelector('.stages__stage-text');
+    if (hidden) hidden.textContent = text;
+    if (typeof vm.onChangeTitle === 'function') vm.onChangeTitle(text);
+    vm.$emit?.('change-title', text);
+  }
+
+  if (price != null && !Number.isNaN(price)) {
+    vm.priceLocal = price;
+    if (stage) stage.payer_price = price;
+    const priceInput = row.querySelector('.stages__stage-price-input');
+    if (priceInput) {
+      priceInput.focus();
+      priceInput.value = String(price);
+      priceInput.dispatchEvent(new Event('input', { bubbles: true }));
+      priceInput.dispatchEvent(new Event('change', { bubbles: true }));
+      priceInput.blur();
+    }
+    if (typeof vm.onChangePrice === 'function') vm.onChangePrice(price);
+  }
+
+  if (typeof parent.recalcTotalPrice === 'function') parent.recalcTotalPrice();
+  if (typeof parent.onChangeStages === 'function') parent.onChangeStages();
+  parent.$emit?.('change-stages', parent.localStages);
+
+  const offerVm = document.querySelector('.offer-custom')?.__vue__;
+  const wrapVm = document.querySelector('.custom-kwork-offer__wrapper')?.__vue__;
+  if (offerVm && parent.localStages?.length) {
+    offerVm.stages = parent.localStages.map((s) => ({
+      id: s.id || 0,
+      number: s.number,
+      title: s.title,
+      payer_price: s.payer_price,
+    }));
+    if (offerVm.priceStages != null) {
+      offerVm.priceStages = parent.localStages.reduce(
+        (sum, s) => sum + Number(s.payer_price || 0),
+        0,
+      );
+    }
+  }
+  if (wrapVm?.setRequestDataStages) wrapVm.setRequestDataStages(parent.localStages);
+  if (offerVm?.updateDataStages) offerVm.updateDataStages();
+  if (offerVm?.changeDraftContent) offerVm.changeDraftContent();
+
+  const readTitle = String(stage?.title || vm.titleLocal || '').trim();
+  const priceInput = row.querySelector('.stages__stage-price-input');
+  const domPrice = Number(String(priceInput?.value || '').replace(/\\s/g, ''));
+  const readPrice = Number(stage?.payer_price ?? vm.priceLocal ?? domPrice);
+  const titleOk = text == null || !text || readTitle === text;
+  const priceOk = price == null || Number.isNaN(price) || readPrice === price || domPrice === price;
+  return titleOk && priceOk;
+}
+"""
+
+
+def _set_stage_vue(
+    browser: BrowserClient,
+    idx: int,
+    title: str | None,
+    amount: int | None = None,
+) -> bool:
+    try:
+        return bool(
+            browser.evaluate(
+                f"({STAGE_VUE_SET_JS})({idx}, {json.dumps(title)}, {json.dumps(amount)})"
+            )
+        )
+    except Exception:
+        return False
+
+
+def _fill_stage_title(browser: BrowserClient, idx: int, title: str) -> bool:
+    value = (title or "").strip()[:70]
+    if not value:
+        return False
+    if hasattr(browser, "_ensure_page"):
+        try:
+            page = browser._ensure_page()
+            editor = page.locator(
+                f'div:has(textarea[name="stageTitle-{idx}"]) .trumbowyg-editor'
+            ).first
+            editor.scroll_into_view_if_needed(timeout=5000)
+            editor.click(force=True, timeout=5000)
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+            editor.press_sequentially(value, delay=20)
+            page.keyboard.press("Tab")
+            if hasattr(browser, "wait_ms"):
+                browser.wait_ms(150)
+        except Exception:
+            pass
+    try:
+        return bool(
+            browser.evaluate(
+                f"""
+                () => {{
+                  const ta = document.querySelector('textarea[name="stageTitle-{idx}"]');
+                  const ed = ta?.closest('.trumbowyg-box')?.querySelector('.trumbowyg-editor');
+                  const text = (ed?.textContent || '').replace(/\\s+/g, ' ').trim();
+                  const expected = {json.dumps(value)};
+                  return Boolean(
+                    text
+                    && text.toLowerCase() !== 'undefined'
+                    && (text === expected || text.toLowerCase() === expected.toLowerCase())
+                  );
+                }}
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _read_stage_prices(browser: BrowserClient) -> list[str]:
+    raw = browser.evaluate(
+        """
+        () => [...document.querySelectorAll('.stages__stage-price-input')]
+          .filter((i) => i.offsetParent)
+          .map((inp) => (inp.value || '').replace(/\\s/g, ''))
+        """
+    )
+    return [str(p) for p in raw] if isinstance(raw, list) else []
+
+
+def _fill_stage_price(browser: BrowserClient, idx: int, amount: int) -> bool:
+    if _set_stage_vue(browser, idx, None, amount):
+        return True
+    if not hasattr(browser, "_ensure_page"):
+        return False
+    try:
+        page = browser._ensure_page()
+        row = page.locator(".stages__list .stages__stage").nth(idx - 1)
+        loc = row.locator(".stages__stage-price-input")
+        loc.scroll_into_view_if_needed(timeout=5000)
+        loc.click(force=True, timeout=5000)
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+        loc.press_sequentially(str(amount), delay=40)
+        page.keyboard.press("Tab")
+        return True
+    except Exception:
+        return False
+
+
+def _read_stages_from_dom(browser: BrowserClient) -> dict[str, Any]:
+    raw = browser.evaluate(
+        """
+        () => {
+          const rows = [...document.querySelectorAll('.stages__list .stages__stage')].map((row) => {
+            const ta = row.querySelector('textarea[name^="stageTitle-"]');
+            const ed = ta?.closest('.trumbowyg-box')?.querySelector('.trumbowyg-editor');
+            const hidden = row.querySelector('.stages__stage-text');
+            const title = (ed?.textContent || hidden?.textContent || ta?.value || '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/\\s+/g, ' ')
+              .trim()
+              .slice(0, 70);
+            const price = (row.querySelector('.stages__stage-price-input')?.value || '')
+              .replace(/\\s/g, '');
+            return { name: ta?.name || null, title, price };
+          });
+          return {
+            rows: rows.map(({ name, title }) => ({ name, title })),
+            prices: rows.map((r) => r.price).filter(Boolean),
+            vueStages: (document.querySelector('.stages')?.__vue__?.localStages || []).map((s) => ({
+              title: s.title,
+              price: s.payer_price,
+            })),
+          };
+        }
+        """
+    )
+    return raw if isinstance(raw, dict) else {}
+
+
+def _stage_title_matches(expected: str, actual: str) -> bool:
+    expected_norm = (expected or "").strip().lower()
+    actual_norm = (actual or "").strip().lower()
+    if not expected_norm or not actual_norm or actual_norm == "undefined":
+        return False
+    return (
+        actual_norm == expected_norm
+        or expected_norm in actual_norm
+        or actual_norm in expected_norm
+    )
+
+
+def _stages_dom_ok(stages: list[tuple[str, int]], read: dict[str, Any]) -> bool:
+    expected_total = sum(amount for _, amount in stages)
+    prices = [str(p) for p in (read.get("prices") or []) if p]
+    sum_final = sum(int(p) for p in prices if p.isdigit())
+    if len(prices) < len(stages) or sum_final != expected_total:
+        return False
+    dom_titles = [
+        (r.get("title") or "").strip()
+        for r in (read.get("rows") or [])[: len(stages)]
+    ]
+    vue_titles = [
+        str(t.get("title") or "").strip()
+        for t in (read.get("vueStages") or [])[: len(stages)]
+        if isinstance(t, dict)
+    ]
+    for i, (exp_title, exp_amount) in enumerate(stages):
+        if prices[i] != str(exp_amount):
+            return False
+        dom_ok = i < len(dom_titles) and _stage_title_matches(exp_title, dom_titles[i])
+        vue_ok = i < len(vue_titles) and _stage_title_matches(exp_title, vue_titles[i])
+        if not (dom_ok or vue_ok):
+            return False
+    return True
+
+
+def _finalize_offer_form(
+    browser: BrowserClient,
+    *,
+    text: str,
+    price: str,
+    order_title: str,
+    delivery_days: int,
+    stages: list[tuple[str, int]],
+) -> dict[str, Any]:
+    milestone = _select_milestone_payment(browser)
+    if hasattr(browser, "wait_ms"):
+        browser.wait_ms(1000)
+
+    stages_result = _fill_offer_stages(browser, stages)
+    if not stages_result.get("ok"):
+        stages_result = _fill_offer_stages(browser, stages)
+
+    desc_ok = _fill_description(browser, text)
+    title_ok = bool(order_title) and _fill_order_title(browser, order_title)
+    price_ok = _fill_price(browser, str(price))
+    deadline_result = _fill_deadline(browser, delivery_days)
+    if not deadline_result.get("ok") and hasattr(browser, "wait_ms"):
+        browser.wait_ms(1500)
+        deadline_result = _fill_deadline(browser, delivery_days)
+
+    read_title = _read_order_title(browser)
+    stages_read = _read_stages_from_dom(browser)
+    if order_title and not read_title:
+        title_ok = _fill_order_title(browser, order_title) or title_ok
+        read_title = _read_order_title(browser)
+    if not _stages_dom_ok(stages, stages_read):
+        stages_result = _fill_offer_stages(browser, stages)
+        stages_read = _read_stages_from_dom(browser)
+        stages_result["read"] = stages_read
+        stages_result["ok"] = _stages_dom_ok(stages, stages_read)
+
+    if order_title and read_title:
+        title_ok = True
+
+    return {
+        "milestone": milestone,
+        "milestoneSelected": _is_milestone_payment_selected(browser),
+        "stages": stages_result,
+        "stagesRead": stages_read,
+        "desc_ok": desc_ok,
+        "title_ok": title_ok,
+        "read_title": read_title,
+        "price_ok": price_ok,
+        "deadline": deadline_result,
+    }
+
+
+def _sync_stages_draft(browser: BrowserClient) -> None:
+    try:
         browser.evaluate(
             """
             () => {
-              const btn = [...document.querySelectorAll('a, button, span, div')].find((el) =>
-                /добавить задачу/i.test((el.textContent || '').replace(/\\s+/g, ' '))
-              );
-              if (btn) btn.click();
-              return Boolean(btn);
+              const parent = document.querySelector('.stages')?.__vue__;
+              const offerVm = document.querySelector('.offer-custom')?.__vue__;
+              const wrapVm = document.querySelector('.custom-kwork-offer__wrapper')?.__vue__;
+              const local = parent?.localStages || [];
+              if (offerVm && local.length) {
+                offerVm.stages = local.map((s) => ({
+                  id: s.id || 0,
+                  number: s.number,
+                  title: s.title,
+                  payer_price: s.payer_price,
+                }));
+                if (offerVm.priceStages != null) {
+                  offerVm.priceStages = local.reduce((sum, s) => sum + Number(s.payer_price || 0), 0);
+                }
+              }
+              if (wrapVm?.setRequestDataStages) wrapVm.setRequestDataStages(local);
+              if (offerVm?.updateDataStages) offerVm.updateDataStages();
+              if (offerVm?.changeDraftContent) offerVm.changeDraftContent();
+              return true;
             }
             """
         )
-        if hasattr(browser, "wait_ms"):
-            browser.wait_ms(400)
+    except Exception:
+        pass
 
 
 def _fill_offer_stages(
@@ -1028,41 +1703,17 @@ def _fill_offer_stages(
 ) -> dict[str, Any]:
     if len(stages) < 2:
         return {"ok": False, "reason": "need_min_2_stages"}
+    expected_total = sum(amount for _, amount in stages)
     selected = _select_milestone_payment(browser)
     if hasattr(browser, "wait_ms"):
-        browser.wait_ms(800)
+        browser.wait_ms(1200)
     _ensure_stage_rows(browser, len(stages))
 
     filled: list[dict[str, Any]] = []
-    page = browser._ensure_page() if hasattr(browser, "_ensure_page") else None
     for idx, (title, amount) in enumerate(stages, start=1):
-        title_ok = _set_trumbowyg(browser, f"stageTitle-{idx}", title)
-        if page and not title_ok:
-            try:
-                editor = page.locator(
-                    f'div:has(textarea[name="stageTitle-{idx}"]) .trumbowyg-editor'
-                ).first
-                editor.click(force=True)
-                page.keyboard.press("Control+A")
-                page.keyboard.press("Backspace")
-                editor.press_sequentially(title[:70], delay=30)
-                page.keyboard.press("Tab")
-                title_ok = True
-            except Exception:
-                title_ok = False
-        price_ok = False
-        if page is not None:
-            try:
-                loc = page.locator(".stages__stage-price-input").nth(idx - 1)
-                loc.scroll_into_view_if_needed(timeout=5000)
-                loc.click(force=True, timeout=5000)
-                page.keyboard.press("Control+A")
-                page.keyboard.press("Backspace")
-                loc.press_sequentially(str(amount), delay=40)
-                page.keyboard.press("Tab")
-                price_ok = True
-            except Exception:
-                price_ok = False
+        _set_stage_vue(browser, idx, title, amount)
+        title_ok = _fill_stage_title(browser, idx, title)
+        price_ok = _fill_stage_price(browser, idx, amount)
         filled.append(
             {
                 "idx": idx,
@@ -1072,39 +1723,29 @@ def _fill_offer_stages(
                 "priceOk": price_ok,
             }
         )
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(300)
 
     if hasattr(browser, "wait_ms"):
         browser.wait_ms(500)
-    read = browser.evaluate(
-        """
-        () => {
-          const rows = [...document.querySelectorAll('textarea[name^="stageTitle-"]')].map((ta) => {
-            const ed = ta.closest('.trumbowyg-box')?.querySelector('.trumbowyg-editor');
-            const title = (ed?.textContent || ta.value || '')
-              .replace(/<[^>]+>/g, ' ')
-              .replace(/\\s+/g, ' ')
-              .trim()
-              .slice(0, 70);
-            return { name: ta.name, title };
-          });
-          const prices = [...document.querySelectorAll('.stages__stage-price-input')].map((inp) =>
-            (inp.value || '').replace(/\\s/g, '')
-          );
-          return { rows, prices };
-        }
-        """
-    )
-    ok = len(filled) >= 2 and all(
-        item["titleOk"] and item["priceOk"] for item in filled[:2]
-    )
-    if isinstance(read, dict):
-        rows = read.get("rows") or []
-        prices = read.get("prices") or []
-        if len(rows) >= 2 and prices[:2] and all(prices[:2]):
-            titles_ok = all((r.get("title") or "").strip() for r in rows[: len(stages)])
-            if titles_ok:
-                ok = True
-    return {"ok": ok, "selected": selected, "filled": filled, "read": read}
+
+    _sync_stages_draft(browser)
+
+    read = _read_stages_from_dom(browser)
+    prices_final = [str(p) for p in (read.get("prices") or []) if p]
+    sum_final = sum(int(p) for p in prices_final if p.isdigit())
+    titles_ok = _stages_dom_ok(stages, read)
+    milestone_ok = _is_milestone_payment_selected(browser)
+    ok = titles_ok and milestone_ok
+    return {
+        "ok": ok,
+        "selected": selected,
+        "milestoneSelected": milestone_ok,
+        "filled": filled,
+        "read": read,
+        "expectedTotal": expected_total,
+        "actualTotal": sum_final,
+    }
 
 
 def _autosave_wait(browser: BrowserClient, *, wait_ms: int = 8000) -> None:
@@ -1444,6 +2085,10 @@ class KworkAdapter:
                 message="not_logged_in: нужен логин Kwork на VPS",
             )
 
+        blocked = _check_offer_form_available(self.browser, project_id)
+        if blocked is not None:
+            return blocked
+
         order_title = _resolve_order_title(
             self.browser, project_id, order_title
         )
@@ -1460,25 +2105,51 @@ class KworkAdapter:
         if hasattr(self.browser, "wait_ms"):
             self.browser.wait_ms(400)
         desc_ok = _fill_description(self.browser, text)
-        title_ok = _fill_order_title(self.browser, order_title)
-
-        if hasattr(self.browser, "wait_ms"):
-            self.browser.wait_ms(500)
-
-        deadline_result = _fill_deadline(self.browser, delivery_days)
-        price_ok = _fill_price(self.browser, str(price)) or price_ok
-        if order_title:
-            title_ok = _fill_order_title(self.browser, order_title) or title_ok
 
         stages = plan_offer_stages(int(price), project)
-        stages_result = _fill_offer_stages(self.browser, stages)
-        fill_result: dict[str, Any] = {}
+        final = _finalize_offer_form(
+            self.browser,
+            text=text,
+            price=str(price),
+            order_title=order_title,
+            delivery_days=delivery_days,
+            stages=stages,
+        )
+        stages_result = final["stages"]
+        stages_read = final["stagesRead"]
+        title_ok = final["title_ok"]
+        desc_ok = final["desc_ok"] or desc_ok
+        price_ok = final["price_ok"] or price_ok
+        deadline_result = final["deadline"]
 
-        _autosave_wait(self.browser, wait_ms=8000)
+        _autosave_wait(self.browser, wait_ms=5000)
+        if not _stages_dom_ok(stages, stages_read) or (
+            order_title and not final.get("read_title")
+        ):
+            final = _finalize_offer_form(
+                self.browser,
+                text=text,
+                price=str(price),
+                order_title=order_title,
+                delivery_days=delivery_days,
+                stages=stages,
+            )
+            stages_result = final["stages"]
+            stages_read = final["stagesRead"]
+            title_ok = final["title_ok"]
+            desc_ok = final["desc_ok"] or desc_ok
+            price_ok = final["price_ok"] or price_ok
+            deadline_result = final["deadline"]
+            _autosave_wait(self.browser, wait_ms=5000)
+
+        fill_result: dict[str, Any] = {"finalize": final}
+
+        _autosave_wait(self.browser, wait_ms=3000)
         readback = _read_offer_form(self.browser)
-        desc_len = int(readback.get("descLen") or 0)
+        desc_len = _read_description_len(self.browser) or int(readback.get("descLen") or 0)
         read_price = str(readback.get("price") or "").replace(" ", "")
-        read_title = str(readback.get("title") or "").strip()
+        read_title = _read_order_title(self.browser) or str(readback.get("title") or "").strip()
+        stages_read = _read_stages_from_dom(self.browser)
         read_deadline = str(
             readback.get("deadline") or readback.get("deadlineLabel") or ""
         ).strip()
@@ -1504,11 +2175,19 @@ class KworkAdapter:
         fill_result["stagesPlan"] = [{"title": t, "amount": a} for t, a in stages]
 
         if desc_len < min_desc or not read_price:
-            return SubmitResult(
-                success=False,
-                project_id=project_id,
-                message=f"prepare_verify_failed: {fill_result}",
-            )
+            if desc_ok and read_price and desc_len < min_desc:
+                desc_ok = _fill_description(self.browser, text)
+                if hasattr(self.browser, "wait_ms"):
+                    self.browser.wait_ms(800)
+                desc_len = _read_description_len(self.browser) or desc_len
+                fill_result["descRefilled"] = True
+                fill_result["descLenAfterRefill"] = desc_len
+            if desc_len < min_desc or not read_price:
+                return SubmitResult(
+                    success=False,
+                    project_id=project_id,
+                    message=f"prepare_verify_failed: {fill_result}",
+                )
 
         read_price_int = int(re.sub(r"\D", "", read_price) or 0)
         if form_min and read_price_int < form_min:
@@ -1523,11 +2202,26 @@ class KworkAdapter:
                 project_id=project_id,
                 message=f"prepare_title_empty: {fill_result}",
             )
-        if not stages_result.get("ok"):
+        fill_result["stagesRead"] = stages_read
+        fill_result["milestoneSelected"] = _is_milestone_payment_selected(self.browser)
+        if not final.get("milestoneSelected") and not fill_result["milestoneSelected"]:
+            return SubmitResult(
+                success=False,
+                project_id=project_id,
+                message=f"prepare_milestone_not_selected: {fill_result}",
+            )
+        if not stages_result.get("ok") or not _stages_dom_ok(stages, stages_read):
             return SubmitResult(
                 success=False,
                 project_id=project_id,
                 message=f"prepare_stages_failed: {fill_result}",
+            )
+        stage_total = int(stages_result.get("actualTotal") or 0)
+        if stage_total != int(price) or read_price_int != int(price):
+            return SubmitResult(
+                success=False,
+                project_id=project_id,
+                message=f"prepare_total_mismatch: expected={price} got={read_price_int} stages={stage_total} {fill_result}",
             )
 
         message = f"prepared: verified desc={desc_len} price={read_price} title={read_title!r}"

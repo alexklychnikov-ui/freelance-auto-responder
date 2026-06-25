@@ -22,7 +22,11 @@ def test_plan_two_stages_default() -> None:
     assert all(a >= 500 for _, a in stages)
 
 
-def test_plan_three_stages_for_two_bots() -> None:
+def test_plan_three_stages_from_title_only() -> None:
+    project = _project("Доработать 2 Telegram-бота по готовому ТЗ", "")
+    stages = plan_offer_stages(35000, project)
+    assert len(stages) == 3
+    assert sum(a for _, a in stages) == 35000
     project = _project(
         "Доработать 2 Telegram-бота",
         "Проект №1: бот учёта контактов. Проект №2: клиентский бот поддержки.",

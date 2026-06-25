@@ -12,6 +12,8 @@ REPO = Path(__file__).resolve().parents[1]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+from src.config import get_settings
+from src.journal.kwork_status_sync import sync_journal_from_kwork_offers
 from src.journal.writer import JournalWriter, format_offer_notes
 from src.responses.prepared_store import PreparedResponse
 
@@ -93,15 +95,45 @@ def _pull_prepared(tmp: Path) -> list[Path]:
 
 
 def _mark_exported_on_vps(filename: str) -> None:
-    script = (
-        "import json; from pathlib import Path; "
-        f"p=Path('{REMOTE_PREPARED}')/'{filename}'; "
-        "d=json.loads(p.read_text(encoding='utf-8')); "
-        "d['journal_exported']=True; "
-        "p.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8'); "
-        "print('marked', p.name)"
+    safe_name = Path(filename).name
+    if safe_name != filename:
+        raise ValueError(f"unsafe filename: {filename}")
+    remote_file = f"{REMOTE_PREPARED}/{safe_name}"
+    with tempfile.TemporaryDirectory(prefix="mark_exported_") as tmp_dir:
+        local_path = Path(tmp_dir) / safe_name
+        _run(["scp", f"{VPS}:{remote_file}", str(local_path)])
+        data = json.loads(local_path.read_text(encoding="utf-8"))
+        data["journal_exported"] = True
+        local_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        _run(["scp", str(local_path), f"{VPS}:{remote_file}"])
+        print("marked", safe_name)
+
+
+def _sync_kwork_offer_statuses(journal_path: Path) -> int:
+    if os.environ.get("JOURNAL_SKIP_OFFERS_SYNC", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }:
+        print("Сверка kwork.ru/offers пропущена (JOURNAL_SKIP_OFFERS_SYNC).")
+        return 0
+
+    print("Сверка статусов с https://kwork.ru/offers ...")
+    sync_result = sync_journal_from_kwork_offers(
+        journal_path,
+        settings=get_settings(),
     )
-    _run(["ssh", VPS, f"python3 -c \"{script}\""])
+    if sync_result.error:
+        print(f"WARN: сверка /offers не выполнена: {sync_result.error}")
+        return 0
+    print(
+        f"Сверка /offers: обновлено {sync_result.updated}, добавлено {sync_result.appended}, "
+        f"совпало {sync_result.matched}, пропущено {sync_result.skipped}"
+    )
+    return 0
 
 
 def main() -> int:
@@ -143,6 +175,11 @@ def main() -> int:
                 if writer.update_notes_by_project_id(item.project_id, notes):
                     print(f"OK notes: {item.title}")
                 continue
+            if (not item.journal_exported) and in_journal:
+                if writer.update_notes_by_project_id(item.project_id, notes):
+                    print(f"OK notes: {item.title}")
+                _mark_exported_on_vps(path.name)
+                continue
             if item.journal_exported and not in_journal:
                 print(
                     f"re-sync {path.name}: exported на VPS, но нет в Excel"
@@ -157,7 +194,7 @@ def main() -> int:
                     "Если строки не видно — закрой Excel полностью и открой файл заново "
                     "(открытый Excel не подхватывает изменения с диска)."
                 )
-            return 0
+            return _sync_kwork_offer_statuses(journal_path)
 
         for filename, item in pending:
             row = writer.append_prepared(
@@ -175,7 +212,7 @@ def main() -> int:
         print(
             "Закрой Excel, если был открыт, затем открой journal.xlsx из проводника."
         )
-        return 0
+        return _sync_kwork_offer_statuses(journal_path)
 
 
 if __name__ == "__main__":

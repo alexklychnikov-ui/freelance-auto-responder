@@ -25,6 +25,7 @@ from src.analyzer.response_history import load_recent_response_context
 from src.browser.factory import close_browser_client, get_browser_client
 from src.config import Settings, SourceConfig, get_enabled_sources, get_settings
 from src.journal.writer import JournalWriter
+from src.journal.vps_sync import sync_journal_on_vps
 from src.limits.daily import is_daily_limit_reached
 from src.models import PendingOffer, ProjectFull
 from src.responses.portfolio_link import ensure_portfolio_link
@@ -64,9 +65,12 @@ class PipelineOrchestrator:
         self.offer_estimator = offer_estimator or GptOfferEstimator(settings)
         self._browser = browser
         self._adapter_factory = adapter_factory or self._default_adapter
+        self._journal_sync_lock = asyncio.Lock()
         self.review_service.set_approve_handler(self.handle_approve_click)
         self.review_service.set_journal_confirm_handler(self.handle_journal_confirm)
+        self.review_service.set_prepare_retry_handler(self.handle_prepare_retry)
         self.review_service.set_submit_text_handler(self.handle_user_response_text)
+        self.review_service.set_export_journal_handler(self.export_prepared_to_journal)
 
     def close(self) -> None:
         if self._browser is not None:
@@ -414,6 +418,28 @@ class PipelineOrchestrator:
                 "Текст отклика — на форме Kwork."
             )
 
+    async def handle_prepare_retry(
+        self,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        callback: Any | None = None,
+    ) -> None:
+        offer = self.review_service.store.load(platform, source_key, project_id)
+        if offer is None:
+            await self.review_service.tg_bot.notify(
+                f"⚠️ Заявка {project_id} не найдена в pending_offers"
+            )
+            return
+        if offer.status == "pending":
+            offer.status = "approved"
+            self.review_service.store.save(offer)
+        prepared = self.prepared_store.load(platform, source_key, project_id)
+        if prepared is not None and (prepared.response_text or "").strip():
+            offer.response_text = prepared.response_text
+            self.review_service.store.save(offer)
+        await self._prepare_offer_on_site(offer)
+
     async def handle_user_response_text(
         self, offer: PendingOffer, text: str
     ) -> None:
@@ -503,10 +529,9 @@ class PipelineOrchestrator:
                 delivery_days,
                 lock_offer=False,
             )
-            await self.review_service.tg_bot.notify(
-                "⚠️ Браузер упал, данные сохранены на сервере.\n"
-                f"{html.escape(str(exc))}\n"
-                "Нажми «Откликнуться» ещё раз — повторю заполнение."
+            await self.review_service.tg_bot.send_prepare_retry(
+                offer,
+                error=f"Браузер упал: {exc}",
             )
             return
 
@@ -525,11 +550,23 @@ class PipelineOrchestrator:
                     f"Отклик сохранён в prepared_responses/{offer.project_id}\n"
                     f"Нужен: deploy/kwork_save_session.py или KWORK_AUTO_LOGIN=true"
                 )
-            else:
+            elif "offer_already_submitted" in msg:
                 await self.review_service.tg_bot.notify(
-                    f"⚠️ Форма не заполнена: {html.escape(offer.title)}\n"
-                    f"{html.escape(msg)}\n"
-                    "Нажми «Откликнуться» ещё раз"
+                    f"ℹ️ <b>Отклик уже отправлен</b>: {html.escape(offer.title)}\n"
+                    f"Проект {offer.project_id} есть в "
+                    f"<a href=\"https://kwork.ru/offers\">Мои отклики</a>.\n"
+                    "Kwork больше не открывает форму new_offer — повторно заполнить нельзя.\n"
+                    "Если нужно изменить предложение — только вручную на Kwork."
+                )
+            elif "offer_form_unavailable" in msg:
+                await self.review_service.tg_bot.notify(
+                    f"⚠️ Форма отклика недоступна: {html.escape(offer.title)}\n"
+                    f"{html.escape(msg)}"
+                )
+            else:
+                await self.review_service.tg_bot.send_prepare_retry(
+                    offer,
+                    error=msg,
                 )
             return
 
@@ -639,41 +676,42 @@ class PipelineOrchestrator:
             )
 
     async def export_prepared_to_journal(self, message: Any = None) -> int:
-        items = [
-            i
-            for i in self.prepared_store.list_not_exported()
-            if i.journal_confirmed
-        ]
-        if not items:
-            text = "ℹ️ Нет подготовленных откликов для Excel"
-            await self.review_service.tg_bot.notify(text)
-            return 0
-
-        try:
-            count = 0
-            for item in items:
-                self.journal.append_prepared(
-                    item.project,
-                    item.score,
-                    item.response_text,
-                    price=item.price,
-                    delivery_days=item.delivery_days,
+        async with self._journal_sync_lock:
+            try:
+                sync = await asyncio.to_thread(
+                    sync_journal_on_vps,
+                    settings=self.settings,
+                    writer=self.journal,
+                    prepared_store=self.prepared_store,
                 )
-                item.journal_exported = True
-                self.prepared_store.save(item)
-                count += 1
-        except Exception as exc:
-            logger.exception("journal_export_failed")
-            await self.review_service.tg_bot.notify(
-                f"⚠️ Ошибка Excel: {html.escape(str(exc))}"
-            )
-            return 0
+            except Exception as exc:
+                logger.exception("journal_export_failed")
+                await self.review_service.tg_bot.notify(
+                    f"⚠️ Ошибка Excel: {html.escape(str(exc))}"
+                )
+                return 0
 
-        await self.review_service.tg_bot.notify(
-            f"📒 Excel: добавлено {count} строк(и)\n"
-            f"Файл: {self.settings.response_journal}"
-        )
-        return count
+            caption = (
+                f"📒 Журнал обновлён\n"
+                f"Prepared добавлено: {sync.appended_prepared}\n"
+                f"Notes обновлено: {sync.updated_notes}\n"
+                f"Offers обновлено: {sync.offers_updated}\n"
+                f"Offers добавлено: {sync.offers_appended}"
+            )
+            if sync.offers_error:
+                caption += f"\n⚠️ Offers sync: {sync.offers_error}"
+            try:
+                await self.review_service.tg_bot.send_document(
+                    self.settings.response_journal,
+                    caption=caption[:1000],
+                )
+            except Exception as exc:
+                logger.exception("journal_send_file_failed")
+                await self.review_service.tg_bot.notify(
+                    f"⚠️ Журнал обновлён, но отправка файла не удалась: {html.escape(str(exc))}\n"
+                    f"Файл: {html.escape(self.settings.response_journal)}"
+                )
+            return sync.appended_prepared + sync.offers_appended
 
     async def handle_approved(
         self,
