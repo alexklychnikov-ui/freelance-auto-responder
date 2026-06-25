@@ -74,6 +74,23 @@ def test_load_recent_response_context(tmp_path) -> None:
     assert "Excel" in ctx["recent_openings"][0]
 
 
+def test_strip_markdown_links() -> None:
+    from src.analyzer.response_text import strip_response_markdown
+
+    text = "См. [Price Monitoring](https://github.com/foo/bar)."
+    assert "[Price Monitoring]" not in strip_response_markdown(text)
+    assert "https://github.com/foo/bar" in strip_response_markdown(text)
+
+
+def test_kwork_compliance_detects_call() -> None:
+    from src.analyzer.response_text import kwork_compliance_issues
+
+    assert "off_platform_call" in kwork_compliance_issues(
+        "Давайте созвонимся и обсудим детали!"
+    )
+    assert not kwork_compliance_issues("Разработаю Telegram-бота для учёта расходов.")
+
+
 def test_banned_phrase_triggers_retry(monkeypatch) -> None:
     from src.analyzer.gpt_response_generator import GptResponseGenerator
     from src.config import Settings

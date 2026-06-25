@@ -13,7 +13,7 @@ from src.analyzer.response_qa import ResponseQaValidator, rule_check_alignment
 from src.analyzer.response_strategy import build_generation_strategy
 from src.config import Settings
 from src.models import ProjectFull
-from src.analyzer.response_text import strip_response_markdown
+from src.analyzer.response_text import kwork_compliance_issues, strip_response_markdown
 from src.responses.portfolio_link import PORTFOLIO_URL, ensure_portfolio_link
 
 logger = logging.getLogger(__name__)
@@ -75,8 +75,15 @@ D: 3–5 предложений, без вступительной воды
 Из lightrag_context / github — только 1–2 факта, реально относящиеся к ЭТОМУ заказу.
 Портфолио: {PORTFOLIO_URL} — один раз, органично, не отдельным блоком «моё портфолио:».
 
-Длина: 900–2000 знаков (Kwork минимум ~150). Без markdown (**жирный**, заголовки #).
+Длина: 900–2000 знаков (Kwork минимум ~150). Без markdown (**жирный**, заголовки #, ссылки [текст](url)).
 Без списков с «- » в начале каждой строки (можно короткие абзацы). Без цены в тексте — цена в форме отдельно.
+
+Правила Kwork (критично — иначе предупреждение от поддержки):
+- Вся коммуникация только внутри Kwork. НЕ предлагай созвон, звонок, Zoom, Meet, Telegram/WhatsApp для связи.
+- НЕ проси обменяться контактами, email, телефоном, «напишите напрямую».
+- НЕ упоминай комиссию Kwork.
+- GitHub и портфолио — только как примеры работ (URL текстом), не как способ связи.
+- Финал: уточняющий вопрос по ТЗ или «готов ответить на вопросы в этом чате Kwork».
 
 Верни только текст отклика.
 """
@@ -210,7 +217,9 @@ class GptResponseGenerator:
         body: dict[str, Any],
         text: str,
     ) -> str:
-        issues = _soft_banned_check(text)
+        issues = _soft_banned_check(text) + [
+            f"kwork:{v}" for v in kwork_compliance_issues(text)
+        ]
         if issues:
             logger.info(
                 "gpt_generate_response retry banned phrases project_id=%s %s",
@@ -222,6 +231,11 @@ class GptResponseGenerator:
             retry_payload["task"] += (
                 " Перепиши: убери клише и смени вступление/структуру."
             )
+            if any(i.startswith("kwork:") for i in issues):
+                retry_payload["task"] += (
+                    " Убери созвон/звонок/мессенджеры/контакты вне Kwork. "
+                    "Финал — вопрос по ТЗ или готовность ответить в чате Kwork."
+                )
             body["messages"][1]["content"] = json.dumps(retry_payload, ensure_ascii=False)
             body["temperature"] = 0.9
             text = self._call_api(body, project.project_id)
@@ -231,7 +245,8 @@ class GptResponseGenerator:
             qa = self._qa.validate(project, text)
             rule_issues = rule_check_alignment(project, text)
             all_issues = list(qa.get("issues") or []) + rule_issues
-            if qa.get("aligned", True) and not rule_issues:
+            all_issues += [f"kwork:{v}" for v in kwork_compliance_issues(text)]
+            if qa.get("aligned", True) and not rule_issues and not kwork_compliance_issues(text):
                 return text
             logger.info(
                 "gpt_generate_response qa_retry project_id=%s issues=%s attempt=%s",
@@ -244,6 +259,7 @@ class GptResponseGenerator:
             retry_payload["task"] += (
                 " Перепиши отклик: убери вопросы о том, что уже указано в project_brief/tz_facts. "
                 "Начни с демонстрации понимания задачи из ТЗ. "
+                "Соблюдай правила Kwork: без созвонов, мессенджеров и контактов вне площадки. "
                 f"Проблемы проверки: {'; '.join(all_issues[:5])}"
             )
             body["messages"][1]["content"] = json.dumps(retry_payload, ensure_ascii=False)
