@@ -15,7 +15,7 @@ class SourceConfig(BaseModel):
     enabled: bool = False
     url: str | None = None
     channel: str | None = None
-    scan_interval_minutes: int = 30
+    scan_interval_minutes: int = 15
     bootstrap: bool = True
     filters: dict[str, Any] = Field(default_factory=dict)
     last_message_id: int = 0
@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     github_token: str = ""
     github_stack_cache: str = "data/github_stack_cache.json"
 
-    scan_interval_minutes: int = 30
+    scan_interval_minutes: int = 15
     min_gpt_score: int = 7
     budget_ceiling_price_multiplier: float = 2.0
     max_daily_responses: int = 5

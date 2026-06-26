@@ -53,6 +53,16 @@ def test_stage_title_matches_partial() -> None:
     assert not _stage_title_matches("Этап 1", "undefined")
 
 
+def test_order_title_required_when_milestone(monkeypatch) -> None:
+    from src.adapters import kwork as kwork_mod
+
+    monkeypatch.setattr(kwork_mod, "_is_milestone_payment_selected", lambda _b: True)
+    assert kwork_mod._order_title_required(object()) is False
+
+    monkeypatch.setattr(kwork_mod, "_is_milestone_payment_selected", lambda _b: False)
+    assert kwork_mod._order_title_required(object()) is True
+
+
 def test_stages_dom_ok_accepts_vue_titles() -> None:
     stages = [("Анализ", 7000), ("Сдача", 3000)]
     read = {

@@ -496,30 +496,72 @@ class PipelineOrchestrator:
             delivery_days=delivery_days,
         )
 
-        def _run_prepare():
+        def _run_prepare(text: str, price_val: str, days: int):
             browser = get_browser_client(self.settings)
             try:
                 adapter = self._adapter_factory(source, browser)
                 if not hasattr(adapter, "prepare_response"):
                     raise RuntimeError("Adapter does not support prepare_response")
-                result = adapter.prepare_response(
+                return adapter.prepare_response(
                     offer.project_id,
-                    response_text,
-                    price,
-                    delivery_days=delivery_days,
+                    text,
+                    price_val,
+                    delivery_days=days,
                     order_title=offer.title or offer.project.title,
                     project=offer.project,
                 )
-                return result
             finally:
                 close_browser_client(browser)
 
+        max_attempts = 2
+        result = None
         try:
             await self.review_service.tg_bot.notify(
                 f"⏳ Готовлю отклик: {html.escape(offer.title)}\n"
                 f"Оценка: {price} ₽ · {delivery_days} дн."
             )
-            result = await asyncio.to_thread(_run_prepare)
+            for attempt in range(max_attempts):
+                if attempt > 0:
+                    await self.review_service.tg_bot.notify(
+                        f"🔄 Повтор {attempt + 1}/{max_attempts}: "
+                        f"перегенерация GPT и заполнение формы…"
+                    )
+                    offer.response_text = ""
+                    self.review_service.store.save(offer)
+                    response_text = await self._generate_response_text(offer)
+                    offer.response_text = response_text
+                    self.review_service.store.save(offer)
+                    context = await asyncio.to_thread(self.lightrag.get_full_context)
+                    terms = await asyncio.to_thread(
+                        self.offer_estimator.estimate,
+                        offer.project,
+                        response_text,
+                        lightrag_context=context,
+                    )
+                    price = str(terms.price_rub)
+                    delivery_days = terms.delivery_days
+                    response_text = append_missing_checklist_answers(
+                        response_text,
+                        offer.project,
+                        price_rub=terms.price_rub,
+                        delivery_days=delivery_days,
+                    )
+
+                result = await asyncio.to_thread(
+                    _run_prepare, response_text, price, delivery_days
+                )
+                if result.success:
+                    break
+                msg = result.message or ""
+                if any(
+                    token in msg
+                    for token in (
+                        "not_logged_in",
+                        "offer_already_submitted",
+                        "offer_form_unavailable",
+                    )
+                ):
+                    break
         except Exception as exc:
             logger.exception("prepare_failed project_id=%s", offer.project_id)
             await self._save_prepared_response(

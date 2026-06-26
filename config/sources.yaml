@@ -3,7 +3,7 @@ sources:
     platform: kwork
     enabled: true
     url: https://kwork.ru/projects?c=11
-    scan_interval_minutes: 30
+    scan_interval_minutes: 15
     bootstrap: true
 
   - id: flru_ai

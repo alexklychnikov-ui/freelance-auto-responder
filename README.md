@@ -1,6 +1,6 @@
 # Freelance Auto-Responder
 
-Автоскан Kwork → LightRAG + GPT → карточка в Telegram → черновик → prepare формы на Kwork (без отправки) → Excel-журнал на ПК.
+Автоматический пайплайн откликов на фриланс-проекты (сейчас Kwork): daemon каждые **15 минут** сканирует ленту → для новых проектов подтягивает контекст из **LightRAG** и примеры откликов → **GPT** оценивает fit и риски → в **Telegram** приходит карточка с кнопкой «Откликнуть». После approve бот генерирует текст, оценивает цену/срок и **заполняет черновик формы Kwork** (Playwright на VPS): поэтапная оплата, 2+ задачи с суммами, описание, цена, срок — **без нажатия «Предложить»**. Подтверждённый отклик попадает в Excel-журнал на ПК через `Sync-Journal.bat`. Синхронизация статусов с Kwork (`/offers`) обновляет журнал и тип проекта.
 
 ## Архитектура
 
@@ -12,6 +12,20 @@
 | **Excel** | только локально: `C:\Python\Projects\Zerocode2md\ResponseJournal\journal.xlsx` (лист «Мои отклики») |
 
 VPS **не** пишет в твой локальный Excel. После prepare отклик лежит в `data/prepared_responses/*.json` на сервере. На ПК запускаешь `Sync-Journal.bat` — строки подтягиваются в `journal.xlsx`.
+
+---
+
+## Последние изменения (июнь 2025)
+
+| Область | Что сделано |
+|---------|-------------|
+| **Интервал скана** | `SCAN_INTERVAL_MINUTES` и daemon: **15 мин** (было 30) |
+| **Prepare Kwork** | Клик «По мере выполнения задач» до заполнения этапов; reassert после price/deadline |
+| **Черновик этапов** | Сохранение через `updatePaymentType` + `updateDataStages` + `changeDraftContent` (без `setRequestDataStages`) |
+| **Verify prepare** | Проверка этапов, milestone, цены и описания в той же сессии; retry GPT+форма (2 попытки) |
+| **TG** | Кнопка «Заполнить форму снова» при ошибке prepare; `/journal_sync` для синка Excel |
+| **Журнал Excel** | Гиперссылки в колонке D; тип проекта при sync с `/offers`; repair строк |
+| **VPS sync** | `deploy/sync_journal_from_vps.py`, `sync_journal_on_vps.py` — offers + prepared на сервере |
 
 ---
 
@@ -160,6 +174,7 @@ grep -E '^(BROWSER_ADAPTER|OPENAI_BASE_URL|LIGHTRAG|KWORK|PREPARE|RESPONSE)' /op
 | `KWORK_AUTO_LOGIN` | `false` (капча) |
 | `KWORK_STORAGE_STATE` | `/opt/freelance-responder/data/kwork_storage.json` |
 | `PREPARE_ONLY_NO_SUBMIT` | `true` |
+| `SCAN_INTERVAL_MINUTES` | `15` |
 | `RESPONSE_JOURNAL` | `/opt/freelance-responder/data/response_journal.xlsx` (не используется для твоего Excel) |
 | `RESPONSE_EXAMPLES_DIR` | `/opt/freelance-responder/data/examples` |
 
@@ -268,6 +283,8 @@ tar czf /root/freelance-backup-$(date +%F).tar.gz \
 | `deploy/sync_journal_from_vps.py` | VPS → локальный Excel |
 | `deploy/Sync-Journal.bat` | bat для ПК (копировать на Desktop) |
 | `deploy/verify_kwork_session.py` | проверка логина на VPS |
+| `deploy/rerun_prepare.py` | повторный prepare по project_id |
+| `deploy/probe_draft_stages_persist.py` | проверка сохранения этапов в черновик |
 | `deploy/reset_journal_exported.py` | сброс флага для повторной синхронизации |
 
 ---
@@ -277,6 +294,7 @@ tar czf /root/freelance-backup-$(date +%F).tar.gz \
 | Симптом | Решение |
 |---------|---------|
 | Кнопки TG не работают | `systemctl status freelance-responder` — нужен daemon, не только run-test |
+| Prepare: этапы пустые после reload | обновить `kwork.py`; проверить milestone + autosave 15s; F5 на `new_offer` |
 | Prepare: not_logged_in | обновить `kwork_storage.json` с ПК |
 | Prepare: greenlet error | обновить `src/pipeline/orchestrator.py` на VPS |
 | Sync-Journal: дубли / неверный № | закрыть Excel, `reset_journal_exported.py` на VPS, bat снова |

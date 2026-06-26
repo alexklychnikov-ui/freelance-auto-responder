@@ -1191,6 +1191,86 @@ def _read_order_title(browser: BrowserClient) -> str:
         return ""
 
 
+def _stages_section_visible(browser: BrowserClient, *, min_rows: int = 2) -> bool:
+    try:
+        count = browser.evaluate(
+            f"""
+            () => {{
+              const prices = [...document.querySelectorAll('.stages__stage-price-input')]
+                .filter((i) => i.offsetParent);
+              const rows = [...document.querySelectorAll('.stages__list .stages__stage')]
+                .filter((r) => r.offsetParent);
+              const titles = [...document.querySelectorAll('textarea[name^="stageTitle-"]')]
+                .filter((t) => t.offsetParent);
+              return Math.max(prices.length, rows.length, titles.length);
+            }}
+            """
+        )
+        return int(count or 0) >= min_rows
+    except Exception:
+        return False
+
+
+def _wait_stages_ready(
+    browser: BrowserClient, *, min_rows: int = 2, attempts: int = 16
+) -> bool:
+    for _ in range(attempts):
+        if _stages_section_visible(browser, min_rows=min_rows):
+            return True
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(500)
+    return False
+
+
+def _click_milestone_payment_card(browser: BrowserClient) -> bool:
+    try:
+        if hasattr(browser, "_ensure_page"):
+            page = browser._ensure_page()
+            item = page.locator(".offer-payment-type__item").filter(
+                has_text=re.compile(r"По мере выполнения задач", re.I)
+            ).first
+            if item.count() > 0:
+                item.scroll_into_view_if_needed(timeout=8000)
+                item.click(force=True, timeout=5000)
+                radio = item.locator('input[type="radio"]').first
+                if radio.count() > 0:
+                    radio.click(force=True)
+    except Exception:
+        pass
+    try:
+        browser.evaluate(
+            """
+            () => {
+              const item = [...document.querySelectorAll('.offer-payment-type__item')].find((el) =>
+                /по мере выполнения задач/i.test((el.textContent || '').replace(/\\s+/g, ' '))
+              );
+              if (!item) return false;
+              item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+              item.click();
+              const input = item.querySelector('input[type="radio"], input[type="checkbox"]');
+              if (input) {
+                input.checked = true;
+                input.dispatchEvent(new Event('change', { bubbles: true }));
+                input.click();
+              }
+              const payVm = item.closest('.offer-payment-type')?.__vue__
+                || document.querySelector('.offer-custom')?.__vue__;
+              if (payVm && typeof payVm.updatePaymentType === 'function') {
+                try {
+                  payVm.updatePaymentType(payVm.offerPaymentStages || 'stages');
+                } catch (e) {}
+              }
+              return true;
+            }
+            """
+        )
+    except Exception:
+        pass
+    if hasattr(browser, "wait_ms"):
+        browser.wait_ms(1200)
+    return True
+
+
 def _is_milestone_payment_selected(browser: BrowserClient) -> bool:
     try:
         return bool(
@@ -1202,14 +1282,81 @@ def _is_milestone_payment_selected(browser: BrowserClient) -> bool:
                     /по мере выполнения задач/i.test((el.textContent || '').replace(/\\s+/g, ' '))
                   );
                   if (!milestone) return false;
-                  if (milestone.classList.contains('active') || milestone.classList.contains('selected')) {
-                    return true;
-                  }
+                  const active = milestone.classList.contains('active')
+                    || milestone.classList.contains('selected');
                   const input = milestone.querySelector('input[type="radio"], input[type="checkbox"]');
-                  if (input?.checked) return true;
-                  return milestone.classList.contains('active')
-                    || milestone.classList.contains('selected')
-                    || milestone.getAttribute('aria-checked') === 'true';
+                  const prices = [...document.querySelectorAll('.stages__stage-price-input')]
+                    .filter((i) => i.offsetParent);
+                  const parent = document.querySelector('.stages')?.__vue__;
+                  const local = (parent?.localStages || []).filter(
+                    (s) => s && (s.title || s.payer_price)
+                  );
+                  const stagesReady = prices.length >= 2
+                    || local.filter((s) => Number(s.payer_price || 0) > 0).length >= 2;
+                  return active && stagesReady;
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _select_milestone_payment(browser: BrowserClient) -> bool:
+    if _is_milestone_payment_selected(browser):
+        return True
+    for _ in range(3):
+        _click_milestone_payment_card(browser)
+        if _wait_stages_ready(browser):
+            return True
+    return _is_milestone_payment_selected(browser)
+
+
+def _reassert_milestone_payment(
+    browser: BrowserClient, stages: list[tuple[str, int]]
+) -> tuple[bool, dict[str, Any], dict[str, Any]]:
+    """Re-select milestone payment and restore stages after other field edits."""
+    stages_read = _read_stages_from_dom(browser)
+    if _is_milestone_payment_selected(browser) and _stages_dom_ok(stages, stages_read):
+        total = _stage_total_from_read(stages_read)
+        return True, stages_read, {"ok": True, "actualTotal": total}
+
+    if not _is_milestone_payment_selected(browser):
+        _select_milestone_payment(browser)
+        _wait_stages_ready(browser)
+
+    stages_result = _fill_offer_stages(browser, stages)
+    stages_read = _read_stages_from_dom(browser)
+    stages_result["read"] = stages_read
+    stages_result["ok"] = _stages_dom_ok(stages, stages_read)
+    _sync_stages_draft(browser)
+    if hasattr(browser, "wait_ms"):
+        browser.wait_ms(800)
+    return _is_milestone_payment_selected(browser), stages_read, stages_result
+
+
+def _order_title_required(browser: BrowserClient) -> bool:
+    return not _is_milestone_payment_selected(browser)
+
+
+def _order_title_visible(browser: BrowserClient) -> bool:
+    try:
+        return bool(
+            browser.evaluate(
+                """
+                () => {
+                  const ta = document.querySelector('textarea[name="name"]');
+                  if (ta) {
+                    const box = ta.closest('.trumbowyg-box, .form-field, .field, div');
+                    if (box && box.offsetParent !== null) return true;
+                  }
+                  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+                  const label = [...document.querySelectorAll('label, span, div, p')].find(
+                    (el) => /^название заказа$/i.test(norm(el.textContent))
+                  );
+                  if (!label) return false;
+                  const root = label.closest('.form-field, .field, div') || label.parentElement;
+                  return Boolean(root && root.offsetParent !== null);
                 }
                 """
             )
@@ -1273,49 +1420,6 @@ def _fill_order_title(browser: BrowserClient, title: str) -> bool:
         return False
 
 
-def _select_milestone_payment(browser: BrowserClient) -> bool:
-    if _is_milestone_payment_selected(browser):
-        return True
-    try:
-        if hasattr(browser, "_ensure_page"):
-            page = browser._ensure_page()
-            item = page.locator(".offer-payment-type__item").filter(
-                has_text=re.compile(r"По мере выполнения задач", re.I)
-            ).first
-            if item.count() > 0:
-                item.scroll_into_view_if_needed(timeout=8000)
-                item.click(force=True)
-                radio = item.locator('input[type="radio"]').first
-                if radio.count() > 0:
-                    radio.click(force=True)
-                if hasattr(browser, "wait_ms"):
-                    browser.wait_ms(1000)
-                return _is_milestone_payment_selected(browser)
-    except Exception:
-        pass
-    try:
-        return bool(
-            browser.evaluate(
-                """
-                () => {
-                  const item = [...document.querySelectorAll('.offer-payment-type__item')].find((el) =>
-                    /по мере выполнения задач/i.test((el.textContent || '').replace(/\\s+/g, ' '))
-                  );
-                  if (!item) return false;
-                  item.click();
-                  const input = item.querySelector('input[type="radio"], input[type="checkbox"]');
-                  if (input) input.click();
-                  return item.classList.contains('active')
-                    || item.classList.contains('selected')
-                    || Boolean(input?.checked);
-                }
-                """
-            )
-        )
-    except Exception:
-        return False
-
-
 def _count_visible_stage_slots(browser: BrowserClient) -> int:
     try:
         raw = browser.evaluate(
@@ -1367,6 +1471,9 @@ def _click_add_stage_row(browser: BrowserClient) -> bool:
 
 
 def _ensure_stage_rows(browser: BrowserClient, needed: int) -> None:
+    if not _stages_section_visible(browser, min_rows=1):
+        _select_milestone_payment(browser)
+        _wait_stages_ready(browser, min_rows=min(2, needed))
     for _ in range(10):
         visible = _count_visible_stage_slots(browser)
         if visible >= needed:
@@ -1433,19 +1540,20 @@ STAGE_VUE_SET_JS = """
     offerVm.stages = parent.localStages.map((s) => ({
       id: s.id || 0,
       number: s.number,
-      title: s.title,
-      payer_price: s.payer_price,
+      title: s.title || '',
+      payer_price: Number(s.payer_price || 0),
     }));
-    if (offerVm.priceStages != null) {
-      offerVm.priceStages = parent.localStages.reduce(
-        (sum, s) => sum + Number(s.payer_price || 0),
-        0,
-      );
-    }
+    offerVm.stagesCount = offerVm.stages.length;
+    offerVm.priceStages = parent.localStages.reduce(
+      (sum, s) => sum + Number(s.payer_price || 0),
+      0,
+    );
   }
-  if (wrapVm?.setRequestDataStages) wrapVm.setRequestDataStages(parent.localStages);
-  if (offerVm?.updateDataStages) offerVm.updateDataStages();
-  if (offerVm?.changeDraftContent) offerVm.changeDraftContent();
+  if (typeof offerVm?.updatePaymentType === 'function') {
+    offerVm.updatePaymentType(offerVm.offerPaymentStages || 'stages');
+  }
+  if (typeof offerVm?.updateDataStages === 'function') offerVm.updateDataStages();
+  if (typeof offerVm?.changeDraftContent === 'function') offerVm.changeDraftContent();
 
   const readTitle = String(stage?.title || vm.titleLocal || '').trim();
   const priceInput = row.querySelector('.stages__stage-price-input');
@@ -1633,30 +1741,42 @@ def _finalize_offer_form(
         stages_result = _fill_offer_stages(browser, stages)
 
     desc_ok = _fill_description(browser, text)
-    title_ok = bool(order_title) and _fill_order_title(browser, order_title)
     price_ok = _fill_price(browser, str(price))
+    title_required = len(stages) < 2
+    title_ok = True
+    read_title = ""
+    if title_required and order_title:
+        title_ok = _fill_order_title(browser, order_title)
+        read_title = _read_order_title(browser)
+        if not read_title:
+            title_ok = _fill_order_title(browser, order_title) or title_ok
+            read_title = _read_order_title(browser)
     deadline_result = _fill_deadline(browser, delivery_days)
     if not deadline_result.get("ok") and hasattr(browser, "wait_ms"):
         browser.wait_ms(1500)
         deadline_result = _fill_deadline(browser, delivery_days)
 
-    read_title = _read_order_title(browser)
-    stages_read = _read_stages_from_dom(browser)
-    if order_title and not read_title:
-        title_ok = _fill_order_title(browser, order_title) or title_ok
-        read_title = _read_order_title(browser)
-    if not _stages_dom_ok(stages, stages_read):
+    milestone_selected, stages_read, reassert_stages = _reassert_milestone_payment(
+        browser, stages
+    )
+    if reassert_stages.get("filled") or not _stages_dom_ok(stages, stages_read):
+        stages_result = reassert_stages
+    elif not _stages_dom_ok(stages, stages_read):
         stages_result = _fill_offer_stages(browser, stages)
         stages_read = _read_stages_from_dom(browser)
         stages_result["read"] = stages_read
         stages_result["ok"] = _stages_dom_ok(stages, stages_read)
 
-    if order_title and read_title:
+    if not desc_ok or _read_description_len(browser) < 150:
+        desc_ok = _fill_description(browser, text)
+
+    if milestone_selected:
         title_ok = True
 
     return {
         "milestone": milestone,
-        "milestoneSelected": _is_milestone_payment_selected(browser),
+        "milestoneSelected": milestone_selected,
+        "titleRequired": title_required,
         "stages": stages_result,
         "stagesRead": stages_read,
         "desc_ok": desc_ok,
@@ -1674,22 +1794,30 @@ def _sync_stages_draft(browser: BrowserClient) -> None:
             () => {
               const parent = document.querySelector('.stages')?.__vue__;
               const offerVm = document.querySelector('.offer-custom')?.__vue__;
-              const wrapVm = document.querySelector('.custom-kwork-offer__wrapper')?.__vue__;
               const local = parent?.localStages || [];
+              const payStages = offerVm?.offerPaymentStages || 'stages';
               if (offerVm && local.length) {
                 offerVm.stages = local.map((s) => ({
                   id: s.id || 0,
                   number: s.number,
-                  title: s.title,
-                  payer_price: s.payer_price,
+                  title: s.title || '',
+                  payer_price: Number(s.payer_price || 0),
                 }));
-                if (offerVm.priceStages != null) {
-                  offerVm.priceStages = local.reduce((sum, s) => sum + Number(s.payer_price || 0), 0);
-                }
+                offerVm.stagesCount = offerVm.stages.length;
+                offerVm.priceStages = local.reduce(
+                  (sum, s) => sum + Number(s.payer_price || 0),
+                  0,
+                );
               }
-              if (wrapVm?.setRequestDataStages) wrapVm.setRequestDataStages(local);
-              if (offerVm?.updateDataStages) offerVm.updateDataStages();
-              if (offerVm?.changeDraftContent) offerVm.changeDraftContent();
+              if (typeof offerVm?.updatePaymentType === 'function') {
+                offerVm.updatePaymentType(payStages);
+              }
+              if (typeof offerVm?.updateDataStages === 'function') {
+                offerVm.updateDataStages();
+              }
+              if (typeof offerVm?.changeDraftContent === 'function') {
+                offerVm.changeDraftContent();
+              }
               return true;
             }
             """
@@ -1705,6 +1833,16 @@ def _fill_offer_stages(
         return {"ok": False, "reason": "need_min_2_stages"}
     expected_total = sum(amount for _, amount in stages)
     selected = _select_milestone_payment(browser)
+    if not selected:
+        return {"ok": False, "reason": "milestone_not_selected", "selected": False}
+    if not _wait_stages_ready(browser):
+        _click_milestone_payment_card(browser)
+        if not _wait_stages_ready(browser, attempts=24):
+            return {
+                "ok": False,
+                "reason": "stages_not_visible",
+                "selected": selected,
+            }
     if hasattr(browser, "wait_ms"):
         browser.wait_ms(1200)
     _ensure_stage_rows(browser, len(stages))
@@ -1748,7 +1886,13 @@ def _fill_offer_stages(
     }
 
 
+def _stage_total_from_read(stages_read: dict[str, Any]) -> int:
+    prices = [str(p) for p in (stages_read.get("prices") or []) if p]
+    return sum(int(re.sub(r"\D", "", p) or 0) for p in prices)
+
+
 def _autosave_wait(browser: BrowserClient, *, wait_ms: int = 8000) -> None:
+    _sync_stages_draft(browser)
     try:
         browser.evaluate(TRIGGER_OFFER_AUTOSAVE_JS)
     except Exception:
@@ -2101,6 +2245,19 @@ class KworkAdapter:
             form_max=form_max,
         )
 
+        if not _select_milestone_payment(self.browser):
+            return SubmitResult(
+                success=False,
+                project_id=project_id,
+                message="prepare_milestone_click_failed",
+            )
+        if not _wait_stages_ready(self.browser):
+            return SubmitResult(
+                success=False,
+                project_id=project_id,
+                message="prepare_stages_not_visible",
+            )
+
         price_ok = _fill_price(self.browser, str(price))
         if hasattr(self.browser, "wait_ms"):
             self.browser.wait_ms(400)
@@ -2123,8 +2280,9 @@ class KworkAdapter:
         deadline_result = final["deadline"]
 
         _autosave_wait(self.browser, wait_ms=5000)
+        title_required = len(stages) < 2
         if not _stages_dom_ok(stages, stages_read) or (
-            order_title and not final.get("read_title")
+            title_required and order_title and not final.get("read_title")
         ):
             final = _finalize_offer_form(
                 self.browser,
@@ -2145,11 +2303,24 @@ class KworkAdapter:
         fill_result: dict[str, Any] = {"finalize": final}
 
         _autosave_wait(self.browser, wait_ms=3000)
+        milestone_selected, stages_read, stages_result = _reassert_milestone_payment(
+            self.browser, stages
+        )
+        final["milestoneSelected"] = milestone_selected
+        final["stages"] = stages_result
+        final["stagesRead"] = stages_read
+        fill_result["finalize"] = final
+        _autosave_wait(self.browser, wait_ms=15000)
+        if milestone_selected and _read_description_len(self.browser) < 150:
+            desc_ok = _fill_description(self.browser, text)
+            _autosave_wait(self.browser, wait_ms=2000)
         readback = _read_offer_form(self.browser)
         desc_len = _read_description_len(self.browser) or int(readback.get("descLen") or 0)
         read_price = str(readback.get("price") or "").replace(" ", "")
         read_title = _read_order_title(self.browser) or str(readback.get("title") or "").strip()
         stages_read = _read_stages_from_dom(self.browser)
+        milestone_selected = _is_milestone_payment_selected(self.browser)
+        title_required = len(stages) < 2
         read_deadline = str(
             readback.get("deadline") or readback.get("deadlineLabel") or ""
         ).strip()
@@ -2164,7 +2335,9 @@ class KworkAdapter:
             fill_result = {}
         fill_result["hasDesc"] = desc_ok
         fill_result["hasPrice"] = price_ok
-        fill_result["hasTitle"] = title_ok
+        fill_result["hasTitle"] = title_ok if title_required else True
+        fill_result["titleRequired"] = title_required
+        fill_result["milestoneSelected"] = milestone_selected
         fill_result["daysSet"] = days_set
         fill_result["deadline"] = deadline_result
         fill_result["readback"] = readback
@@ -2196,14 +2369,13 @@ class KworkAdapter:
                 project_id=project_id,
                 message=f"prepare_price_below_min: {read_price_int} < {form_min} {fill_result}",
             )
-        if order_title and not read_title:
+        if title_required and order_title and not read_title:
             return SubmitResult(
                 success=False,
                 project_id=project_id,
                 message=f"prepare_title_empty: {fill_result}",
             )
         fill_result["stagesRead"] = stages_read
-        fill_result["milestoneSelected"] = _is_milestone_payment_selected(self.browser)
         if not final.get("milestoneSelected") and not fill_result["milestoneSelected"]:
             return SubmitResult(
                 success=False,
@@ -2217,6 +2389,8 @@ class KworkAdapter:
                 message=f"prepare_stages_failed: {fill_result}",
             )
         stage_total = int(stages_result.get("actualTotal") or 0)
+        if stage_total <= 0:
+            stage_total = _stage_total_from_read(stages_read)
         if stage_total != int(price) or read_price_int != int(price):
             return SubmitResult(
                 success=False,
@@ -2224,7 +2398,10 @@ class KworkAdapter:
                 message=f"prepare_total_mismatch: expected={price} got={read_price_int} stages={stage_total} {fill_result}",
             )
 
-        message = f"prepared: verified desc={desc_len} price={read_price} title={read_title!r}"
+        message = f"prepared: verified desc={desc_len} price={read_price}"
+        if title_required:
+            message += f" title={read_title!r}"
+        message += f" stages={len(stages)} milestone={milestone_selected}"
         if not days_set:
             message += f"; deadline_not_set: {deadline_result}"
 
