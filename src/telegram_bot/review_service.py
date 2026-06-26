@@ -21,6 +21,7 @@ ApproveHandler = Callable[
 ]
 SubmitTextHandler = Callable[[PendingOffer, str], Awaitable[None]]
 ExportJournalHandler = Callable[[Message], Awaitable[None]]
+ScanReportHandler = Callable[[Message], Awaitable[None]]
 JournalConfirmHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 PrepareRetryHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 
@@ -36,6 +37,7 @@ class ReviewService:
         on_approve: ApproveHandler | None = None,
         on_submit_text: SubmitTextHandler | None = None,
         on_export_journal: ExportJournalHandler | None = None,
+        on_scan_report: ScanReportHandler | None = None,
         on_journal_confirm: JournalConfirmHandler | None = None,
         on_prepare_retry: PrepareRetryHandler | None = None,
     ) -> None:
@@ -46,6 +48,7 @@ class ReviewService:
         self._on_approve = on_approve
         self._on_submit_text = on_submit_text
         self._on_export_journal = on_export_journal
+        self._on_scan_report = on_scan_report
         self._on_journal_confirm = on_journal_confirm
         self._on_prepare_retry = on_prepare_retry
         self.tg_bot.register_handlers(
@@ -53,6 +56,7 @@ class ReviewService:
             on_reject=self._handle_reject,
             on_response_text=self._handle_response_text,
             on_export_journal=self._handle_export_journal,
+            on_scan_report=self._handle_scan_report,
             on_journal_confirm=self._handle_journal_confirm,
             on_prepare_retry=self._handle_prepare_retry,
         )
@@ -65,6 +69,9 @@ class ReviewService:
 
     def set_export_journal_handler(self, handler: ExportJournalHandler) -> None:
         self._on_export_journal = handler
+
+    def set_scan_report_handler(self, handler: ScanReportHandler) -> None:
+        self._on_scan_report = handler
 
     def set_journal_confirm_handler(self, handler: JournalConfirmHandler) -> None:
         self._on_journal_confirm = handler
@@ -227,6 +234,14 @@ class ReviewService:
         if str(message.chat.id) != str(self.tg_bot.chat_id):
             return
         await self._on_export_journal(message)
+
+    async def _handle_scan_report(self, message: Message) -> None:
+        if self._on_scan_report is None:
+            await message.answer("Команда /report недоступна")
+            return
+        if str(message.chat.id) != str(self.tg_bot.chat_id):
+            return
+        await self._on_scan_report(message)
 
     def expire_stale_pending(self) -> list[PendingOffer]:
         expired = self.store.expire_stale(self.settings.pending_timeout_hours)

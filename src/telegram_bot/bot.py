@@ -191,6 +191,7 @@ class TelegramReviewBot:
         on_reject: Any,
         on_response_text: Any | None = None,
         on_export_journal: Any | None = None,
+        on_scan_report: Any | None = None,
         on_journal_confirm: Any | None = None,
         on_prepare_retry: Any | None = None,
     ) -> None:
@@ -241,8 +242,14 @@ class TelegramReviewBot:
             await message.answer(
                 "Freelance Auto-Responder\n"
                 "Отклик: карточка → автозаполнение формы на Kwork (VPS).\n"
-                "Excel: команда /journal_sync в этом чате."
+                "Excel: /journal · отчёт сканов: /report"
             )
+
+        @self._dp.message(Command("report"))
+        async def handle_report(message: Message) -> None:
+            if on_scan_report is None:
+                return
+            await on_scan_report(message)
 
         @self._dp.message(Command("journal", "journal_sync"))
         async def handle_journal_sync(message: Message) -> None:

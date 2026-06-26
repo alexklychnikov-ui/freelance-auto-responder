@@ -1,17 +1,17 @@
 # Freelance Auto-Responder
 
-Автоматический пайплайн откликов на фриланс-проекты (сейчас Kwork): daemon каждые **15 минут** сканирует ленту → для новых проектов подтягивает контекст из **LightRAG** и примеры откликов → **GPT** оценивает fit и риски → в **Telegram** приходит карточка с кнопкой «Откликнуть». После approve бот генерирует текст, оценивает цену/срок и **заполняет черновик формы Kwork** (Playwright на VPS): поэтапная оплата, 2+ задачи с суммами, описание, цена, срок — **без нажатия «Предложить»**. Подтверждённый отклик попадает в Excel-журнал на ПК через `Sync-Journal.bat`. Синхронизация статусов с Kwork (`/offers`) обновляет журнал и тип проекта.
+Автоматический пайплайн откликов на фриланс-проекты (сейчас Kwork): daemon каждые **15 минут** сканирует ленту → для новых проектов подтягивает контекст из **LightRAG** и примеры откликов → **GPT** оценивает fit и риски → в **Telegram** приходит карточка с кнопкой «Откликнуть». После approve бот генерирует текст, оценивает цену/срок и **заполняет черновик формы Kwork** (Playwright на VPS): поэтапная оплата, 2+ задачи с суммами, описание, цена, срок — **без нажатия «Предложить»**. После prepare — кнопка **«Подтвердить отклик»** (строка в Excel на VPS) или команда **`/journal`** (обновить журнал + статусы с Kwork `/offers` и прислать `.xlsx` в чат).
 
 ## Архитектура
 
 | Где | Роль |
 |-----|------|
-| **VPS** (`/opt/freelance-responder`) | daemon: скан, GPT, TG-бот, Playwright prepare на Kwork |
-| **ПК (Windows)** | разработка, Kwork-login, синхронизация Excel |
+| **VPS** (`/opt/freelance-responder`) | daemon: скан, GPT, TG-бот, Playwright prepare, **Excel-журнал** |
+| **ПК (Windows)** | разработка, Kwork-login, опционально локальная копия журнала |
 | **LightRAG** | на том же VPS (`http://127.0.0.1:9621`) |
-| **Excel** | только локально: `C:\Python\Projects\Zerocode2md\ResponseJournal\journal.xlsx` (лист «Мои отклики») |
+| **Excel** | на VPS: `/opt/freelance-responder/data/response_journal.xlsx` (лист «Мои отклики»); бот присылает файл в TG по `/journal` |
 
-VPS **не** пишет в твой локальный Excel. После prepare отклик лежит в `data/prepared_responses/*.json` на сервере. На ПК запускаешь `Sync-Journal.bat` — строки подтягиваются в `journal.xlsx`.
+Рабочий журнал ведётся **на VPS**. Команда `/journal` в Telegram: дописывает подтверждённые `prepared_responses`, подтягивает статусы с Kwork `/offers`, отправляет обновлённый `journal.xlsx` в чат. Кнопка **«Подтвердить отклик»** после prepare пишет строку в журнал сразу (тоже на VPS).
 
 ---
 
@@ -23,7 +23,7 @@ VPS **не** пишет в твой локальный Excel. После prepare
 | **Prepare Kwork** | Клик «По мере выполнения задач» до заполнения этапов; reassert после price/deadline |
 | **Черновик этапов** | Сохранение через `updatePaymentType` + `updateDataStages` + `changeDraftContent` (без `setRequestDataStages`) |
 | **Verify prepare** | Проверка этапов, milestone, цены и описания в той же сессии; retry GPT+форма (2 попытки) |
-| **TG** | Кнопка «Заполнить форму снова» при ошибке prepare; `/journal_sync` для синка Excel |
+| **TG** | Кнопка «Заполнить форму снова»; `/journal` — Excel; **`/report`** — отчёт по 3 последним сканам |
 | **Журнал Excel** | Гиперссылки в колонке D; тип проекта при sync с `/offers`; repair строк |
 | **VPS sync** | `deploy/sync_journal_from_vps.py`, `sync_journal_on_vps.py` — offers + prepared на сервере |
 
@@ -87,17 +87,17 @@ Host LightRAG_Naive
     IdentityFile C:/Users/User/.ssh/alexklyvibe
 ```
 
-Имя хоста используется в `deploy/*.ps1`, `deploy/*.py`, `Sync-Journal.bat`.
+Имя хоста используется в `deploy/*.ps1`, `deploy/*.py`.
 
-### 4. Excel-журнал (ярлык на рабочий стол)
+### 4. Excel-журнал (опционально на ПК)
 
-Скопировать на рабочий стол:
+Для локальной копии с VPS:
 
 ```powershell
-copy deploy\Sync-Journal.bat "%USERPROFILE%\Desktop\Sync-Journal.bat"
+python deploy\sync_journal_from_vps.py
 ```
 
-**Порядок:** закрыть Excel → двойной клик `Sync-Journal.bat` → откроется `journal.xlsx`.
+Откроется/обновится `journal.xlsx` по пути из `RESPONSE_JOURNAL` в `.env` на ПК. **В проде** журнал на VPS; актуальный файл — через `/journal` в Telegram.
 
 ### 5. Сессия Kwork (раз в N недель / после logout)
 
@@ -175,7 +175,8 @@ grep -E '^(BROWSER_ADAPTER|OPENAI_BASE_URL|LIGHTRAG|KWORK|PREPARE|RESPONSE)' /op
 | `KWORK_STORAGE_STATE` | `/opt/freelance-responder/data/kwork_storage.json` |
 | `PREPARE_ONLY_NO_SUBMIT` | `true` |
 | `SCAN_INTERVAL_MINUTES` | `15` |
-| `RESPONSE_JOURNAL` | `/opt/freelance-responder/data/response_journal.xlsx` (не используется для твоего Excel) |
+| `OPERATOR_TIMEZONE` | `Asia/Irkutsk` (для `/report`) |
+| `RESPONSE_JOURNAL` | `/opt/freelance-responder/data/response_journal.xlsx` |
 | `RESPONSE_EXAMPLES_DIR` | `/opt/freelance-responder/data/examples` |
 
 ### 5. Kwork-сессия на VPS
@@ -238,11 +239,13 @@ ssh LightRAG_Naive "cd /opt/freelance-responder && .venv/bin/pip install -r requ
 
 1. Daemon находит проект → карточка в Telegram  
 2. **Откликнуть** → GPT-черновик  
-3. Reply на черновик с финальным текстом  
-4. Бот заполняет форму Kwork (без «Предложить») + скрин  
-5. На ПК: **`Sync-Journal.bat`** → строка в `journal.xlsx`
+3. Reply на черновик с финальным текстом (или сразу approve)  
+4. Бот заполняет форму Kwork (без «Предложить»)  
+5. **Подтвердить отклик** → строка в Excel на VPS  
+6. **`/journal`** → обновление журнала (prepared + offers) и файл `.xlsx` в чат  
+7. **`/report`** → отчёт по последним 3 сканам (время в `OPERATOR_TIMEZONE`, проверено / не стек / не бюджет)
 
-Команда `/journal` в TG **не используется** — Excel только через bat на ПК.
+Локальная копия на ПК — по желанию: `python deploy\sync_journal_from_vps.py`.
 
 ---
 
@@ -257,7 +260,7 @@ ssh LightRAG_Naive "cd /opt/freelance-responder && .venv/bin/pip install -r requ
 | Очередь Excel | — | `data/prepared_responses/*.json` |
 | Pending TG | — | `data/pending_offers/*.json` |
 | БД скана | `data/seen_projects.db` | то же |
-| Excel | `journal.xlsx` | — |
+| Excel | локальная копия (опц.) | `data/response_journal.xlsx` |
 
 Пример бэкапа VPS:
 
@@ -280,8 +283,8 @@ tar czf /root/freelance-backup-$(date +%F).tar.gz \
 | `deploy/install.sh` | venv + playwright + systemd на VPS |
 | `deploy/kwork_login_interactive.py` | логин Kwork → session |
 | `deploy/export_kwork_profile_session.py` | экспорт session из профиля |
-| `deploy/sync_journal_from_vps.py` | VPS → локальный Excel |
-| `deploy/Sync-Journal.bat` | bat для ПК (копировать на Desktop) |
+| `deploy/sync_journal_from_vps.py` | скачать журнал с VPS на ПК (опционально) |
+| `deploy/sync_journal_on_vps.py` | ручной sync на VPS + отправка в TG |
 | `deploy/verify_kwork_session.py` | проверка логина на VPS |
 | `deploy/rerun_prepare.py` | повторный prepare по project_id |
 | `deploy/probe_draft_stages_persist.py` | проверка сохранения этапов в черновик |
@@ -297,8 +300,8 @@ tar czf /root/freelance-backup-$(date +%F).tar.gz \
 | Prepare: этапы пустые после reload | обновить `kwork.py`; проверить milestone + autosave 15s; F5 на `new_offer` |
 | Prepare: not_logged_in | обновить `kwork_storage.json` с ПК |
 | Prepare: greenlet error | обновить `src/pipeline/orchestrator.py` на VPS |
-| Sync-Journal: дубли / неверный № | закрыть Excel, `reset_journal_exported.py` на VPS, bat снова |
-| Excel пустой после bat | на VPS нет `journal_exported=false` в `prepared_responses/` |
+| Журнал пустой / нет строки | `/journal` в TG; проверить `journal_confirmed` в `prepared_responses/` |
+| `/journal` без файла | смотреть лог daemon; путь `RESPONSE_JOURNAL` на VPS |
 | 0 проектов в скане | проверить Kwork-селекторы / сессию |
 
 ---

@@ -66,6 +66,7 @@ class Settings(BaseSettings):
     default_offer_days: int = 14
     prepared_responses_dir: str = "data/prepared_responses"
     pending_timeout_hours: int = 24
+    operator_timezone: str = "Asia/Irkutsk"
 
     kwork_login: str | None = None
     kwork_password: str | None = None

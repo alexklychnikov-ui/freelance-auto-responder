@@ -1222,56 +1222,41 @@ def _wait_stages_ready(
     return False
 
 
-def _click_milestone_payment_card(browser: BrowserClient) -> bool:
+def _payment_items_count(browser: BrowserClient) -> int:
     try:
-        if hasattr(browser, "_ensure_page"):
-            page = browser._ensure_page()
-            item = page.locator(".offer-payment-type__item").filter(
-                has_text=re.compile(r"По мере выполнения задач", re.I)
-            ).first
-            if item.count() > 0:
-                item.scroll_into_view_if_needed(timeout=8000)
-                item.click(force=True, timeout=5000)
-                radio = item.locator('input[type="radio"]').first
-                if radio.count() > 0:
-                    radio.click(force=True)
-    except Exception:
-        pass
-    try:
-        browser.evaluate(
+        count = browser.evaluate(
             """
-            () => {
-              const item = [...document.querySelectorAll('.offer-payment-type__item')].find((el) =>
-                /по мере выполнения задач/i.test((el.textContent || '').replace(/\\s+/g, ' '))
-              );
-              if (!item) return false;
-              item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
-              item.click();
-              const input = item.querySelector('input[type="radio"], input[type="checkbox"]');
-              if (input) {
-                input.checked = true;
-                input.dispatchEvent(new Event('change', { bubbles: true }));
-                input.click();
-              }
-              const payVm = item.closest('.offer-payment-type')?.__vue__
-                || document.querySelector('.offer-custom')?.__vue__;
-              if (payVm && typeof payVm.updatePaymentType === 'function') {
-                try {
-                  payVm.updatePaymentType(payVm.offerPaymentStages || 'stages');
-                } catch (e) {}
-              }
-              return true;
-            }
+            () => document.querySelectorAll('.offer-payment-type__item').length
             """
         )
+        return int(count or 0)
     except Exception:
-        pass
+        return 0
+
+
+def _wait_payment_block_ready(
+    browser: BrowserClient, *, attempts: int = 24
+) -> bool:
+    for _ in range(attempts):
+        if _payment_items_count(browser) >= 2:
+            return True
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(500)
+    return False
+
+
+def _prime_payment_ui(browser: BrowserClient, price: str) -> bool:
+    """Kwork renders payment cards only after a price is entered."""
+    if _payment_items_count(browser) >= 2:
+        return True
+    if not _fill_price(browser, str(price)):
+        return False
     if hasattr(browser, "wait_ms"):
-        browser.wait_ms(1200)
-    return True
+        browser.wait_ms(800)
+    return _wait_payment_block_ready(browser, attempts=20)
 
 
-def _is_milestone_payment_selected(browser: BrowserClient) -> bool:
+def _is_milestone_card_selected(browser: BrowserClient) -> bool:
     try:
         return bool(
             browser.evaluate(
@@ -1282,9 +1267,110 @@ def _is_milestone_payment_selected(browser: BrowserClient) -> bool:
                     /по мере выполнения задач/i.test((el.textContent || '').replace(/\\s+/g, ' '))
                   );
                   if (!milestone) return false;
-                  const active = milestone.classList.contains('active')
-                    || milestone.classList.contains('selected');
+                  if (milestone.classList.contains('active')
+                    || milestone.classList.contains('selected')) {
+                    return true;
+                  }
                   const input = milestone.querySelector('input[type="radio"], input[type="checkbox"]');
+                  return Boolean(input?.checked);
+                }
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _read_payment_diag(browser: BrowserClient) -> dict[str, Any]:
+    try:
+        raw = browser.evaluate(
+            """
+            () => {
+              const items = [...document.querySelectorAll('.offer-payment-type__item')];
+              const milestone = items.find((el) =>
+                /по мере выполнения задач/i.test((el.textContent || '').replace(/\\s+/g, ' '))
+              );
+              const prices = [...document.querySelectorAll('.stages__stage-price-input')]
+                .filter((i) => i.offsetParent);
+              return {
+                paymentItems: items.length,
+                hasMilestoneCard: Boolean(milestone),
+                milestoneActive: Boolean(
+                  milestone?.classList.contains('active')
+                  || milestone?.classList.contains('selected')
+                ),
+                stagePriceInputs: prices.length,
+                url: location.href,
+              };
+            }
+            """
+        )
+        return raw if isinstance(raw, dict) else {}
+    except Exception:
+        return {}
+
+
+def _click_milestone_payment_card(browser: BrowserClient) -> bool:
+    clicked = False
+    try:
+        if hasattr(browser, "_ensure_page"):
+            page = browser._ensure_page()
+            item = page.locator(".offer-payment-type__item").filter(
+                has_text=re.compile(r"По мере выполнения задач", re.I)
+            ).first
+            item.wait_for(state="visible", timeout=12000)
+            item.scroll_into_view_if_needed(timeout=8000)
+            item.click(force=True, timeout=5000)
+            clicked = True
+            radio = item.locator('input[type="radio"]').first
+            if radio.count() > 0:
+                radio.click(force=True)
+    except Exception:
+        pass
+    try:
+        clicked = bool(
+            browser.evaluate(
+                """
+                () => {
+                  const item = [...document.querySelectorAll('.offer-payment-type__item')].find((el) =>
+                    /по мере выполнения задач/i.test((el.textContent || '').replace(/\\s+/g, ' '))
+                  );
+                  if (!item) return false;
+                  item.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+                  item.click();
+                  const input = item.querySelector('input[type="radio"], input[type="checkbox"]');
+                  if (input) {
+                    input.checked = true;
+                    input.dispatchEvent(new Event('change', { bubbles: true }));
+                    input.click();
+                  }
+                  const offerVm = document.querySelector('.offer-custom')?.__vue__;
+                  const payStages = offerVm?.offerPaymentStages || 'stages';
+                  if (offerVm && typeof offerVm.updatePaymentType === 'function') {
+                    try { offerVm.updatePaymentType(payStages); } catch (e) {}
+                  }
+                  return item.classList.contains('active')
+                    || item.classList.contains('selected')
+                    || Boolean(input?.checked);
+                }
+                """
+            )
+        ) or clicked
+    except Exception:
+        pass
+    if hasattr(browser, "wait_ms"):
+        browser.wait_ms(1200)
+    return clicked or _is_milestone_card_selected(browser)
+
+
+def _is_milestone_payment_selected(browser: BrowserClient) -> bool:
+    if not _is_milestone_card_selected(browser):
+        return False
+    try:
+        return bool(
+            browser.evaluate(
+                """
+                () => {
                   const prices = [...document.querySelectorAll('.stages__stage-price-input')]
                     .filter((i) => i.offsetParent);
                   const parent = document.querySelector('.stages')?.__vue__;
@@ -1293,7 +1379,7 @@ def _is_milestone_payment_selected(browser: BrowserClient) -> bool:
                   );
                   const stagesReady = prices.length >= 2
                     || local.filter((s) => Number(s.payer_price || 0) > 0).length >= 2;
-                  return active && stagesReady;
+                  return stagesReady;
                 }
                 """
             )
@@ -1303,13 +1389,18 @@ def _is_milestone_payment_selected(browser: BrowserClient) -> bool:
 
 
 def _select_milestone_payment(browser: BrowserClient) -> bool:
-    if _is_milestone_payment_selected(browser):
+    if _is_milestone_card_selected(browser) and _stages_section_visible(browser, min_rows=2):
         return True
-    for _ in range(3):
-        _click_milestone_payment_card(browser)
-        if _wait_stages_ready(browser):
+    for _ in range(5):
+        if not _wait_payment_block_ready(browser, attempts=6):
+            if hasattr(browser, "wait_ms"):
+                browser.wait_ms(500)
+            continue
+        if not _is_milestone_card_selected(browser):
+            _click_milestone_payment_card(browser)
+        if _wait_stages_ready(browser, attempts=20):
             return True
-    return _is_milestone_payment_selected(browser)
+    return _is_milestone_card_selected(browser) and _wait_stages_ready(browser, attempts=12)
 
 
 def _reassert_milestone_payment(
@@ -1321,7 +1412,7 @@ def _reassert_milestone_payment(
         total = _stage_total_from_read(stages_read)
         return True, stages_read, {"ok": True, "actualTotal": total}
 
-    if not _is_milestone_payment_selected(browser):
+    if not _is_milestone_card_selected(browser):
         _select_milestone_payment(browser)
         _wait_stages_ready(browser)
 
@@ -1759,7 +1850,7 @@ def _finalize_offer_form(
     milestone_selected, stages_read, reassert_stages = _reassert_milestone_payment(
         browser, stages
     )
-    if reassert_stages.get("filled") or not _stages_dom_ok(stages, stages_read):
+    if reassert_stages.get("filled"):
         stages_result = reassert_stages
     elif not _stages_dom_ok(stages, stages_read):
         stages_result = _fill_offer_stages(browser, stages)
@@ -2220,7 +2311,7 @@ class KworkAdapter:
         offer_url = kwork_offer_form_url(project_id)
         self.browser.navigate(offer_url)
         if hasattr(self.browser, "wait_ms"):
-            self.browser.wait_ms(4000)
+            self.browser.wait_ms(6000)
 
         if not is_logged_in(self.browser):
             return SubmitResult(
@@ -2245,13 +2336,22 @@ class KworkAdapter:
             form_max=form_max,
         )
 
-        if not _select_milestone_payment(self.browser):
+        if not _prime_payment_ui(self.browser, str(price)):
+            diag = _read_payment_diag(self.browser)
             return SubmitResult(
                 success=False,
                 project_id=project_id,
-                message="prepare_milestone_click_failed",
+                message=f"prepare_payment_block_missing: {diag}",
             )
-        if not _wait_stages_ready(self.browser):
+
+        if not _select_milestone_payment(self.browser):
+            diag = _read_payment_diag(self.browser)
+            return SubmitResult(
+                success=False,
+                project_id=project_id,
+                message=f"prepare_milestone_click_failed: {diag}",
+            )
+        if not _wait_stages_ready(self.browser, attempts=20):
             return SubmitResult(
                 success=False,
                 project_id=project_id,

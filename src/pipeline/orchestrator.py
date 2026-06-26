@@ -31,11 +31,23 @@ from src.models import PendingOffer, ProjectFull
 from src.responses.portfolio_link import ensure_portfolio_link
 from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
 from src.store.repository import ProjectRepository
+from src.store.scan_reports import ScanCycleStats, ScanReportStore
 from src.telegram_bot.bot import TelegramReviewBot
 from src.telegram_bot.pending_store import PendingStore
 from src.telegram_bot.review_service import ReviewService
+from src.telegram_bot.scan_report import format_scan_reports_message
 
 logger = logging.getLogger(__name__)
+
+_PREPARE_FORM_ONLY_RETRY = (
+    "prepare_milestone_click_failed",
+    "prepare_stages_not_visible",
+    "prepare_payment_block_missing",
+    "prepare_milestone_not_selected",
+    "prepare_stages_failed",
+    "prepare_verify_failed",
+    "prepare_total_mismatch",
+)
 
 
 class PipelineOrchestrator:
@@ -66,11 +78,13 @@ class PipelineOrchestrator:
         self._browser = browser
         self._adapter_factory = adapter_factory or self._default_adapter
         self._journal_sync_lock = asyncio.Lock()
+        self.scan_reports = ScanReportStore(settings.database_path)
         self.review_service.set_approve_handler(self.handle_approve_click)
         self.review_service.set_journal_confirm_handler(self.handle_journal_confirm)
         self.review_service.set_prepare_retry_handler(self.handle_prepare_retry)
         self.review_service.set_submit_text_handler(self.handle_user_response_text)
         self.review_service.set_export_journal_handler(self.export_prepared_to_journal)
+        self.review_service.set_scan_report_handler(self.send_scan_report)
 
     def close(self) -> None:
         if self._browser is not None:
@@ -105,9 +119,11 @@ class PipelineOrchestrator:
 
     async def run_scan_cycle(self) -> dict[str, int]:
         totals = {"seen": 0, "new": 0, "skipped": 0, "scored": 0, "notified": 0}
+        cycle_stats = ScanCycleStats()
         self.review_service.expire_stale_pending()
 
         for source in get_enabled_sources(self.settings.sources_config_path):
+            source_stats = ScanCycleStats()
             try:
                 previews = await asyncio.to_thread(self._scan_listings, source)
             except KworkAuthError as exc:
@@ -123,6 +139,7 @@ class PipelineOrchestrator:
 
             for preview in previews:
                 totals["seen"] += 1
+                source_stats.seen += 1
                 known = self.repository.is_known(
                     preview.platform, preview.source_key, preview.project_id
                 )
@@ -166,7 +183,16 @@ class PipelineOrchestrator:
                 totals["new"] += 1
                 new_in_source += 1
 
-                await self._process_new_project(source, preview)
+                outcome = await self._process_new_project(source, preview)
+                source_stats.checked += 1
+                totals["scored"] += 1
+                if outcome == "stack_reject":
+                    source_stats.rejected_stack += 1
+                elif outcome == "budget_reject":
+                    source_stats.rejected_budget += 1
+                elif outcome == "notified":
+                    source_stats.notified += 1
+                    totals["notified"] += 1
 
             max_id = max(
                 (int(p.project_id) for p in previews if p.project_id.isdigit()),
@@ -184,14 +210,21 @@ class PipelineOrchestrator:
             )
 
             logger.info(
-                "[scan] platform=%s source=%s | seen=%d | new=%d | skipped=%d",
+                "[scan] platform=%s source=%s | seen=%d | new=%d | skipped=%d | "
+                "checked=%d | stack=%d | budget=%d | notified=%d",
                 source.platform,
                 source.id,
-                len(previews),
+                source_stats.seen,
                 new_in_source,
-                len(previews) - new_in_source,
+                source_stats.seen - new_in_source,
+                source_stats.checked,
+                source_stats.rejected_stack,
+                source_stats.rejected_budget,
+                source_stats.notified,
             )
+            cycle_stats.merge(source_stats)
 
+        self.scan_reports.save(cycle_stats)
         return totals
 
     def _scan_listings(self, source: SourceConfig) -> list[Any]:
@@ -210,7 +243,7 @@ class PipelineOrchestrator:
         finally:
             close_browser_client(browser)
 
-    async def _process_new_project(self, source: SourceConfig, preview: Any) -> None:
+    async def _process_new_project(self, source: SourceConfig, preview: Any) -> str:
         full = await asyncio.to_thread(self._read_full_listing, source, preview.project_id)
         full = merge_preview_into_full(full, preview)
         context = await asyncio.to_thread(self.lightrag.get_scoring_context, full)
@@ -229,7 +262,7 @@ class PipelineOrchestrator:
             score=float(score.score),
         )
 
-        if not score.fit or score.score < self.settings.min_gpt_score:
+        if not score.fit:
             self.repository.update_status(
                 full.platform,
                 full.source_key,
@@ -238,7 +271,17 @@ class PipelineOrchestrator:
                 fit=score.fit,
                 score=float(score.score),
             )
-            return
+            return "stack_reject"
+        if score.score < self.settings.min_gpt_score:
+            self.repository.update_status(
+                full.platform,
+                full.source_key,
+                full.project_id,
+                "skipped",
+                fit=score.fit,
+                score=float(score.score),
+            )
+            return "stack_reject"
 
         if await self._skip_over_budget_ceiling(full, context):
             self.repository.update_status(
@@ -249,30 +292,32 @@ class PipelineOrchestrator:
                 fit=score.fit,
                 score=float(score.score),
             )
-            return
+            return "budget_reject"
 
         if self.settings.require_telegram_approval:
             await self.review_service.request_review(full, score)
+            return "notified"
+
+        offer = PendingOffer(
+            platform=full.platform,
+            source_key=full.source_key,
+            project_id=full.project_id,
+            url=full.url,
+            title=full.title,
+            project=full,
+            score=score,
+            created_at=datetime.now(timezone.utc),
+            status="approved",
+            approved_at=datetime.now(timezone.utc),
+        )
+        if self.settings.prepare_only_no_submit:
+            await self._prepare_offer_on_site(offer)
         else:
-            offer = PendingOffer(
-                platform=full.platform,
-                source_key=full.source_key,
-                project_id=full.project_id,
-                url=full.url,
-                title=full.title,
-                project=full,
-                score=score,
-                created_at=datetime.now(timezone.utc),
-                status="approved",
-                approved_at=datetime.now(timezone.utc),
+            await self._ensure_response_text(offer)
+            await self.handle_approved(
+                full.platform, full.source_key, full.project_id, offer
             )
-            if self.settings.prepare_only_no_submit:
-                await self._prepare_offer_on_site(offer)
-            else:
-                await self._ensure_response_text(offer)
-                await self.handle_approved(
-                    full.platform, full.source_key, full.project_id, offer
-                )
+        return "notified"
 
     async def _skip_over_budget_ceiling(
         self, full: ProjectFull, lightrag_context: str
@@ -515,6 +560,7 @@ class PipelineOrchestrator:
 
         max_attempts = 2
         result = None
+        last_msg = ""
         try:
             await self.review_service.tg_bot.notify(
                 f"⏳ Готовлю отклик: {html.escape(offer.title)}\n"
@@ -522,37 +568,45 @@ class PipelineOrchestrator:
             )
             for attempt in range(max_attempts):
                 if attempt > 0:
-                    await self.review_service.tg_bot.notify(
-                        f"🔄 Повтор {attempt + 1}/{max_attempts}: "
-                        f"перегенерация GPT и заполнение формы…"
-                    )
-                    offer.response_text = ""
-                    self.review_service.store.save(offer)
-                    response_text = await self._generate_response_text(offer)
-                    offer.response_text = response_text
-                    self.review_service.store.save(offer)
-                    context = await asyncio.to_thread(self.lightrag.get_full_context)
-                    terms = await asyncio.to_thread(
-                        self.offer_estimator.estimate,
-                        offer.project,
-                        response_text,
-                        lightrag_context=context,
-                    )
-                    price = str(terms.price_rub)
-                    delivery_days = terms.delivery_days
-                    response_text = append_missing_checklist_answers(
-                        response_text,
-                        offer.project,
-                        price_rub=terms.price_rub,
-                        delivery_days=delivery_days,
-                    )
+                    form_only = any(token in last_msg for token in _PREPARE_FORM_ONLY_RETRY)
+                    if form_only:
+                        await self.review_service.tg_bot.notify(
+                            f"🔄 Повтор {attempt + 1}/{max_attempts}: "
+                            f"заполнение формы (без GPT, {price} ₽ · {delivery_days} дн.)…"
+                        )
+                    else:
+                        await self.review_service.tg_bot.notify(
+                            f"🔄 Повтор {attempt + 1}/{max_attempts}: "
+                            f"перегенерация GPT и заполнение формы…"
+                        )
+                        offer.response_text = ""
+                        self.review_service.store.save(offer)
+                        response_text = await self._generate_response_text(offer)
+                        offer.response_text = response_text
+                        self.review_service.store.save(offer)
+                        context = await asyncio.to_thread(self.lightrag.get_full_context)
+                        terms = await asyncio.to_thread(
+                            self.offer_estimator.estimate,
+                            offer.project,
+                            response_text,
+                            lightrag_context=context,
+                        )
+                        price = str(terms.price_rub)
+                        delivery_days = terms.delivery_days
+                        response_text = append_missing_checklist_answers(
+                            response_text,
+                            offer.project,
+                            price_rub=terms.price_rub,
+                            delivery_days=delivery_days,
+                        )
 
                 result = await asyncio.to_thread(
                     _run_prepare, response_text, price, delivery_days
                 )
+                last_msg = result.message or ""
                 if result.success:
                     break
-                msg = result.message or ""
+                msg = last_msg
                 if any(
                     token in msg
                     for token in (
@@ -683,7 +737,7 @@ class PipelineOrchestrator:
         await callback.answer("Записано в журнал")
         await self.review_service.tg_bot.notify(
             f"📒 Журнал: строка {row} · {html.escape(item.title)}\n"
-            "На ПК: Sync-Journal.bat подтянет с VPS, если Excel локальный."
+            "На ПК: /journal в TG — пришлёт актуальный journal.xlsx с VPS."
         )
         logger.info("journal_confirmed project_id=%s row=%s", project_id, row)
 
@@ -754,6 +808,15 @@ class PipelineOrchestrator:
                     f"Файл: {html.escape(self.settings.response_journal)}"
                 )
             return sync.appended_prepared + sync.offers_appended
+
+    async def send_scan_report(self, message: Any = None) -> None:
+        reports = self.scan_reports.list_recent(limit=3)
+        text = format_scan_reports_message(
+            reports,
+            timezone_name=self.settings.operator_timezone,
+            limit=3,
+        )
+        await self.review_service.tg_bot.notify(text)
 
     async def handle_approved(
         self,
