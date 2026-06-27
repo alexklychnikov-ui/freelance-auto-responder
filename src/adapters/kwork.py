@@ -201,27 +201,34 @@ TRUMBOWYG_SET_JS = """
   const text = raw.slice(0, limit);
   const ta = document.querySelector(`textarea[name="${name}"]`);
   if (!ta) return false;
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
+  const singleLine = (name === 'name' || String(name).startsWith('stageTitle'));
+  let html;
+  let lines = [];
+  if (singleLine) {
+    const flat = text.replace(/\\s+/g, ' ').trim();
+    html = flat ? `<p>${esc(flat)}</p>` : '<div><br></div>';
+  } else {
+    lines = text.split(/\\n+/).map((l) => l.trim()).filter(Boolean);
+    html = lines.length
+      ? lines.map((l) => `<p>${esc(l)}</p>`).join('')
+      : '<div><br></div>';
+  }
   const $ = window.jQuery || window.$;
   if ($ && typeof $(ta).trumbowyg === 'function') {
-    const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
-    const html = text ? `<p>${esc(text)}</p>` : '<div><br></div>';
     $(ta).trumbowyg('html', html);
     $(ta).trigger('tbwchange');
     ta.dispatchEvent(new Event('input', { bubbles: true }));
     ta.dispatchEvent(new Event('change', { bubbles: true }));
     if (String(name).startsWith('stageTitle')) {
       const hidden = ta.closest('.stages__stage-name')?.querySelector('.stages__stage-text');
-      if (hidden) hidden.textContent = text;
+      const flat = singleLine ? text.replace(/\\s+/g, ' ').trim() : lines.join(' ');
+      if (hidden) hidden.textContent = flat;
     }
     return true;
   }
   const box = ta.closest('.trumbowyg-box') || ta.parentElement;
   const editor = box?.querySelector('.trumbowyg-editor');
-  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;');
-  const lines = text.split(/\\n+/).map((l) => l.trim()).filter(Boolean);
-  const html = lines.length
-    ? lines.map((l) => `<p>${esc(l)}</p>`).join('')
-    : '<div><br></div>';
   if (editor) {
     editor.innerHTML = html;
     editor.classList.remove('is-placeholder-mobile', 'force-placeholder');
@@ -720,8 +727,19 @@ def _build_deadline_pick_js(delivery_days: int) -> str:
 """
 
 
+def _normalize_editor_plaintext(text: str, *, single_line: bool = False) -> str:
+    body = (text or "").strip()
+    if not body:
+        return ""
+    if single_line:
+        return re.sub(r"\s+", " ", body)
+    lines = [re.sub(r"\s+", " ", ln.strip()) for ln in re.split(r"\n+", body) if ln.strip()]
+    return "\n\n".join(lines)
+
+
 def _set_trumbowyg(browser: BrowserClient, field_name: str, text: str) -> bool:
-    value = (text or "").strip()
+    single_line = field_name == "name" or field_name.startswith("stageTitle")
+    value = _normalize_editor_plaintext(text, single_line=single_line)
     if not value and field_name != "name":
         return False
     try:
