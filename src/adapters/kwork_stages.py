@@ -34,6 +34,25 @@ def _needs_three_stages(brief: str) -> bool:
     return False
 
 
+def _short_project_label(project: ProjectFull | None) -> str:
+    if project is None:
+        return "проект"
+    title = re.sub(r"\s+", " ", (project.title or "").strip())
+    if not title:
+        return "проект"
+    if len(title) > 48:
+        return title[:45].rstrip() + "…"
+    return title
+
+
+def _two_stage_names(project: ProjectFull | None) -> list[str]:
+    label = _short_project_label(project)
+    return [
+        f"Разработка: {label}",
+        "Тесты, правки и передача",
+    ]
+
+
 def plan_offer_stages(total: int, project: ProjectFull | None = None) -> list[tuple[str, int]]:
     """Разбить сумму отклика на этапы оплаты (минимум 2)."""
     brief = build_project_brief(project) if project else ""
@@ -59,9 +78,6 @@ def plan_offer_stages(total: int, project: ProjectFull | None = None) -> list[tu
 
     return _split_amounts(
         total_rub,
-        [
-            "Анализ ТЗ и реализация основной части",
-            "Тестирование, правки и передача проекта",
-        ],
+        _two_stage_names(project),
         [0.55, 0.45],
     )

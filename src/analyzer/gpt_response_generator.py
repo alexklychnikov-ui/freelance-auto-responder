@@ -18,8 +18,12 @@ from src.analyzer.response_qa import ResponseQaValidator, rule_check_alignment
 from src.analyzer.response_strategy import build_generation_strategy
 from src.config import Settings
 from src.models import ProjectFull
-from src.analyzer.response_text import kwork_compliance_issues, strip_response_markdown
-from src.responses.portfolio_link import ensure_portfolio_link
+from src.analyzer.response_text import (
+    finalize_response_text,
+    kwork_compliance_issues,
+    payment_mismatch_issues,
+    strip_response_markdown,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,8 @@ _BANNED_OPENERS = (
     r"^здравствуйте",
     r"^доброго времени",
     r"^приветствую",
+    r"^изучив ваш проект",
+    r"^изучил ваш",
 )
 
 _BANNED_PHRASES = (
@@ -37,6 +43,7 @@ _BANNED_PHRASES = (
     "буду рад сотрудничеству",
     "уважаемый заказчик",
     "обращайтесь",
+    "понимаю, что основная задача заключается",
 )
 
 GENERATION_SYSTEM_PROMPT = """\
@@ -134,25 +141,18 @@ D: коротко и по делу (3–5 предложений)
 - 1 релевантный кейс
 - максимально похожий
 - с конкретикой
+- БЕЗ ссылок на GitHub и без URL в тексте
 
 Формат:
 "Делал X → использовал Y → получил результат Z"
 
 ***
 
-ИСПОЛЬЗОВАНИЕ GITHUB (ВАЖНО)
+СООТВЕТСТВИЕ МОДЕЛИ ОПЛАТЫ (КРИТИЧНО)
 
-Если у тебя есть релевантный код/проекты под задачу:
-- Добавь 1 ссылку на GitHub (максимум 1–2)
-- Только если это усиливает доверие
-- Встраивай органично в текст, а не отдельным блоком
-
-GitHub:
-https://github.com/alexklychnikov-ui
-
-НЕ добавляй GitHub:
-- если он не релевантен задаче
-- если отклик и так сильный
+Если в ТЗ указано «без онлайн-оплаты», «только заявка», «заявка менеджеру»:
+- НЕ предлагай платёжные системы, эквайринг, оплату в боте
+- Опиши сценарий: каталог → заявка → уведомление менеджеру
 
 ***
 
@@ -191,7 +191,7 @@ https://github.com/alexklychnikov-ui
 - Только чат Kwork
 - Без контактов, Telegram, Zoom
 - Без "давайте созвонимся"
-- Портфолио только как пример: https://portfolio.hayklyvibelexy.ru/
+- Без ссылок (GitHub, портфолио, внешние URL) — Kwork режет или штрафует
 
 ***
 
@@ -335,9 +335,9 @@ class GptResponseGenerator:
         )
 
         text = self._call_api(body, project.project_id)
-        text = strip_response_markdown(text)
+        text = finalize_response_text(text, project)
         text = self._postprocess_with_checks(project, user_payload, body, text)
-        return ensure_portfolio_link(strip_response_markdown(text))
+        return finalize_response_text(text, project)
 
     def _postprocess_with_checks(
         self,
@@ -351,6 +351,7 @@ class GptResponseGenerator:
         ] + [
             f"checklist:{v}" for v in buyer_checklist_issues(project, text)
         ] + _topic_mismatch_issues(project, text)
+        issues += [f"tz:{v}" for v in payment_mismatch_issues(project, text)]
         if issues:
             logger.info(
                 "gpt_generate_response retry banned phrases project_id=%s %s",
@@ -376,10 +377,17 @@ class GptResponseGenerator:
                 retry_payload["task"] += (
                     " Убери парсинг/скрапинг — их нет в ТЗ. Опиши задачу как в project_brief."
                 )
+            if any("tz:payment_not_required" in i for i in issues):
+                retry_payload["task"] += (
+                    " В ТЗ без онлайн-оплаты — только заявки менеджеру. "
+                    "Убери платёжные системы и оплату в боте."
+                )
+            if any(i.startswith("kwork:") for i in issues):
+                retry_payload["task"] += " Убери внешние ссылки и GitHub из текста."
             body["messages"][1]["content"] = json.dumps(retry_payload, ensure_ascii=False)
             body["temperature"] = 0.9
             text = self._call_api(body, project.project_id)
-            text = strip_response_markdown(text)
+            text = finalize_response_text(text, project)
 
         for attempt in range(2):
             qa = self._qa.validate(project, text)
@@ -388,12 +396,14 @@ class GptResponseGenerator:
             all_issues += [f"kwork:{v}" for v in kwork_compliance_issues(text)]
             all_issues += [f"checklist:{v}" for v in buyer_checklist_issues(project, text)]
             all_issues += _topic_mismatch_issues(project, text)
+            all_issues += [f"tz:{v}" for v in payment_mismatch_issues(project, text)]
             if (
                 qa.get("aligned", True)
                 and not rule_issues
                 and not kwork_compliance_issues(text)
                 and not buyer_checklist_issues(project, text)
                 and not _topic_mismatch_issues(project, text)
+                and not payment_mismatch_issues(project, text)
             ):
                 return text
             logger.info(
@@ -413,9 +423,9 @@ class GptResponseGenerator:
             body["messages"][1]["content"] = json.dumps(retry_payload, ensure_ascii=False)
             body["temperature"] = 0.65
             text = self._call_api(body, project.project_id)
-            text = strip_response_markdown(text)
+            text = finalize_response_text(text, project)
 
-        return strip_response_markdown(text)
+        return finalize_response_text(text, project)
 
 
 _PARSE_HALLUCINATION_RE = re.compile(r"парс\w*|скрап\w*", re.I)

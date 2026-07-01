@@ -104,6 +104,14 @@ def extract_tz_facts(project: ProjectFull) -> list[str]:
         facts.append(
             "Заказчик просит в отклике явно указать: " + "; ".join(checklist[:6])
         )
+    if re.search(
+        r"без\s+онлайн[- ]?оплат|оформление\s+заявки\s+без|заявк\w*\s+менеджер",
+        text,
+        re.I,
+    ):
+        facts.append(
+            "В ТЗ: без онлайн-оплаты в боте — только заявки/контакты менеджеру"
+        )
     if len(text) >= 80:
         facts.append(f"Суть заказа (цитата): {text[:280].strip()}")
     return facts

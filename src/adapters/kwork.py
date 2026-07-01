@@ -727,6 +727,36 @@ def _build_deadline_pick_js(delivery_days: int) -> str:
 """
 
 
+DEFAULT_STAGE_TITLE_PATTERNS: tuple[str, ...] = (
+    "Анализ ТЗ и реализация основной части",
+    "Тестирование, правки и передача проекта",
+    "Аудит наработок и согласование плана",
+    "Реализация основной части по ТЗ",
+    "Финальная доработка, тесты и передача",
+)
+
+
+def _strip_stage_title_leakage(
+    text: str, stages: list[tuple[str, int]] | None = None
+) -> str:
+    """Remove milestone stage titles accidentally prepended to description."""
+    body = (text or "").strip()
+    if not body:
+        return ""
+    titles = list(DEFAULT_STAGE_TITLE_PATTERNS)
+    if stages:
+        titles.extend(title for title, _ in stages)
+    unique = sorted({t.strip() for t in titles if t.strip()}, key=len, reverse=True)
+    changed = True
+    while changed:
+        changed = False
+        for title in unique:
+            if body.startswith(title):
+                body = body[len(title) :].lstrip(" ,.;")
+                changed = True
+    return body.strip()
+
+
 def _normalize_editor_plaintext(text: str, *, single_line: bool = False) -> str:
     body = (text or "").strip()
     if not body:
@@ -2379,12 +2409,13 @@ class KworkAdapter:
         price_ok = _fill_price(self.browser, str(price))
         if hasattr(self.browser, "wait_ms"):
             self.browser.wait_ms(400)
-        desc_ok = _fill_description(self.browser, text)
-
         stages = plan_offer_stages(int(price), project)
+        clean_text = _strip_stage_title_leakage(text, stages)
+        desc_ok = _fill_description(self.browser, clean_text)
+
         final = _finalize_offer_form(
             self.browser,
-            text=text,
+            text=clean_text,
             price=str(price),
             order_title=order_title,
             delivery_days=delivery_days,
@@ -2404,7 +2435,7 @@ class KworkAdapter:
         ):
             final = _finalize_offer_form(
                 self.browser,
-                text=text,
+                text=clean_text,
                 price=str(price),
                 order_title=order_title,
                 delivery_days=delivery_days,
@@ -2429,8 +2460,11 @@ class KworkAdapter:
         final["stagesRead"] = stages_read
         fill_result["finalize"] = final
         _autosave_wait(self.browser, wait_ms=15000)
+        clean_text = _strip_stage_title_leakage(text, stages)
+        desc_ok = _fill_description(self.browser, clean_text)
+        _autosave_wait(self.browser, wait_ms=3000)
         if milestone_selected and _read_description_len(self.browser) < 150:
-            desc_ok = _fill_description(self.browser, text)
+            desc_ok = _fill_description(self.browser, clean_text)
             _autosave_wait(self.browser, wait_ms=2000)
         readback = _read_offer_form(self.browser)
         desc_len = _read_description_len(self.browser) or int(readback.get("descLen") or 0)

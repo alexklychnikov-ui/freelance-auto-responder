@@ -3,8 +3,25 @@ from __future__ import annotations
 
 import re
 
-from src.analyzer.project_brief import buyer_checklist_issues
+from src.analyzer.project_brief import build_project_brief, buyer_checklist_issues
 from src.models import ProjectFull
+
+_NO_ONLINE_PAYMENT_TZ_RE = re.compile(
+    r"без\s+онлайн[- ]?оплат|оформление\s+заявки\s+без|без\s+оплат[ыи]?\s+внутри",
+    re.I,
+)
+_PAYMENT_IN_RESPONSE_RE = re.compile(
+    r"плат[её]жн\w*|эквайринг|yookassa|юкасс|stripe|оплат[аы]\s+внутри",
+    re.I,
+)
+_GITHUB_URL_RE = re.compile(
+    r"https?://(?:www\.)?github\.com/\S+|(?<![/\w])github\.com/[\w\-./]+",
+    re.I,
+)
+_PORTFOLIO_LINE_RE = re.compile(
+    r"\n*портфолио\s*:\s*https?://\S+\s*$",
+    re.I,
+)
 
 _KWORK_VIOLATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("off_platform_call", re.compile(r"созвон", re.I)),
@@ -26,10 +43,43 @@ _KWORK_VIOLATION_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 def strip_response_markdown(text: str) -> str:
     """Убрать markdown-выделение и ссылки [текст](url) из GPT-ответа."""
     cleaned = text
-    cleaned = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", cleaned)
+    cleaned = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1", cleaned)
     cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
     cleaned = re.sub(r"__([^_]+)__", r"\1", cleaned)
     cleaned = cleaned.replace("**", "").replace("__", "")
+    return cleaned.strip()
+
+
+def strip_github_links(text: str) -> str:
+    cleaned = _GITHUB_URL_RE.sub("", text)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"GitHub\s*:\s*", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.])", r"\1", cleaned)
+    return cleaned.strip()
+
+
+def strip_portfolio_footer(text: str) -> str:
+    return _PORTFOLIO_LINE_RE.sub("", (text or "").strip()).strip()
+
+
+def tz_requires_lead_only(project: ProjectFull) -> bool:
+    brief = build_project_brief(project)
+    return bool(_NO_ONLINE_PAYMENT_TZ_RE.search(brief))
+
+
+def payment_mismatch_issues(project: ProjectFull, response: str) -> list[str]:
+    if not tz_requires_lead_only(project):
+        return []
+    if _PAYMENT_IN_RESPONSE_RE.search(response):
+        return ["tz:payment_not_required"]
+    return []
+
+
+def finalize_response_text(text: str, project: ProjectFull | None = None) -> str:
+    cleaned = strip_response_markdown(text)
+    cleaned = strip_github_links(cleaned)
+    cleaned = strip_portfolio_footer(cleaned)
     return cleaned.strip()
 
 

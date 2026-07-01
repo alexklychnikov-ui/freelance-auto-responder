@@ -78,8 +78,7 @@ def test_strip_markdown_links() -> None:
     from src.analyzer.response_text import strip_response_markdown
 
     text = "См. [Price Monitoring](https://github.com/foo/bar)."
-    assert "[Price Monitoring]" not in strip_response_markdown(text)
-    assert "https://github.com/foo/bar" in strip_response_markdown(text)
+    assert strip_response_markdown(text) == "См. Price Monitoring."
 
 
 def test_append_missing_checklist() -> None:

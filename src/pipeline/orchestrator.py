@@ -17,7 +17,7 @@ from src.adapters.kwork_auth import KworkCredentials
 from src.analyzer.examples_loader import load_response_examples
 from src.analyzer.gpt_offer_estimator import GptOfferEstimator
 from src.analyzer.gpt_response_generator import GptResponseGenerator
-from src.analyzer.response_text import append_missing_checklist_answers, strip_response_markdown
+from src.analyzer.response_text import append_missing_checklist_answers, finalize_response_text
 from src.analyzer.gpt_scorer import GptScorer
 from src.analyzer.lightrag_client import LightRagClient
 from src.analyzer.project_brief import build_project_brief
@@ -28,7 +28,6 @@ from src.journal.writer import JournalWriter
 from src.journal.vps_sync import sync_journal_on_vps
 from src.limits.daily import is_daily_limit_reached
 from src.models import PendingOffer, ProjectFull
-from src.responses.portfolio_link import ensure_portfolio_link
 from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
 from src.store.repository import ProjectRepository
 from src.store.scan_reports import ScanCycleStats, ScanReportStore
@@ -391,11 +390,11 @@ class PipelineOrchestrator:
             examples=examples,
             recent_responses=recent,
         )
-        return ensure_portfolio_link(text.strip())
+        return finalize_response_text(text.strip(), offer.project)
 
     async def _ensure_response_text(self, offer: PendingOffer) -> str:
         if (offer.response_text or "").strip():
-            text = strip_response_markdown(offer.response_text.strip())
+            text = finalize_response_text(offer.response_text.strip(), offer.project)
             if text != offer.response_text:
                 offer.response_text = text
                 self.review_service.store.save(offer)
@@ -494,7 +493,7 @@ class PipelineOrchestrator:
             )
             return
 
-        offer.response_text = ensure_portfolio_link(text.strip())
+        offer.response_text = finalize_response_text(text.strip(), offer.project)
         self.review_service.store.save(offer)
 
         if self.settings.prepare_only_no_submit:
