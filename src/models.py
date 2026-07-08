@@ -72,6 +72,7 @@ class PendingOffer(BaseModel):
     title: str
     project: ProjectFull
     score: GptScoreResult
+    acceptance_tier: Literal["standard", "quick_win"] | None = None
     created_at: datetime
     status: Literal[
         "pending", "approved", "rejected", "expired", "submitted", "prepared"

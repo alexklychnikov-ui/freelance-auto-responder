@@ -17,6 +17,8 @@ from aiogram.types import (
     Message,
 )
 
+from src.analyzer.project_tier import resolve_acceptance_tier, tier_label
+from src.config import get_settings
 from src.models import GptScoreResult, PendingOffer, ProjectFull
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,11 @@ def _format_budget(value: str | None) -> str:
 def format_review_card(offer: PendingOffer) -> str:
     project = offer.project
     score = offer.score
+    settings = get_settings()
+    acceptance_tier = offer.acceptance_tier or resolve_acceptance_tier(
+        project, score, settings
+    )
+    tier_badge = tier_label(acceptance_tier)
     platform_label = PLATFORM_LABELS.get(offer.platform, offer.platform)
     desc_preview = (project.full_description or "")[:300]
     skills = ", ".join(score.matched_skills) if score.matched_skills else "—"
@@ -89,9 +96,13 @@ def format_review_card(offer: PendingOffer) -> str:
     max_b = _format_budget(project.max_budget)
     hire = project.buyer_hire_rate or "—"
 
+    header = f"🆕 {platform_label} · {offer.source_key}\n"
+    if tier_badge:
+        header += f"{tier_badge}\n"
+
     return (
-        f"🆕 {platform_label} · {offer.source_key}\n"
-        f"📌 {offer.title}\n"
+        header
+        + f"📌 {offer.title}\n"
         f"💰 {desired} / {max_b}\n"
         f"👥 Откликов: {project.offers_count if project.offers_count is not None else '—'} · "
         f"Покупатель: {project.buyer or '—'} ({hire})\n"

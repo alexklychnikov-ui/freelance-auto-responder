@@ -9,6 +9,7 @@ import sys
 from src.adapters.kwork_auth import KworkAuthError, KworkCredentials, ensure_logged_in
 from src.browser.factory import close_browser_client, get_browser_client
 from src.analyzer.examples_loader import load_response_examples
+from src.analyzer.project_tier import resolve_acceptance_tier
 from src.config import get_enabled_sources, get_settings
 from src.pipeline.orchestrator import build_orchestrator
 
@@ -48,13 +49,15 @@ async def _run_test_async() -> int:
                 context = orchestrator.lightrag.get_scoring_context(full)
                 examples = load_response_examples(settings.response_examples_dir)
                 score = orchestrator.scorer.score(full, context, examples=examples)
+                acceptance_tier = resolve_acceptance_tier(full, score, settings)
                 logger.info(
-                    "run-test: score=%s fit=%s reason=%s",
+                    "run-test: score=%s fit=%s tier=%s reason=%s",
                     score.score,
                     score.fit,
+                    acceptance_tier,
                     score.reason,
                 )
-                if score.fit and score.score >= settings.min_gpt_score:
+                if acceptance_tier is not None:
                     return full, score
             return None
         finally:

@@ -145,7 +145,12 @@ def _filter_generic_risks(risks: list[str], project: ProjectFull) -> list[str]:
     return filtered
 
 
-def _apply_score_guardrails(data: dict[str, Any], project: ProjectFull) -> dict[str, Any]:
+def _apply_score_guardrails(
+    data: dict[str, Any],
+    project: ProjectFull,
+    *,
+    min_fit_score: int = 7,
+) -> dict[str, Any]:
     text = _project_text(project)
     risks = _filter_generic_risks(list(data.get("risks") or []), project)
 
@@ -171,7 +176,7 @@ def _apply_score_guardrails(data: dict[str, Any], project: ProjectFull) -> dict[
             f"Объём: {project.title[:80]} — проверить реализуемость в одиночку",
         ]
     data["risks"] = risks[:5]
-    data["fit"] = bool(data.get("fit")) and int(data.get("score", 0)) >= 7
+    data["fit"] = bool(data.get("fit")) and int(data.get("score", 0)) >= min_fit_score
     if not data["fit"]:
         data["recommendation"] = "пропустить"
     return data
@@ -258,7 +263,13 @@ class GptScorer:
         lightrag_context: str,
         *,
         examples: str = "",
+        min_fit_score: int | None = None,
     ) -> GptScoreResult:
+        fit_threshold = (
+            min_fit_score
+            if min_fit_score is not None
+            else self.settings.min_gpt_score
+        )
         user_payload = {
             "task": (
                 "Сопоставь требования заказа (заголовок, описание, теги, бюджет) со стеком "
@@ -313,4 +324,7 @@ class GptScorer:
         data = response.json()
         content = data["choices"][0]["message"]["content"]
         parsed = _normalize_score_payload(_extract_json(content), project)
-        return GptScoreResult.model_validate(parsed)
+        guarded = _apply_score_guardrails(
+            parsed, project, min_fit_score=fit_threshold
+        )
+        return GptScoreResult.model_validate(guarded)

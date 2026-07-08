@@ -55,6 +55,11 @@ class Settings(BaseSettings):
     scan_interval_minutes: int = 15
     min_gpt_score: int = 7
     budget_ceiling_price_multiplier: float = 2.0
+    quick_win_enabled: bool = True
+    quick_win_min_score: int = 5
+    quick_win_max_budget_rub: int = 10_000
+    quick_win_max_offers_count: int = 40
+    quick_win_max_delivery_days: int = 2
     max_daily_responses: int = 5
     require_telegram_approval: bool = True
     scan_bootstrap_skip_pipeline: bool = True

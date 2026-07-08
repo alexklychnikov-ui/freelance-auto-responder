@@ -218,6 +218,50 @@ async def test_pipeline_skips_over_budget_ceiling(
 
 
 @pytest.mark.asyncio
+async def test_pipeline_quick_win_skips_budget_ceiling(
+    settings: Settings,
+) -> None:
+    quick_project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3211980",
+        url="https://kwork.ru/projects/3211980/view",
+        title="Парсинг сайта",
+        full_description="Небольшой парсинг, выгрузка в csv",
+        max_budget="до 3 000 ₽",
+        offers_count=5,
+    )
+    quick_score = GptScoreResult(
+        score=6,
+        fit=True,
+        reason="quick script",
+        matched_skills=["Python"],
+        risks=[],
+        suggested_project_type="Парсинг",
+        competition_level="low",
+        recommendation="откликаться",
+    )
+    preview = ProjectPreview(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3211980",
+        url=quick_project.url,
+        title=quick_project.title,
+    )
+    settings.require_telegram_approval = True
+    orch, mock_adapter = _make_orchestrator(
+        settings, previews=[preview], project_full=quick_project, score=quick_score
+    )
+    orch.offer_estimator.estimate_market_cost.return_value = 60_000
+
+    totals = await orch.run_scan_cycle()
+
+    assert totals["new"] == 1
+    orch.review_service.tg_bot.send_review_card.assert_called_once()
+    mock_adapter.prepare_response.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_pipeline_skips_low_score(
     settings: Settings, project_full: ProjectFull
 ) -> None:

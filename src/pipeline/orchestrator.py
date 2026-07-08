@@ -21,6 +21,7 @@ from src.analyzer.response_text import append_missing_checklist_answers, finaliz
 from src.analyzer.gpt_scorer import GptScorer
 from src.analyzer.lightrag_client import LightRagClient
 from src.analyzer.project_brief import build_project_brief
+from src.analyzer.project_tier import resolve_acceptance_tier
 from src.analyzer.response_history import load_recent_response_context
 from src.browser.factory import close_browser_client, get_browser_client
 from src.config import Settings, SourceConfig, get_enabled_sources, get_settings
@@ -252,6 +253,7 @@ class PipelineOrchestrator:
         score = await asyncio.to_thread(
             self.scorer.score, full, context, examples=examples
         )
+        acceptance_tier = resolve_acceptance_tier(full, score, self.settings)
         self.repository.update_status(
             full.platform,
             full.source_key,
@@ -261,17 +263,7 @@ class PipelineOrchestrator:
             score=float(score.score),
         )
 
-        if not score.fit:
-            self.repository.update_status(
-                full.platform,
-                full.source_key,
-                full.project_id,
-                "skipped",
-                fit=score.fit,
-                score=float(score.score),
-            )
-            return "stack_reject"
-        if score.score < self.settings.min_gpt_score:
+        if acceptance_tier is None:
             self.repository.update_status(
                 full.platform,
                 full.source_key,
@@ -282,7 +274,9 @@ class PipelineOrchestrator:
             )
             return "stack_reject"
 
-        if await self._skip_over_budget_ceiling(full, context):
+        if acceptance_tier == "standard" and await self._skip_over_budget_ceiling(
+            full, context
+        ):
             self.repository.update_status(
                 full.platform,
                 full.source_key,
@@ -294,7 +288,9 @@ class PipelineOrchestrator:
             return "budget_reject"
 
         if self.settings.require_telegram_approval:
-            await self.review_service.request_review(full, score)
+            await self.review_service.request_review(
+                full, score, acceptance_tier=acceptance_tier
+            )
             return "notified"
 
         offer = PendingOffer(
@@ -305,6 +301,7 @@ class PipelineOrchestrator:
             title=full.title,
             project=full,
             score=score,
+            acceptance_tier=acceptance_tier,
             created_at=datetime.now(timezone.utc),
             status="approved",
             approved_at=datetime.now(timezone.utc),
@@ -533,6 +530,13 @@ class PipelineOrchestrator:
         )
         price = str(terms.price_rub)
         delivery_days = terms.delivery_days
+        tier = offer.acceptance_tier or resolve_acceptance_tier(
+            offer.project, offer.score, self.settings
+        )
+        if tier == "quick_win":
+            delivery_days = min(
+                delivery_days, self.settings.quick_win_max_delivery_days
+            )
         response_text = append_missing_checklist_answers(
             response_text,
             offer.project,

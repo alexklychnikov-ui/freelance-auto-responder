@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Literal
 
 from aiogram.types import CallbackQuery, Message
 
@@ -83,6 +83,8 @@ class ReviewService:
         self,
         project: ProjectFull,
         score: GptScoreResult,
+        *,
+        acceptance_tier: Literal["standard", "quick_win"] | None = None,
     ) -> PendingOffer:
         offer = PendingOffer(
             platform=project.platform,
@@ -92,6 +94,7 @@ class ReviewService:
             title=project.title,
             project=project,
             score=score,
+            acceptance_tier=acceptance_tier,
             created_at=datetime.now(timezone.utc),
             status="pending",
         )
