@@ -77,7 +77,7 @@ def test_journal_skips_merged_cells(
 ) -> None:
     wb = load_workbook(journal_path)
     ws = wb.active
-    ws.merge_cells("A2:H2")
+    ws.merge_cells("A2:I2")
     wb.save(journal_path)
     wb.close()
 
@@ -88,8 +88,9 @@ def test_journal_skips_merged_cells(
     wb = load_workbook(journal_path)
     ws = wb.active
     assert ws.cell(row=3, column=6).value == "Подготовлен"
-    assert "Test project" in str(ws.cell(row=3, column=8).value)
-    assert "5000" in str(ws.cell(row=3, column=8).value)
+    assert ws.cell(row=3, column=8).value == "desc"
+    assert "prepared text" in str(ws.cell(row=3, column=9).value)
+    assert "5000" in str(ws.cell(row=3, column=9).value)
     wb.close()
 
 
@@ -123,11 +124,11 @@ def test_repair_row_fills_type_and_hyperlink(tmp_path: Path) -> None:
     wb.close()
 
 
-def test_format_offer_notes() -> None:
-    from src.journal.writer import format_offer_notes
+def test_format_response_payload() -> None:
+    from src.journal.writer import format_response_payload
 
-    text = format_offer_notes("Сайт", price="8000", delivery_days=10)
-    assert text == "Сайт\nЦена: 8000 ₽ · Срок: 10 дн."
+    text = format_response_payload("Сделаю за вечер", price="8000", delivery_days=10)
+    assert text == "Сделаю за вечер\n\nОбщий бюджет: 8000 ₽\nСрок: 10 дн."
 
 
 def test_project_ids_in_journal(journal_path: Path, project: ProjectFull, score: GptScoreResult) -> None:

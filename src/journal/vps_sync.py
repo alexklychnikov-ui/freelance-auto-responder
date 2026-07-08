@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from src.config import Settings
 from src.journal.kwork_status_sync import sync_journal_from_kwork_offers
-from src.journal.writer import JournalWriter, format_offer_notes
+from src.journal.writer import JournalWriter, format_response_payload
 from src.responses.prepared_store import PreparedResponseStore
 
 
@@ -31,21 +31,21 @@ def sync_journal_on_vps(
         if not item.journal_confirmed:
             continue
 
-        notes = format_offer_notes(
-            item.title,
+        response_payload = format_response_payload(
+            item.response_text,
             price=item.price,
             delivery_days=item.delivery_days,
         )
         in_journal = item.project_id in existing_ids
 
         if item.journal_exported and in_journal:
-            if writer.update_notes_by_project_id(item.project_id, notes):
+            if writer.update_response_by_project_id(item.project_id, response_payload):
                 result.updated_notes += 1
             continue
         if (not item.journal_exported) and in_journal:
             item.journal_exported = True
             prepared_store.save(item)
-            if writer.update_notes_by_project_id(item.project_id, notes):
+            if writer.update_response_by_project_id(item.project_id, response_payload):
                 result.updated_notes += 1
             continue
 

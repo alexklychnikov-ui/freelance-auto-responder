@@ -14,7 +14,7 @@ if str(REPO) not in sys.path:
 
 from src.config import get_settings
 from src.journal.kwork_status_sync import sync_journal_from_kwork_offers
-from src.journal.writer import JournalWriter, format_offer_notes
+from src.journal.writer import JournalWriter, format_response_payload
 from src.responses.prepared_store import PreparedResponse
 
 VPS = os.environ.get("FREELANCE_VPS_HOST", "LightRAG_Naive")
@@ -165,19 +165,19 @@ def main() -> int:
                 continue
 
             in_journal = item.project_id in existing_ids
-            notes = format_offer_notes(
-                item.title,
+            response_payload = format_response_payload(
+                item.response_text,
                 price=item.price,
                 delivery_days=item.delivery_days,
             )
 
             if item.journal_exported and in_journal:
-                if writer.update_notes_by_project_id(item.project_id, notes):
-                    print(f"OK notes: {item.title}")
+                if writer.update_response_by_project_id(item.project_id, response_payload):
+                    print(f"OK response: {item.title}")
                 continue
             if (not item.journal_exported) and in_journal:
-                if writer.update_notes_by_project_id(item.project_id, notes):
-                    print(f"OK notes: {item.title}")
+                if writer.update_response_by_project_id(item.project_id, response_payload):
+                    print(f"OK response: {item.title}")
                 _mark_exported_on_vps(path.name)
                 continue
             if item.journal_exported and not in_journal:

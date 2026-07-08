@@ -22,7 +22,8 @@ JOURNAL_COLUMNS = [
     "Тип проекта",
     "Статус",
     "Результат общения",
-    "Заметки",
+    "Полный текст предложения",
+    "Полный текст отклика",
 ]
 
 PLATFORM_DISPLAY = {
@@ -53,15 +54,16 @@ def infer_project_type(title: str) -> str:
     return "Другое"
 
 
-def format_offer_notes(
-    title: str,
+def format_response_payload(
+    response_text: str,
     *,
     price: str | None = None,
     delivery_days: int | None = None,
 ) -> str:
     price_text = f"{price} ₽" if price else "—"
     days_text = f"{delivery_days} дн." if delivery_days else "—"
-    return f"{title}\nЦена: {price_text} · Срок: {days_text}"
+    body = (response_text or "").strip()
+    return f"{body}\n\nОбщий бюджет: {price_text}\nСрок: {days_text}".strip()
 
 
 class JournalWriter:
@@ -204,24 +206,27 @@ class JournalWriter:
         wb.close()
         return changed
 
-    def update_notes_by_project_id(
+    def update_response_by_project_id(
         self,
         project_id: str,
-        notes: str,
+        response_payload: str,
     ) -> bool:
         if not self.journal_path.exists():
             return False
         wb = load_workbook(self.journal_path)
         ws = wb.active
         row = self._find_row_by_project_id(ws, project_id)
-        if row is None or not self._writable(ws, row, 8):
+        if row is None or not self._writable(ws, row, 9):
             wb.close()
             return False
-        ws.cell(row=row, column=8, value=notes)
+        ws.cell(row=row, column=9, value=response_payload)
         wb.save(self.journal_path)
         wb.close()
-        logger.info("journal_notes_updated project_id=%s row=%d", project_id, row)
+        logger.info("journal_response_updated project_id=%s row=%d", project_id, row)
         return True
+
+    def update_notes_by_project_id(self, project_id: str, notes: str) -> bool:
+        return self.update_response_by_project_id(project_id, notes)
 
     def remove_row_by_project_id(self, project_id: str) -> bool:
         if not self.journal_path.exists():
@@ -260,8 +265,8 @@ class JournalWriter:
 
         type_val = str(ws.cell(row=row, column=5).value or "").strip()
         if type_val in ("", "—", "-"):
-            notes = str(ws.cell(row=row, column=8).value or "")
-            infer_title = title or notes.split("\n")[0]
+            offer_text = str(ws.cell(row=row, column=8).value or "")
+            infer_title = title or offer_text.split("\n")[0]
             new_type = (project_type or "").strip() or infer_project_type(infer_title)
             ws.cell(row=row, column=5, value=new_type)
             changed = True
@@ -340,8 +345,10 @@ class JournalWriter:
         row = self._next_row(ws)
 
         platform_label = PLATFORM_DISPLAY.get(project.platform, project.platform)
-        price = project.desired_budget or project.max_budget
-        notes = format_offer_notes(project.title, price=price)
+        response_payload = format_response_payload(
+            response_text,
+            price=project.desired_budget or project.max_budget,
+        )
 
         ws.cell(row=row, column=1, value=self._next_number(ws))
         ws.cell(row=row, column=2, value=date.today())
@@ -350,7 +357,8 @@ class JournalWriter:
         ws.cell(row=row, column=5, value=score.suggested_project_type)
         ws.cell(row=row, column=6, value="Отправлен")
         ws.cell(row=row, column=7, value="Жду ответа")
-        ws.cell(row=row, column=8, value=notes)
+        ws.cell(row=row, column=8, value=project.full_description)
+        ws.cell(row=row, column=9, value=response_payload)
 
         wb.save(self.journal_path)
         logger.info(
@@ -375,8 +383,8 @@ class JournalWriter:
         row = self._next_row(ws)
 
         platform_label = PLATFORM_DISPLAY.get(project.platform, project.platform)
-        notes = format_offer_notes(
-            project.title,
+        response_payload = format_response_payload(
+            response_text,
             price=price,
             delivery_days=delivery_days,
         )
@@ -388,7 +396,8 @@ class JournalWriter:
         ws.cell(row=row, column=5, value=score.suggested_project_type)
         ws.cell(row=row, column=6, value="Подготовлен")
         ws.cell(row=row, column=7, value="Жду ответа")
-        ws.cell(row=row, column=8, value=notes)
+        ws.cell(row=row, column=8, value=project.full_description)
+        ws.cell(row=row, column=9, value=response_payload)
 
         wb.save(self.journal_path)
         logger.info(
@@ -422,6 +431,7 @@ class JournalWriter:
         ws.cell(row=row, column=6, value=status)
         ws.cell(row=row, column=7, value=result)
         ws.cell(row=row, column=8, value=title.strip())
+        ws.cell(row=row, column=9, value="")
 
         wb.save(self.journal_path)
         wb.close()
