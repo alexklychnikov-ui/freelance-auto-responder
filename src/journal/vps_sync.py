@@ -25,6 +25,7 @@ def sync_journal_on_vps(
     prepared_store: PreparedResponseStore,
 ) -> VpsJournalSyncResult:
     result = VpsJournalSyncResult()
+    writer.normalize_layout()
     existing_ids = writer.project_ids_in_journal()
 
     for item in prepared_store.list_all():

@@ -8,7 +8,9 @@ from pathlib import Path
 
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
+from openpyxl.styles import Alignment
 from openpyxl.styles import Font
+from openpyxl.styles import PatternFill
 
 from src.models import GptScoreResult, ProjectFull
 
@@ -22,9 +24,13 @@ JOURNAL_COLUMNS = [
     "Тип проекта",
     "Статус",
     "Результат общения",
-    "Полный текст предложения",
-    "Полный текст отклика",
+    "Предложения",
+    "Отклик",
 ]
+
+OFFER_COLUMN = 8
+RESPONSE_COLUMN = 9
+TEXT_COLUMN_WIDTH = 73
 
 PLATFORM_DISPLAY = {
     "kwork": "Kwork",
@@ -63,7 +69,7 @@ def format_response_payload(
     price_text = f"{price} ₽" if price else "—"
     days_text = f"{delivery_days} дн." if delivery_days else "—"
     body = (response_text or "").strip()
-    return f"{body}\n\nОбщий бюджет: {price_text}\nСрок: {days_text}".strip()
+    return f"Отклик\n{body}\n\nОбщий бюджет: {price_text}\nСрок: {days_text}".strip()
 
 
 class JournalWriter:
@@ -92,8 +98,48 @@ class JournalWriter:
             ws.title = "Отклики"
             for col, header in enumerate(JOURNAL_COLUMNS, start=1):
                 ws.cell(row=1, column=col, value=header)
+            self._apply_journal_layout(ws)
             self.journal_path.parent.mkdir(parents=True, exist_ok=True)
             wb.save(self.journal_path)
+
+    def _apply_journal_layout(self, ws) -> None:
+        header = self._header_row(ws)
+        ws.column_dimensions["H"].width = TEXT_COLUMN_WIDTH
+        ws.column_dimensions["I"].width = TEXT_COLUMN_WIDTH
+
+        header_fill = PatternFill(
+            fill_type="solid",
+            start_color="1F4E78",
+            end_color="1F4E78",
+        )
+        header_font = Font(color="FFFFFF", bold=True)
+        header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+        ws.cell(row=header, column=OFFER_COLUMN, value="Предложения")
+        ws.cell(row=header, column=RESPONSE_COLUMN, value="Отклик")
+        for col in (OFFER_COLUMN, RESPONSE_COLUMN):
+            cell = ws.cell(row=header, column=col)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_align
+
+        text_align = Alignment(vertical="top", wrap_text=True)
+        for row in range(header + 1, ws.max_row + 1):
+            for col in (OFFER_COLUMN, RESPONSE_COLUMN):
+                cell = ws.cell(row=row, column=col)
+                if isinstance(cell, MergedCell):
+                    continue
+                cell.alignment = text_align
+
+    def normalize_layout(self) -> bool:
+        if not self.journal_path.exists():
+            return False
+        wb = load_workbook(self.journal_path)
+        ws = wb.active
+        self._apply_journal_layout(ws)
+        wb.save(self.journal_path)
+        wb.close()
+        return True
 
     def _header_row(self, ws) -> int:
         for row in range(1, min(ws.max_row + 1, 20)):
@@ -180,6 +226,7 @@ class JournalWriter:
             return False
         wb = load_workbook(self.journal_path)
         ws = wb.active
+        self._apply_journal_layout(ws)
         row = self._find_row_by_project_id(ws, project_id)
         if row is None:
             wb.close()
@@ -215,11 +262,13 @@ class JournalWriter:
             return False
         wb = load_workbook(self.journal_path)
         ws = wb.active
+        self._apply_journal_layout(ws)
         row = self._find_row_by_project_id(ws, project_id)
         if row is None or not self._writable(ws, row, 9):
             wb.close()
             return False
         ws.cell(row=row, column=9, value=response_payload)
+        ws.cell(row=row, column=9).alignment = Alignment(vertical="top", wrap_text=True)
         wb.save(self.journal_path)
         wb.close()
         logger.info("journal_response_updated project_id=%s row=%d", project_id, row)
@@ -233,6 +282,7 @@ class JournalWriter:
             return False
         wb = load_workbook(self.journal_path)
         ws = wb.active
+        self._apply_journal_layout(ws)
         row = self._find_row_by_project_id(ws, project_id)
         if row is None:
             wb.close()
@@ -283,6 +333,7 @@ class JournalWriter:
             return False
         wb = load_workbook(self.journal_path)
         ws = wb.active
+        self._apply_journal_layout(ws)
         row = self._find_row_by_project_id(ws, project_id)
         if row is None:
             wb.close()
@@ -311,6 +362,7 @@ class JournalWriter:
         project_types = project_types or {}
         wb = load_workbook(self.journal_path)
         ws = wb.active
+        self._apply_journal_layout(ws)
         changed_rows = 0
         for row in range(2, ws.max_row + 1):
             if not self._writable(ws, row, 4):
@@ -342,6 +394,7 @@ class JournalWriter:
         self._ensure_workbook()
         wb = load_workbook(self.journal_path)
         ws = wb.active
+        self._apply_journal_layout(ws)
         row = self._next_row(ws)
 
         platform_label = PLATFORM_DISPLAY.get(project.platform, project.platform)
@@ -359,6 +412,8 @@ class JournalWriter:
         ws.cell(row=row, column=7, value="Жду ответа")
         ws.cell(row=row, column=8, value=project.full_description)
         ws.cell(row=row, column=9, value=response_payload)
+        ws.cell(row=row, column=8).alignment = Alignment(vertical="top", wrap_text=True)
+        ws.cell(row=row, column=9).alignment = Alignment(vertical="top", wrap_text=True)
 
         wb.save(self.journal_path)
         logger.info(
@@ -380,6 +435,7 @@ class JournalWriter:
         self._ensure_workbook()
         wb = load_workbook(self.journal_path)
         ws = wb.active
+        self._apply_journal_layout(ws)
         row = self._next_row(ws)
 
         platform_label = PLATFORM_DISPLAY.get(project.platform, project.platform)
@@ -398,6 +454,8 @@ class JournalWriter:
         ws.cell(row=row, column=7, value="Жду ответа")
         ws.cell(row=row, column=8, value=project.full_description)
         ws.cell(row=row, column=9, value=response_payload)
+        ws.cell(row=row, column=8).alignment = Alignment(vertical="top", wrap_text=True)
+        ws.cell(row=row, column=9).alignment = Alignment(vertical="top", wrap_text=True)
 
         wb.save(self.journal_path)
         logger.info(
@@ -419,6 +477,7 @@ class JournalWriter:
         self._ensure_workbook()
         wb = load_workbook(self.journal_path)
         ws = wb.active
+        self._apply_journal_layout(ws)
         row = self._next_row(ws)
         url = kwork_project_url(project_id)
         type_label = (project_type or "").strip() or infer_project_type(title)
@@ -432,6 +491,8 @@ class JournalWriter:
         ws.cell(row=row, column=7, value=result)
         ws.cell(row=row, column=8, value=title.strip())
         ws.cell(row=row, column=9, value="")
+        ws.cell(row=row, column=8).alignment = Alignment(vertical="top", wrap_text=True)
+        ws.cell(row=row, column=9).alignment = Alignment(vertical="top", wrap_text=True)
 
         wb.save(self.journal_path)
         wb.close()

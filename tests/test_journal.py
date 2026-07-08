@@ -48,6 +48,8 @@ def test_journal_template_has_columns(journal_path: Path) -> None:
     ws = wb.active
     headers = [ws.cell(row=1, column=c).value for c in range(1, len(JOURNAL_COLUMNS) + 1)]
     assert headers == JOURNAL_COLUMNS
+    assert ws.column_dimensions["H"].width == 73
+    assert ws.column_dimensions["I"].width == 73
     wb.close()
 
 
@@ -128,7 +130,7 @@ def test_format_response_payload() -> None:
     from src.journal.writer import format_response_payload
 
     text = format_response_payload("Сделаю за вечер", price="8000", delivery_days=10)
-    assert text == "Сделаю за вечер\n\nОбщий бюджет: 8000 ₽\nСрок: 10 дн."
+    assert text == "Отклик\nСделаю за вечер\n\nОбщий бюджет: 8000 ₽\nСрок: 10 дн."
 
 
 def test_project_ids_in_journal(journal_path: Path, project: ProjectFull, score: GptScoreResult) -> None:

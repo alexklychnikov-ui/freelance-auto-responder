@@ -143,6 +143,7 @@ def main() -> int:
         return 1
 
     writer = JournalWriter(journal_path)
+    writer.normalize_layout()
     existing_ids = writer.project_ids_in_journal()
     skip_ids = _skip_project_ids()
 
