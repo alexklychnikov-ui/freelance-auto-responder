@@ -20,17 +20,18 @@ def env_vars(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_load_sources_yaml() -> None:
     config_path = Path("config/sources.yaml")
     sources = load_sources(config_path)
-    assert len(sources) == 3
-    kwork = next(s for s in sources if s.id == "kwork_dev_it")
-    assert kwork.enabled is True
-    assert kwork.platform == "kwork"
-    assert "kwork.ru/projects" in (kwork.url or "")
+    kwork_sources = [s for s in sources if s.platform == "kwork"]
+    assert len(kwork_sources) == 3
+    by_id = {s.id: s for s in kwork_sources}
+    assert by_id["kwork_dev_it"].url == "https://kwork.ru/projects?c=11"
+    assert by_id["kwork_c5"].url == "https://kwork.ru/projects?c=5"
+    assert by_id["kwork_c15"].url == "https://kwork.ru/projects?c=15"
 
 
 def test_enabled_sources_only_kwork() -> None:
     enabled = get_enabled_sources("config/sources.yaml")
-    assert len(enabled) == 1
-    assert enabled[0].id == "kwork_dev_it"
+    assert len(enabled) == 3
+    assert {s.id for s in enabled} == {"kwork_dev_it", "kwork_c5", "kwork_c15"}
 
 
 def test_settings_from_env(env_vars: None) -> None:

@@ -6,6 +6,20 @@ sources:
     scan_interval_minutes: 15
     bootstrap: true
 
+  - id: kwork_c5
+    platform: kwork
+    enabled: true
+    url: https://kwork.ru/projects?c=5
+    scan_interval_minutes: 15
+    bootstrap: true
+
+  - id: kwork_c15
+    platform: kwork
+    enabled: true
+    url: https://kwork.ru/projects?c=15
+    scan_interval_minutes: 15
+    bootstrap: true
+
   - id: flru_ai
     platform: flru
     enabled: false
