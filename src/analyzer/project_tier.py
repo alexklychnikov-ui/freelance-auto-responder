@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 
 from src.adapters.kwork_pricing import _budget_amounts
+from src.analyzer.landing_case import LANDING_PATTERN
 from src.analyzer.project_brief import build_project_brief
 from src.config import Settings
 from src.models import GptScoreResult, ProjectFull
@@ -12,7 +13,8 @@ _QUICK_WIN_TASK_RE = re.compile(
     r"парс\w*|скрап\w*|скрин\w*|gmail|imap|почт\w*|выгруз\w*|"
     r"скачать|скрипт|автоматиз|csv|excel|xlsx|"
     r"быстр\w*|прост\w*|небольш\w*|разово|настро\w*|"
-    r"telegram[- ]?бот|бот на python|aiogram",
+    r"telegram[- ]?бот|бот на python|aiogram|"
+    + LANDING_PATTERN,
     re.I,
 )
 

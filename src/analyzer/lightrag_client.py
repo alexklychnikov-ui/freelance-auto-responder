@@ -5,6 +5,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from src.analyzer.context_compress import compress_context_text
+from src.analyzer.landing_case import is_landing_project, landing_scoring_context
 from src.analyzer.github_stack import load_github_stack
 from src.analyzer.lightrag_http import search_lightrag_http
 from src.config import Settings, get_settings
@@ -118,6 +119,8 @@ class LightRagClient:
             parts.append(
                 "## Релевантные кейсы из LightRAG по этому заказу\n" + lightrag.strip()
             )
+        if is_landing_project(project):
+            parts.append(landing_scoring_context())
         return "\n\n".join(parts)
 
     def get_full_context(self) -> str:

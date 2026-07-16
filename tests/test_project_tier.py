@@ -105,3 +105,19 @@ def test_standard_wins_over_quick_win(settings: Settings) -> None:
     )
     good = _score(value=8, fit=True)
     assert resolve_acceptance_tier(project, good, settings) == "standard"
+
+
+def test_quick_win_candidate_landing(settings: Settings) -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3215930",
+        url="https://kwork.ru/projects/3215930/view",
+        title="Создать одностраничный сайт по ТЗ",
+        full_description="Лендинг, адаптив, форма",
+        max_budget="до 8 000 ₽",
+        offers_count=10,
+    )
+    assert is_quick_win_candidate(project, settings)
+    low = _score(value=6, fit=False)
+    assert resolve_acceptance_tier(project, low, settings) == "quick_win"

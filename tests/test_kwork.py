@@ -37,9 +37,25 @@ class FakeBrowser:
         pass
 
     def evaluate(self, js: str) -> Any:
-        if self.last_url and "/projects/" in self.last_url and "?" not in self.last_url:
-            return parse_project_from_html(self.project_html, project_id="3201949")
+        on_project = bool(
+            self.last_url and "/projects/" in self.last_url and "?" not in self.last_url
+        )
+        if on_project and ("hasVisibleTitle" in js or "pathOk" in js):
+            return {
+                "ready": True,
+                "pathOk": True,
+                "hasVisibleTitle": True,
+                "idHint": True,
+                "title": "Telegram-бот для парсинга",
+            }
+        if on_project:
+            raw = parse_project_from_html(self.project_html, project_id="3201949")
+            raw["content_project_id"] = "3201949"
+            return raw
         return parse_listing_from_html(self.listing_html)
+
+    def wait_ms(self, ms: int) -> None:
+        pass
 
     def screenshot(self) -> bytes:
         return b""
@@ -61,6 +77,7 @@ def test_parse_listing_fixture(listing_html: str) -> None:
     assert cards[0]["project_id"] == "3201949"
     assert cards[0]["title"] == "Telegram-бот для парсинга"
     assert cards[0]["responses_count"] == 16
+    assert all(c["project_id"] != "999" for c in cards)
 
 
 def test_parse_project_fixture(project_html: str) -> None:

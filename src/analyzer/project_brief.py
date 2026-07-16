@@ -19,6 +19,7 @@ _TARGET_RE = re.compile(
 )
 _CHECKLIST_HEADER_RE = re.compile(r"при отклике укажите", re.I)
 _CHECKLIST_ITEM_RE = re.compile(r"^\s*\d+[\.\):\-]\s*(.+)", re.MULTILINE)
+_MAX_NUMBERED_ITEMS = 15
 
 
 def build_project_brief(project: ProjectFull) -> str:
@@ -31,16 +32,12 @@ def build_project_brief(project: ProjectFull) -> str:
     return title
 
 
-def extract_buyer_checklist(project: ProjectFull) -> list[str]:
-    text = build_project_brief(project)
-    if not _CHECKLIST_HEADER_RE.search(text):
-        return []
-    start = _CHECKLIST_HEADER_RE.search(text)
-    if not start:
-        return []
-    tail = text[start.end() :]
+def _extract_numbered_block(text: str, *, start_at: int = 0) -> list[str]:
+    """First contiguous numbered list in text[start_at:], up to _MAX_NUMBERED_ITEMS."""
+    section = text[start_at:] if start_at else text
     items: list[str] = []
-    for line in tail.splitlines():
+    started = False
+    for line in section.splitlines():
         stripped = line.strip()
         if not stripped:
             if items:
@@ -48,11 +45,43 @@ def extract_buyer_checklist(project: ProjectFull) -> list[str]:
             continue
         match = _CHECKLIST_ITEM_RE.match(stripped)
         if match:
+            started = True
             items.append(match.group(1).strip().rstrip("."))
+            if len(items) >= _MAX_NUMBERED_ITEMS:
+                break
             continue
-        if items and not stripped[0].isdigit():
+        if started:
             break
     return items
+
+
+def extract_numbered_questions(project: ProjectFull) -> list[str]:
+    """All consecutive numbered items from the first numbered block in the brief."""
+    text = build_project_brief(project)
+    if not text:
+        return []
+    return _extract_numbered_block(text)
+
+
+def extract_buyer_questions(project: ProjectFull) -> list[str]:
+    """Buyer Q&A items: after checklist header if present, else first numbered block."""
+    text = build_project_brief(project)
+    if not text:
+        return []
+    header = _CHECKLIST_HEADER_RE.search(text)
+    if header:
+        return _extract_numbered_block(text, start_at=header.end())
+    return extract_numbered_questions(project)
+
+
+def extract_buyer_checklist(project: ProjectFull) -> list[str]:
+    text = build_project_brief(project)
+    if not _CHECKLIST_HEADER_RE.search(text):
+        return []
+    start = _CHECKLIST_HEADER_RE.search(text)
+    if not start:
+        return []
+    return _extract_numbered_block(text, start_at=start.end())
 
 
 def buyer_checklist_issues(project: ProjectFull, response: str) -> list[str]:
@@ -99,7 +128,7 @@ def extract_tz_facts(project: ProjectFull) -> list[str]:
         m = _TARGET_RE.search(text)
         if m:
             facts.append(f"Целевые данные в ТЗ упомянуты ({m.group(1)})")
-    checklist = extract_buyer_checklist(project)
+    checklist = extract_buyer_checklist(project) or extract_buyer_questions(project)
     if checklist:
         facts.append(
             "Заказчик просит в отклике явно указать: " + "; ".join(checklist[:6])

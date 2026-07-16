@@ -1,6 +1,11 @@
 from src.analyzer.response_text import strip_response_markdown
 from src.adapters.kwork_delivery import KWORK_DELIVERY_DAY_OPTIONS, snap_delivery_days
-from src.adapters.kwork import merge_preview_into_full, parse_project_from_html
+from src.adapters.kwork import (
+    _is_weak_description,
+    merge_preview_into_full,
+    parse_listing_from_html,
+    parse_project_from_html,
+)
 from src.models import ProjectFull, ProjectPreview
 
 
@@ -60,3 +65,106 @@ def test_merge_preview_into_full() -> None:
     assert merged.title == "Telegram-бот СДЭК"
     assert merged.offers_count == 12
     assert "5 000" in (merged.desired_budget or "")
+
+
+def test_merge_preview_keeps_page_title() -> None:
+    full = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3217158",
+        url="https://kwork.ru/projects/3217158/view",
+        title="Ретушь фото для каталога",
+        full_description="Нужна цветокоррекция и удаление фона на 40 фото.",
+        desired_budget="до 3 000 ₽",
+        max_budget="до 5 000 ₽",
+    )
+    preview = ProjectPreview(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3217158",
+        url="https://kwork.ru/projects/3217158",
+        title="Отметки пользователей в Telegram Stories",
+        budget_text="до 15 000 ₽",
+        responses_count=3,
+    )
+    merged = merge_preview_into_full(full, preview)
+    assert merged.title == "Ретушь фото для каталога"
+    assert "цветокоррекция" in merged.full_description
+    assert merged.desired_budget == "до 3 000 ₽"
+    assert merged.max_budget == "до 5 000 ₽"
+    assert merged.offers_count == 3
+
+
+def test_listing_prefers_title_link_over_junk_href() -> None:
+    html = """
+    <article class="project-card" data-project-id="999">
+      <a href="https://kwork.ru/projects/999">Misleading related</a>
+      <a href="https://kwork.ru/projects/3201949">
+        <h2 class="project-card__title">Telegram-бот для парсинга</h2>
+      </a>
+      <span class="project-card__budget">до 5 000 ₽</span>
+      <span class="project-card__responses" data-responses="16">16</span>
+    </article>
+    """
+    cards = parse_listing_from_html(html)
+    assert len(cards) == 1
+    assert cards[0]["project_id"] == "3201949"
+    assert cards[0]["title"] == "Telegram-бот для парсинга"
+
+
+def test_is_weak_description() -> None:
+    assert _is_weak_description("Title", "") is True
+    assert _is_weak_description("Title", "Title") is True
+    # title-as-desc even when longer than 40 chars
+    long_title = "Нужен Telegram-бот для учёта заявок и CRM интеграции"
+    assert len(long_title) > 40
+    assert _is_weak_description(long_title, long_title) is True
+    assert _is_weak_description(long_title, long_title.lower()) is True
+    assert (
+        _is_weak_description(
+            "Ретушь фотографий для каталога маркетплейса",
+            "Ретушь фотографий",
+        )
+        is True
+    )
+    assert (
+        _is_weak_description(
+            "Ретушь",
+            "Нужна детальная цветокоррекция и ретушь портретов для маркетплейса.",
+        )
+        is False
+    )
+
+
+def test_parse_project_prefers_description_text_over_title_breakwords() -> None:
+    title = "Telegram-бот для учёта заявок и CRM (короткий заголовок)"
+    assert len(title) > 40
+    long_desc = (
+        "Нужен бот на Python/aiogram. "
+        "1. Стоимость?\n"
+        "2. Срок?\n"
+        "3. Стек?\n"
+        "4. Готовы ли смотреть код?\n"
+        "5. Что в передаче?\n"
+        "6. Есть ли опыт с CRM?\n"
+        "7. Как поддержка?\n"
+        "8. Нужен ли webhook?\n"
+        "9. Деплой на VPS?\n"
+        "10. Документация?\n"
+    )
+    assert len(long_desc) > 200
+    html = f"""
+    <main class="project-page" data-project-id="3217391">
+      <div class="wants-card__header-title breakwords">
+        <a href="/projects/3217391">{title}</a>
+      </div>
+      <div class="wants-card__description-text">{long_desc}</div>
+      <span class="desired-budget">до 25 000 ₽</span>
+    </main>
+    """
+    data = parse_project_from_html(html, project_id="3217391")
+    assert data["title"] == title
+    assert len(data["full_description"]) > 200
+    assert "Стоимость" in data["full_description"]
+    assert data["full_description"] != title
+

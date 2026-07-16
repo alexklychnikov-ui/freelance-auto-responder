@@ -8,20 +8,24 @@ from typing import Any
 
 import httpx
 
+from src.analyzer.landing_case import MY_PORTFOLIO_GITHUB_LINE
+
+from src.analyzer.landing_case import MY_PORTFOLIO_GITHUB_LINE
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_GITHUB_USER = "alexklychnikov-ui"
 GITHUB_API = "https://api.github.com"
 CACHE_TTL_SECONDS = 24 * 3600
 
-STATIC_FALLBACK = """\
+STATIC_FALLBACK = f"""\
 Профиль: https://github.com/alexklychnikov-ui
 Фокус: Python, FastAPI, Flask, aiogram, OpenAI, LangChain, LightRAG, RAG, Telegram-боты,
 автоматизация, PostgreSQL, pgvector, Docker, Next.js, Prisma, nginx, Dynamics AX (X++).
 
 Ключевые репозитории:
 - LightRAG — Graph RAG, ingestion, hybrid retrieval, Telegram, MCP, VPS
-- MyPortfolio — Next.js, FastAPI, aiogram, GitHub→OpenAI→DB
+{MY_PORTFOLIO_GITHUB_LINE}
 - PriceMonitoring — мониторинг цен, Telegram alerts, Grafana, Docker
 - TGRecordsOfExpenses — бот учёта расходов, OCR, Excel, AI
 - DynamicsAX — AI-ассистент для AX 2012 / X++
@@ -32,6 +36,8 @@ STATIC_FALLBACK = """\
 
 def _format_repo(repo: dict[str, Any]) -> str:
     name = repo.get("name") or ""
+    if name == "MyPortfolio":
+        return MY_PORTFOLIO_GITHUB_LINE
     desc = (repo.get("description") or "").strip()
     lang = repo.get("language") or ""
     topics = ", ".join(repo.get("topics") or [])

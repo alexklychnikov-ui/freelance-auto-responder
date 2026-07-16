@@ -118,6 +118,7 @@ def test_topic_mismatch_flags_parsing_on_bot_project() -> None:
 
 def test_banned_phrase_triggers_retry(monkeypatch) -> None:
     from src.analyzer.gpt_response_generator import GptResponseGenerator
+    from src.analyzer.response_pipeline import ResponsePipeline
     from src.config import Settings
 
     settings = Settings(
@@ -128,15 +129,36 @@ def test_banned_phrase_triggers_retry(monkeypatch) -> None:
         _env_file=None,
     )
     gen = GptResponseGenerator(settings, http_client=MagicMock())
+    pipe: ResponsePipeline = gen._pipeline
     calls: list[str] = []
 
-    def fake_call(body, project_id):
-        calls.append(body["messages"][1]["content"])
+    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+        calls.append(json.dumps(user, ensure_ascii=False))
         if len(calls) == 1:
             return "Добрый день! С удовольствием помогу с вашим проектом."
-        return "По выгрузке ведомостей из Excel логично начать с формата файла."
+        return (
+            "По выгрузке ведомостей из Excel логично начать с формата файла. "
+            "Срок — 3–5 дней. Стоимость — от 15 000 ₽. "
+            "Предлагаю обсудить детали и приступить."
+        )
 
-    monkeypatch.setattr(gen, "_call_api", fake_call)
+    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+        if "ExpertReviewer" in system:
+            return {
+                "verdict": "pass",
+                "score": 8,
+                "feedback": "",
+                "must_fix": [],
+            }
+        return {
+            "verdict": "pass",
+            "issues": [],
+            "missing": [],
+            "style_notes": "",
+        }
+
+    monkeypatch.setattr(pipe, "_openai_text", fake_text)
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
     project = ProjectFull(
         platform="kwork",
         source_key="kwork_dev_it",
@@ -146,7 +168,6 @@ def test_banned_phrase_triggers_retry(monkeypatch) -> None:
         full_description="выгрузка",
     )
     text = gen.generate(project, "ctx")
-    assert len(calls) == 2
+    assert len(calls) >= 2
     assert "Добрый день" not in text
-    retry_payload = json.loads(calls[1])
-    assert "banned_detected" in retry_payload
+    assert any("banned_detected" in c for c in calls)

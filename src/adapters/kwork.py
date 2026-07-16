@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from src.adapters.kwork_delivery import (
     KWORK_DELIVERY_DAY_OPTIONS,
@@ -21,6 +22,8 @@ from src.adapters.kwork_auth import (
 from src.browser.base import BrowserClient
 from src.models import ProjectFull, ProjectPreview, ReplyEvent, SubmitResult
 
+logger = logging.getLogger(__name__)
+
 LISTING_EXTRACTOR_JS = """
 (() => {
   const cards = [];
@@ -32,15 +35,34 @@ LISTING_EXTRACTOR_JS = """
     roots = [...document.querySelectorAll('a[href*="/projects/"]')];
   }
 
+  const resolveTitleLink = (root) => {
+    if (root.matches?.('a[href*="/projects/"]')) return root;
+    const header = root.querySelector('.wants-card__header-title a[href*="/projects/"]');
+    if (header) return header;
+    const titled = root.querySelector('.project-card__title');
+    if (titled) {
+      const parentA = titled.closest('a[href*="/projects/"]');
+      if (parentA) return parentA;
+    }
+    return root.querySelector('a[href*="/projects/"]');
+  };
+
   for (const root of roots) {
-    const link = root.matches('a[href*="/projects/"]')
-      ? root
-      : root.querySelector('a[href*="/projects/"]');
+    const link = resolveTitleLink(root);
     if (!link) continue;
     const href = link.getAttribute('href') || '';
     const m = href.match(/\\/projects\\/(\\d+)/);
     if (!m || seen.has(m[1])) continue;
-    seen.add(m[1]);
+    const titleLinkId = m[1];
+    const dataId =
+      root.getAttribute?.('data-project-id') ||
+      root.querySelector?.('[data-project-id]')?.getAttribute('data-project-id') ||
+      null;
+    // Prefer title-link id when data-project-id disagrees
+    if (dataId && dataId !== titleLinkId) {
+      // keep titleLinkId; surface mismatch for diagnostics
+    }
+    seen.add(titleLinkId);
 
     const card = root.matches('a')
       ? link.closest('.want-card, article, [data-project-id]') || root.parentElement
@@ -64,7 +86,7 @@ LISTING_EXTRACTOR_JS = """
     }
 
     cards.push({
-      project_id: m[1],
+      project_id: titleLinkId,
       url: link.href.startsWith('http') ? link.href : 'https://kwork.ru' + href,
       title: (titleEl?.textContent || '').trim(),
       budget_text:
@@ -73,6 +95,8 @@ LISTING_EXTRACTOR_JS = """
         null,
       responses_count: responses,
       published_at: timeEl?.getAttribute('datetime') || null,
+      data_project_id: dataId,
+      title_link_mismatch: Boolean(dataId && dataId !== titleLinkId),
     });
   }
   return cards;
@@ -83,17 +107,82 @@ PROJECT_EXTRACTOR_JS = """
 (() => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
   const root = document.querySelector('main.project-page, [data-project-id], .want-view, main') || document;
-  const projectId = root.getAttribute?.('data-project-id')
-    || (location.pathname.match(/\\/projects\\/(\\d+)/) || [])[1]
+  const pathId = (location.pathname.match(/\\/projects\\/(\\d+)/) || [])[1] || null;
+  const dataId =
+    root.getAttribute?.('data-project-id')
+    || document.querySelector('[data-project-id]')?.getAttribute('data-project-id')
     || null;
+  const titleLink =
+    root.querySelector('.wants-card__header-title a[href*="/projects/"]')
+    || root.querySelector('a[href*="/projects/"] .project-title')?.closest('a')
+    || root.querySelector('a.project-title[href*="/projects/"]');
+  const titleHrefId = ((titleLink?.getAttribute('href') || '').match(/\\/projects\\/(\\d+)/) || [])[1] || null;
+  // Content id must prefer DOM attrs / title href over pathname (SPA may update URL early)
+  const contentProjectId = dataId || titleHrefId || null;
+  const projectId = contentProjectId || pathId;
   const titleEl =
     root.querySelector('.project-title, .wants-card__header-title, .want-card__header a, [data-project-title]') ||
     root.querySelector('h1');
-  const descEl =
-    root.querySelector('.project-description, .want-card__description-text, [data-description], .breakwords');
+  const titleText = norm(titleEl?.textContent || '');
+  const titleNorm = titleText.toLowerCase();
   const expandBtn = root.querySelector('.show-full-description, [data-expand-description], .kw-link-dashed');
   if (expandBtn && !expandBtn.dataset.clicked) {
     try { expandBtn.click(); expandBtn.dataset.clicked = '1'; } catch (e) {}
+  }
+  const descSelectors = [
+    '.wants-card__description-text',
+    '.want-card__description-text',
+    '.project-description',
+    '.wants-card__description:not(.wants-card__description-higher-price)',
+    '.want-description',
+    '.wants-card__body-description',
+    '[data-description]',
+    '.want-card__description',
+    '.project-card__description',
+  ];
+  const isTitleLike = (text) => {
+    const t = (text || '').toLowerCase();
+    if (!t) return true;
+    if (!titleNorm) return false;
+    if (t === titleNorm) return true;
+    if (t.length < 80 && (titleNorm.includes(t) || t.includes(titleNorm))) return true;
+    return false;
+  };
+  const isTitleNode = (el) =>
+    Boolean(el && (
+      el.closest?.('.wants-card__header-title, .project-title, .want-card__header')
+      || el.matches?.('.wants-card__header-title, .project-title')
+    ));
+  let fullDescription = '';
+  const seen = new Set();
+  for (const sel of descSelectors) {
+    for (const el of root.querySelectorAll(sel)) {
+      if (isTitleNode(el)) continue;
+      const text = norm(el.textContent || el.getAttribute?.('data-description') || '');
+      if (!text || seen.has(text) || isTitleLike(text)) continue;
+      seen.add(text);
+      if (text.length > fullDescription.length) fullDescription = text;
+    }
+  }
+  if (!fullDescription || fullDescription.length < 40) {
+    for (const el of root.querySelectorAll('.breakwords')) {
+      if (isTitleNode(el)) continue;
+      const text = norm(el.textContent || '');
+      if (!text || isTitleLike(text)) continue;
+      if (text.length > fullDescription.length) fullDescription = text;
+    }
+  }
+  if (!fullDescription || fullDescription.length < 40) {
+    const alt = root.querySelector(
+      '.wants-card__description, .want-card__description, .project-card__description, '
+      + '[class*="description"]'
+    );
+    if (alt && !isTitleNode(alt)) {
+      const altText = norm(alt.textContent || '');
+      if (altText && !isTitleLike(altText) && altText.length > fullDescription.length) {
+        fullDescription = altText;
+      }
+    }
   }
   const tags = [...root.querySelectorAll('.tags .tag, .tag-list .tag, .kw-tag')]
     .map(el => norm(el.textContent))
@@ -145,9 +234,11 @@ PROJECT_EXTRACTOR_JS = """
 
   return {
     project_id: projectId,
+    content_project_id: contentProjectId,
+    path_project_id: pathId,
     url: location.href,
-    title: norm(titleEl?.textContent || ''),
-    full_description: norm(descEl?.textContent || descEl?.getAttribute('data-description') || ''),
+    title: titleText,
+    full_description: fullDescription,
     desired_budget:
       norm(root.querySelector('.desired-budget, [data-desired-budget]')?.textContent || '')
       || budgetAfter('желаем(?:ый|ого)?\\s+бюджет')
@@ -1282,6 +1373,83 @@ def _payment_items_count(browser: BrowserClient) -> int:
         return 0
 
 
+def _stages_block_display(browser: BrowserClient) -> str | None:
+    try:
+        raw = browser.evaluate(
+            """
+            () => {
+              const wrap = document.querySelector('.offer-individual__item-stages')
+                || document.querySelector('.stages');
+              if (!wrap) return null;
+              return window.getComputedStyle(wrap).display;
+            }
+            """
+        )
+        return None if raw is None else str(raw)
+    except Exception:
+        return None
+
+
+def _stages_block_enabled(browser: BrowserClient) -> bool:
+    display = _stages_block_display(browser)
+    if display is None or display == "none":
+        return False
+    return _stages_section_visible(browser, min_rows=1)
+
+
+def _has_custom_price_input(browser: BrowserClient) -> bool:
+    try:
+        return bool(
+            browser.evaluate(
+                """
+                () => Boolean(
+                  document.querySelector('#offer-custom-price')
+                  || document.querySelector('input[name="price"]')
+                )
+                """
+            )
+        )
+    except Exception:
+        return False
+
+
+def _read_custom_price_value(browser: BrowserClient) -> str:
+    try:
+        raw = browser.evaluate(
+            """
+            () => {
+              const inp = document.querySelector('#offer-custom-price')
+                || document.querySelector('input[name="price"]');
+              return (inp?.value || '').replace(/\\s/g, '');
+            }
+            """
+        )
+        return str(raw or "").strip()
+    except Exception:
+        return ""
+
+
+def _infer_payment_mode(
+    *,
+    payment_items: int,
+    stages_enabled: bool,
+    has_price_input: bool = True,
+) -> Literal["stages", "lump"]:
+    if payment_items >= 2 or stages_enabled:
+        return "stages"
+    if has_price_input:
+        return "lump"
+    return "lump"
+
+
+def _detect_payment_mode(browser: BrowserClient) -> Literal["stages", "lump"]:
+    return _infer_payment_mode(
+        payment_items=_payment_items_count(browser),
+        stages_enabled=_stages_block_enabled(browser),
+        has_price_input=_has_custom_price_input(browser),
+    )
+
+
 def _wait_payment_block_ready(
     browser: BrowserClient, *, attempts: int = 24
 ) -> bool:
@@ -1294,14 +1462,33 @@ def _wait_payment_block_ready(
 
 
 def _prime_payment_ui(browser: BrowserClient, price: str) -> bool:
-    """Kwork renders payment cards only after a price is entered."""
-    if _payment_items_count(browser) >= 2:
+    """Fill price; ready when payment cards, stages UI, or lump price is set."""
+    if _payment_items_count(browser) >= 2 or _stages_block_enabled(browser):
         return True
     if not _fill_price(browser, str(price)):
         return False
     if hasattr(browser, "wait_ms"):
         browser.wait_ms(800)
-    return _wait_payment_block_ready(browser, attempts=20)
+    for attempt in range(12):
+        if _payment_items_count(browser) >= 2:
+            return True
+        if _stages_block_enabled(browser):
+            return True
+        if attempt >= 4:
+            if (
+                _detect_payment_mode(browser) == "lump"
+                and _read_custom_price_value(browser)
+            ):
+                return True
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(500)
+    if _payment_items_count(browser) >= 2 or _stages_block_enabled(browser):
+        return True
+    if _detect_payment_mode(browser) == "lump":
+        return bool(_read_custom_price_value(browser)) or _fill_price(
+            browser, str(price)
+        )
+    return False
 
 
 def _is_milestone_card_selected(browser: BrowserClient) -> bool:
@@ -1340,6 +1527,10 @@ def _read_payment_diag(browser: BrowserClient) -> dict[str, Any]:
               );
               const prices = [...document.querySelectorAll('.stages__stage-price-input')]
                 .filter((i) => i.offsetParent);
+              const stagesWrap = document.querySelector('.offer-individual__item-stages')
+                || document.querySelector('.stages');
+              const customPrice = document.querySelector('#offer-custom-price')
+                || document.querySelector('input[name="price"]');
               return {
                 paymentItems: items.length,
                 hasMilestoneCard: Boolean(milestone),
@@ -1348,12 +1539,30 @@ def _read_payment_diag(browser: BrowserClient) -> dict[str, Any]:
                   || milestone?.classList.contains('selected')
                 ),
                 stagePriceInputs: prices.length,
+                stagesVisible: prices.length,
+                stagesBlockDisplay: stagesWrap
+                  ? window.getComputedStyle(stagesWrap).display
+                  : null,
+                hasCustomPrice: Boolean(customPrice),
+                customPriceValue: (customPrice?.value || '').replace(/\\s/g, ''),
                 url: location.href,
               };
             }
             """
         )
-        return raw if isinstance(raw, dict) else {}
+        result = raw if isinstance(raw, dict) else {}
+        display = result.get("stagesBlockDisplay")
+        stages_enabled = (
+            display is not None
+            and str(display) != "none"
+            and int(result.get("stagesVisible") or 0) >= 1
+        )
+        result["mode"] = _infer_payment_mode(
+            payment_items=int(result.get("paymentItems") or 0),
+            stages_enabled=stages_enabled,
+            has_price_input=bool(result.get("hasCustomPrice")),
+        )
+        return result
     except Exception:
         return {}
 
@@ -1926,6 +2135,122 @@ def _finalize_offer_form(
     }
 
 
+def _prepare_lump_sum_offer(
+    browser: BrowserClient,
+    *,
+    project_id: str,
+    text: str,
+    price: str,
+    order_title: str,
+    delivery_days: int,
+    form_min: int | None,
+) -> SubmitResult:
+    """Fill lump-sum offer (no payment cards / stages UI). Submit not clicked."""
+    price_ok = _fill_price(browser, str(price))
+    if hasattr(browser, "wait_ms"):
+        browser.wait_ms(400)
+    desc_ok = _fill_description(browser, text)
+    title_ok = True
+    read_title = ""
+    if order_title:
+        title_ok = _fill_order_title(browser, order_title)
+        read_title = _read_order_title(browser)
+        if not read_title:
+            title_ok = _fill_order_title(browser, order_title) or title_ok
+            read_title = _read_order_title(browser)
+    deadline_result = _fill_deadline(browser, delivery_days)
+    if not deadline_result.get("ok") and hasattr(browser, "wait_ms"):
+        browser.wait_ms(1500)
+        deadline_result = _fill_deadline(browser, delivery_days)
+
+    _autosave_wait(browser, wait_ms=5000)
+    if not desc_ok or _read_description_len(browser) < 150:
+        desc_ok = _fill_description(browser, text)
+    if not price_ok or not _read_custom_price_value(browser):
+        price_ok = _fill_price(browser, str(price)) or price_ok
+    if order_title and not _read_order_title(browser):
+        title_ok = _fill_order_title(browser, order_title) or title_ok
+        read_title = _read_order_title(browser)
+    _autosave_wait(browser, wait_ms=3000)
+
+    readback = _read_offer_form(browser)
+    desc_len = _read_description_len(browser) or int(readback.get("descLen") or 0)
+    read_price = str(readback.get("price") or "").replace(" ", "")
+    if not read_price:
+        read_price = _read_custom_price_value(browser)
+    read_title = _read_order_title(browser) or str(readback.get("title") or "").strip()
+    read_deadline = str(
+        readback.get("deadline") or readback.get("deadlineLabel") or ""
+    ).strip()
+    days_set = bool(
+        isinstance(deadline_result, dict)
+        and deadline_result.get("ok")
+        and (read_deadline or re.search(r"\d", str(deadline_result.get("picked") or "")))
+    )
+    min_desc = min(150, max(50, len(text.strip()) // 3))
+    fill_result: dict[str, Any] = {
+        "mode": "lump",
+        "hasDesc": desc_ok,
+        "hasPrice": price_ok,
+        "hasTitle": title_ok if order_title else True,
+        "titleRequired": True,
+        "daysSet": days_set,
+        "deadline": deadline_result,
+        "readback": readback,
+        "readTitle": read_title,
+    }
+
+    if desc_len < min_desc or not read_price:
+        if desc_ok and read_price and desc_len < min_desc:
+            desc_ok = _fill_description(browser, text)
+            if hasattr(browser, "wait_ms"):
+                browser.wait_ms(800)
+            desc_len = _read_description_len(browser) or desc_len
+            fill_result["descRefilled"] = True
+            fill_result["descLenAfterRefill"] = desc_len
+        if desc_len < min_desc or not read_price:
+            return SubmitResult(
+                success=False,
+                project_id=project_id,
+                message=f"prepare_verify_failed: {fill_result}",
+            )
+
+    read_price_int = int(re.sub(r"\D", "", read_price) or 0)
+    if form_min and read_price_int < form_min:
+        return SubmitResult(
+            success=False,
+            project_id=project_id,
+            message=f"prepare_price_below_min: {read_price_int} < {form_min} {fill_result}",
+        )
+    if order_title and not read_title:
+        return SubmitResult(
+            success=False,
+            project_id=project_id,
+            message=f"prepare_title_empty: {fill_result}",
+        )
+    if read_price_int != int(re.sub(r"\D", "", str(price)) or 0):
+        return SubmitResult(
+            success=False,
+            project_id=project_id,
+            message=(
+                f"prepare_total_mismatch: expected={price} got={read_price_int} "
+                f"{fill_result}"
+            ),
+        )
+
+    message = (
+        f"prepared: lump_sum, form filled, submit not clicked "
+        f"desc={desc_len} price={read_price} title={read_title!r}"
+    )
+    if not days_set:
+        message += f"; deadline_not_set: {deadline_result}"
+    return SubmitResult(
+        success=True,
+        project_id=project_id,
+        message=message,
+    )
+
+
 def _sync_stages_draft(browser: BrowserClient) -> None:
     try:
         browser.evaluate(
@@ -2043,7 +2368,31 @@ def _autosave_wait(browser: BrowserClient, *, wait_ms: int = 8000) -> None:
 
 
 def _parse_listing_block(block: str) -> dict[str, Any] | None:
-    pid = _first_group(r'data-project-id="(\d+)"', block)
+    title = ""
+    title_pid: str | None = None
+    title_href: str | None = None
+
+    m = re.search(
+        r'class="wants-card__header-title[^"]*"[^>]*>\s*'
+        r'<a[^>]*href="([^"]*/projects/(\d+)[^"]*)"[^>]*>([^<]*)',
+        block,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m:
+        title_href, title_pid, title = m.group(1), m.group(2), m.group(3)
+    if not title_pid:
+        m = re.search(
+            r'<a[^>]*href="([^"]*/projects/(\d+)[^"]*)"[^>]*>\s*'
+            r'<h[1-3][^>]*class="[^"]*project-card__title[^"]*"[^>]*>([^<]*)',
+            block,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            title_href, title_pid, title = m.group(1), m.group(2), m.group(3)
+
+    data_pid = _first_group(r'data-project-id="(\d+)"', block)
+    # Prefer title-link id over data-project-id / arbitrary card links
+    pid = title_pid or data_pid
     if not pid:
         pid = _first_group(r'href="(?:https?://[^"]*)?/projects/(\d+)"', block)
     if not pid:
@@ -2051,13 +2400,18 @@ def _parse_listing_block(block: str) -> dict[str, Any] | None:
     if not pid:
         return None
 
-    href = _first_group(r'href="([^"]+/projects/\d+)"', block) or f"https://kwork.ru/projects/{pid}"
-    title = (
-        _first_group(r'class="wants-card__header-title[^"]*"[^>]*>\s*<a[^>]*>([^<]+)', block)
-        or _first_group(r'class="project-card__title"[^>]*>([^<]+)', block)
-        or _first_group(r'href="[^"]*/projects/\d+"[^>]*>([^<]+)', block)
-        or ""
+    href = (
+        title_href
+        or _first_group(rf'href="([^"]+/projects/{re.escape(pid)}[^"]*)"', block)
+        or f"https://kwork.ru/projects/{pid}"
     )
+    if not title.strip():
+        title = (
+            _first_group(r'class="wants-card__header-title[^"]*"[^>]*>\s*<a[^>]*>([^<]+)', block)
+            or _first_group(r'class="project-card__title"[^>]*>([^<]+)', block)
+            or _first_group(r'href="[^"]*/projects/\d+"[^>]*>([^<]+)', block)
+            or ""
+        )
     budget = _first_group(r'class="wants-card__price"[^>]*>(.*?)</div>', block)
     if budget:
         budget = re.sub(r"<[^>]+>", " ", budget)
@@ -2109,6 +2463,42 @@ def parse_listing_from_html(html: str) -> list[dict[str, Any]]:
     return results
 
 
+def _html_inner_texts(html: str, class_token: str) -> list[str]:
+    """Collect text nodes from elements whose class contains class_token."""
+    pattern = re.compile(
+        rf'class="[^"]*{re.escape(class_token)}[^"]*"[^>]*>(.*?)</',
+        re.IGNORECASE | re.DOTALL,
+    )
+    out: list[str] = []
+    for match in pattern.finditer(html):
+        raw = re.sub(r"<[^>]+>", " ", match.group(1))
+        text = re.sub(r"\s+", " ", raw).strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _pick_best_description(title: str, candidates: list[str]) -> str:
+    title_n = _normalize_title(title)
+    best = ""
+    for raw in candidates:
+        text = re.sub(r"\s+", " ", (raw or "").strip())
+        if not text:
+            continue
+        text_n = _normalize_title(text)
+        if title_n and text_n == title_n:
+            continue
+        if (
+            title_n
+            and len(text) < 80
+            and (text_n in title_n or title_n in text_n)
+        ):
+            continue
+        if len(text) > len(best):
+            best = text
+    return best
+
+
 def parse_project_from_html(html: str, project_id: str | None = None) -> dict[str, Any]:
     root = html
     pid = project_id or _first_group(r'data-project-id="(\d+)"', root)
@@ -2118,16 +2508,24 @@ def parse_project_from_html(html: str, project_id: str | None = None) -> dict[st
     title = (
         _first_group(r'class="project-title"[^>]*>([^<]+)', root)
         or _first_group(r'class="wants-card__header-title[^"]*"[^>]*>\s*<a[^>]*>([^<]+)', root)
+        or _first_group(r'class="wants-card__header-title[^"]*"[^>]*>([^<]+)', root)
         or _first_group(r"<h1[^>]*>([^<]+)", root)
         or ""
     )
-    description = _first_group(r'class="project-description"[^>]*>([^<]+)', root)
-    if not description:
-        description = _first_group(r'data-description="([^"]+)"', root) or ""
-    if not description:
-        description = _first_group(
-            r'class="want-card__description-text"[^>]*>([^<]+)', root
-        ) or ""
+    candidates: list[str] = []
+    for token in (
+        "wants-card__description-text",
+        "want-card__description-text",
+        "project-description",
+        "wants-card__description",
+        "want-description",
+        "wants-card__body-description",
+    ):
+        candidates.extend(_html_inner_texts(root, token))
+    data_desc = _first_group(r'data-description="([^"]+)"', root)
+    if data_desc:
+        candidates.append(data_desc)
+    description = _pick_best_description(title, candidates)
 
     tags = re.findall(r'class="tag"[^>]*>([^<]+)', root, flags=re.IGNORECASE)
     plain = re.sub(r"<[^>]+>", " ", root)
@@ -2193,9 +2591,116 @@ def _merge_project_raw(
         "time_left",
         "title",
         "full_description",
+        "content_project_id",
     ):
         if not merged.get(key) and fallback.get(key):
             merged[key] = fallback[key]
+    return merged
+
+
+def _normalize_title(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _is_weak_description(title: str, description: str) -> bool:
+    desc = (description or "").strip()
+    tit = (title or "").strip()
+    if not desc:
+        return True
+    desc_n = _normalize_title(desc)
+    tit_n = _normalize_title(tit)
+    if tit_n and desc_n == tit_n:
+        return True
+    if len(desc) < 80 and tit_n:
+        # desc is a fragment of the title
+        if desc_n in tit_n:
+            return True
+        # title padded slightly → still title-as-desc (not a short word inside a real TZ)
+        if tit_n in desc_n and len(desc_n) <= len(tit_n) + 15:
+            return True
+    return False
+
+
+def _dom_content_project_id(html: str) -> str | None:
+    return (
+        _first_group(r'data-project-id="(\d+)"', html)
+        or _first_group(
+            r'class="wants-card__header-title[^"]*"[^>]*>\s*'
+            r'<a[^>]*href="[^"]*/projects/(\d+)',
+            html,
+        )
+        or None
+    )
+
+
+def _page_ready_check_js(project_id: str) -> str:
+    pid = re.sub(r"\D", "", str(project_id))
+    return f"""
+(() => {{
+  const id = '{pid}';
+  const path = location.pathname || '';
+  const pathOk = path.includes('/projects/' + id);
+  const titleEl = document.querySelector(
+    'h1.project-title, h1, .wants-card__header-title, .project-title, [data-project-title]'
+  );
+  const titleText = (titleEl?.textContent || '').replace(/\\s+/g, ' ').trim();
+  const docTitle = (document.title || '').replace(/\\s+/g, ' ').trim();
+  const genericDoc = !docTitle || /^kwork(\\b|$)/i.test(docTitle);
+  const hasVisibleTitle = Boolean(titleText) || (Boolean(docTitle) && !genericDoc);
+  const idLink = document.querySelector('a[href*="/projects/' + id + '"]');
+  const dataEl = document.querySelector('[data-project-id="' + id + '"]');
+  const idHint = Boolean(idLink || dataEl);
+  return {{
+    ready: pathOk && hasVisibleTitle,
+    pathOk,
+    hasVisibleTitle,
+    idHint,
+    title: titleText || docTitle || '',
+  }};
+}})()
+"""
+
+
+def _wait_project_page_ready(
+    browser: BrowserClient, project_id: str, *, timeout_ms: int = 9000
+) -> bool:
+    """Poll until pathname matches project_id and a visible title exists."""
+    deadline_slices = max(1, timeout_ms // 500)
+    js = _page_ready_check_js(project_id)
+    for _ in range(deadline_slices):
+        try:
+            raw = browser.evaluate(js)
+            if isinstance(raw, dict) and raw.get("ready"):
+                return True
+            # FakeBrowser / HTML-parse fallback may return project dict with title
+            if isinstance(raw, dict) and raw.get("title") and (
+                str(raw.get("project_id") or "") in ("", str(project_id))
+                or raw.get("content_project_id") in (None, "", str(project_id))
+            ):
+                title = str(raw.get("title") or "").strip()
+                if title and not re.fullmatch(r"kwork", title, flags=re.I):
+                    return True
+        except Exception:
+            pass
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(500)
+    return False
+
+
+def _extract_project_raw(browser: BrowserClient, project_id: str) -> dict[str, Any]:
+    raw = browser.evaluate(PROJECT_EXTRACTOR_JS)
+    if not isinstance(raw, dict):
+        raw = {}
+    snapshot = browser.snapshot()
+    parsed = parse_project_from_html(snapshot, project_id=project_id)
+    merged = _merge_project_raw(raw, parsed)
+    content_id = (
+        str(raw.get("content_project_id") or "").strip()
+        or _dom_content_project_id(snapshot)
+        or ""
+    )
+    if content_id:
+        merged["content_project_id"] = content_id
     return merged
 
 
@@ -2205,14 +2710,20 @@ def merge_preview_into_full(
     if preview is None:
         return full
     data = full.model_dump()
-    if preview.title and not data.get("title"):
+    page_title = str(data.get("title") or "").strip()
+    page_desc = str(data.get("full_description") or "").strip()
+    # Never overwrite a non-empty page title/description with preview
+    if preview.title and not page_title:
         data["title"] = preview.title
     if preview.responses_count is not None and not data.get("offers_count"):
         data["offers_count"] = preview.responses_count
-    if preview.budget_text:
+    # Do not copy preview budget if page already has any budget fields
+    if preview.budget_text and not data.get("desired_budget") and not data.get("max_budget"):
         bt = preview.budget_text.strip()
-        if not data.get("desired_budget"):
-            data["desired_budget"] = bt if "₽" in bt else f"{bt} ₽"
+        data["desired_budget"] = bt if "₽" in bt else f"{bt} ₽"
+    # Keep explicit page description (preview has no full_description)
+    if page_desc:
+        data["full_description"] = page_desc
     return ProjectFull.model_validate(data)
 
 
@@ -2295,22 +2806,71 @@ class KworkAdapter:
         self._ensure_auth()
         url = f"https://kwork.ru/projects/{project_id}/view"
         self.browser.navigate(url)
-        if hasattr(self.browser, "wait_ms"):
-            self.browser.wait_ms(2000)
-        raw = self.browser.evaluate(PROJECT_EXTRACTOR_JS)
-        if not isinstance(raw, dict):
-            raw = {}
-        snapshot = self.browser.snapshot()
-        parsed = parse_project_from_html(snapshot, project_id=project_id)
-        raw = _merge_project_raw(raw, parsed)
+        ready = _wait_project_page_ready(self.browser, project_id)
+        if not ready:
+            logger.warning("project_page_not_ready project_id=%s", project_id)
+
+        raw = _extract_project_raw(self.browser, project_id)
+
+        # Stale-DOM guard: content id from attrs/title-href != requested
+        for attempt in range(2):
+            content_id = str(raw.get("content_project_id") or "").strip()
+            if not content_id or content_id == str(project_id):
+                break
+            logger.warning(
+                "stale_dom_retry project_id=%s content_id=%s attempt=%s",
+                project_id,
+                content_id,
+                attempt + 1,
+            )
+            if hasattr(self.browser, "wait_ms"):
+                self.browser.wait_ms(2000)
+            raw = _extract_project_raw(self.browser, project_id)
+
+        title = str(raw.get("title") or "").strip()
+        desc = str(raw.get("full_description") or "").strip()
+
+        # Weak content guard: empty / title-only description
+        if _is_weak_description(title, desc):
+            logger.info(
+                "weak_description_retry project_id=%s desc_len=%s",
+                project_id,
+                len(desc),
+            )
+            if hasattr(self.browser, "wait_ms"):
+                self.browser.wait_ms(2000)
+            raw2 = _extract_project_raw(self.browser, project_id)
+            title2 = str(raw2.get("title") or "").strip()
+            desc2 = str(raw2.get("full_description") or "").strip()
+            if not _is_weak_description(title2, desc2) or len(desc2) > len(desc):
+                raw = raw2
+                title = title2
+                desc = desc2
+
+        content_id = str(raw.get("content_project_id") or "").strip()
+        if content_id and content_id != str(project_id):
+            logger.warning(
+                "extract_id_mismatch project_id=%s content_id=%s — failing empty",
+                project_id,
+                content_id,
+            )
+            return ProjectFull(
+                platform=self.platform_id,
+                source_key=self.source_key,
+                project_id=str(project_id),
+                url=url,
+                title="",
+                full_description="",
+                tags=[],
+            )
 
         return ProjectFull(
             platform=self.platform_id,
             source_key=self.source_key,
-            project_id=str(raw.get("project_id") or project_id),
-            url=str(raw.get("url") or url),
-            title=str(raw.get("title") or ""),
-            full_description=str(raw.get("full_description") or ""),
+            project_id=str(project_id),
+            url=url,
+            title=title,
+            full_description=desc,
             desired_budget=raw.get("desired_budget"),
             max_budget=raw.get("max_budget"),
             offers_count=raw.get("offers_count"),
@@ -2390,6 +2950,18 @@ class KworkAdapter:
                 success=False,
                 project_id=project_id,
                 message=f"prepare_payment_block_missing: {diag}",
+            )
+
+        mode = _detect_payment_mode(self.browser)
+        if mode == "lump":
+            return _prepare_lump_sum_offer(
+                self.browser,
+                project_id=project_id,
+                text=text,
+                price=str(price),
+                order_title=order_title,
+                delivery_days=delivery_days,
+                form_min=form_min,
             )
 
         if not _select_milestone_payment(self.browser):

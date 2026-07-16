@@ -35,8 +35,8 @@ def project_full() -> ProjectFull:
         source_key="kwork_dev_it",
         project_id="999",
         url="https://kwork.ru/projects/999",
-        title="AI bot",
-        full_description="Need Python bot",
+        title="AI Telegram bot for inventory sync",
+        full_description="Need a Python/aiogram bot that monitors channels and syncs deals to Sheets.",
         desired_budget="5000",
         offers_count=3,
     )
@@ -215,6 +215,102 @@ async def test_pipeline_skips_over_budget_ceiling(
         ).fetchone()
     assert row is not None
     assert row["status"] == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_extract_fail_skips_scoring(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    project_full = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="2002",
+        url="https://kwork.ru/projects/2002/view",
+        title="",
+        full_description="",
+    )
+    preview = ProjectPreview(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="2002",
+        url=project_full.url,
+        # Wrong listing title must not resurrect failed page extract
+        title="Отметки пользователей в Telegram Stories",
+    )
+    orch, mock_adapter = _make_orchestrator(
+        settings, previews=[preview], project_full=project_full, score=score
+    )
+    totals = await orch.run_scan_cycle()
+
+    assert totals["new"] == 1
+    orch.scorer.score.assert_not_called()
+    orch.review_service.tg_bot.send_review_card.assert_not_called()
+    mock_adapter.prepare_response.assert_not_called()
+    repo = ProjectRepository(settings.database_path)
+    assert repo.is_known("kwork", "kwork_dev_it", "2002")
+
+
+@pytest.mark.asyncio
+async def test_pipeline_extract_fail_weak_title_as_desc(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    title = "Нужен Telegram-бот для учёта заявок и CRM интеграции"
+    assert len(title) > 40
+    project_full = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3217391",
+        url="https://kwork.ru/projects/3217391/view",
+        title=title,
+        full_description=title,
+    )
+    preview = ProjectPreview(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3217391",
+        url=project_full.url,
+        title=title,
+    )
+    orch, mock_adapter = _make_orchestrator(
+        settings, previews=[preview], project_full=project_full, score=score
+    )
+    totals = await orch.run_scan_cycle()
+
+    assert totals["new"] == 1
+    orch.scorer.score.assert_not_called()
+    orch.review_service.tg_bot.send_review_card.assert_not_called()
+    mock_adapter.prepare_response.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_title_mismatch_keeps_page_and_scores(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    project_full = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="2003",
+        url="https://kwork.ru/projects/2003/view",
+        title="Ретушь фото для каталога",
+        full_description="Нужна цветокоррекция и подготовка 40 фото для маркетплейса.",
+        desired_budget="до 3 000 ₽",
+    )
+    preview = ProjectPreview(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="2003",
+        url=project_full.url,
+        title="Отметки пользователей в Telegram Stories",
+    )
+    orch, mock_adapter = _make_orchestrator(
+        settings, previews=[preview], project_full=project_full, score=score
+    )
+    totals = await orch.run_scan_cycle()
+
+    assert totals["new"] == 1
+    orch.scorer.score.assert_called_once()
+    scored = orch.scorer.score.call_args[0][0]
+    assert scored.title == "Ретушь фото для каталога"
 
 
 @pytest.mark.asyncio
@@ -435,3 +531,86 @@ async def test_prepare_success_always_notifies(
     orch.review_service.tg_bot.send_form_prepared_ready.assert_called_once()
     call_kw = orch.review_service.tg_bot.send_form_prepared_ready.call_args.kwargs
     assert "new_offer?project=" in call_kw["offer_url"]
+
+
+@pytest.mark.asyncio
+async def test_process_manual_kwork_project_sends_review_card(
+    settings: Settings, project_full: ProjectFull, score: GptScoreResult
+) -> None:
+    settings.require_telegram_approval = True
+    orch, _ = _make_orchestrator(
+        settings,
+        previews=[],
+        project_full=project_full,
+        score=score,
+    )
+
+    result = await orch.process_manual_kwork_project("123456")
+
+    assert result == {"project_id": "123456", "outcome": "notified"}
+    orch.review_service.tg_bot.send_review_card.assert_called_once()
+    offer = orch.review_service.tg_bot.send_review_card.call_args.args[0]
+    assert offer.source_key == "kwork_manual"
+    assert orch.repository.is_known("kwork", "kwork_manual", "123456")
+
+
+@pytest.mark.asyncio
+async def test_prepare_offer_resolves_kwork_manual_source(
+    settings: Settings, project_full: ProjectFull, score: GptScoreResult
+) -> None:
+    settings.prepare_only_no_submit = True
+    orch, mock_adapter = _make_orchestrator(
+        settings,
+        previews=[],
+        project_full=project_full,
+        score=score,
+    )
+    mock_adapter.prepare_response.return_value = MagicMock(
+        success=True,
+        project_id=project_full.project_id,
+        message="prepared",
+    )
+    manual_project = project_full.model_copy(update={"source_key": "kwork_manual"})
+    offer = PendingOffer(
+        platform="kwork",
+        source_key="kwork_manual",
+        project_id="999",
+        url=project_full.url,
+        title=project_full.title,
+        project=manual_project,
+        score=score,
+        created_at=datetime.now(timezone.utc),
+        status="approved",
+        approved_at=datetime.now(timezone.utc),
+        response_text="Текст отклика.",
+    )
+    await orch._prepare_offer_on_site(offer)
+    mock_adapter.prepare_response.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_process_manual_kwork_project_skips_score_gate(
+    settings: Settings, project_full: ProjectFull
+) -> None:
+    low_score = GptScoreResult(
+        score=2,
+        fit=False,
+        reason="no match",
+        matched_skills=[],
+        risks=["out of stack"],
+        suggested_project_type="X",
+        competition_level="high",
+        recommendation="пропустить",
+    )
+    settings.require_telegram_approval = True
+    orch, _ = _make_orchestrator(
+        settings,
+        previews=[],
+        project_full=project_full,
+        score=low_score,
+    )
+
+    result = await orch.process_manual_kwork_project("123456")
+
+    assert result["outcome"] == "notified"
+    orch.review_service.tg_bot.send_review_card.assert_called_once()

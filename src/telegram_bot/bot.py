@@ -17,6 +17,7 @@ from aiogram.types import (
     Message,
 )
 
+from src.adapters.kwork_urls import extract_kwork_project_id
 from src.analyzer.project_tier import resolve_acceptance_tier, tier_label
 from src.config import get_settings
 from src.models import GptScoreResult, PendingOffer, ProjectFull
@@ -29,10 +30,15 @@ PLATFORM_LABELS = {
     "telegram": "Telegram",
 }
 
+SOURCE_LABELS = {
+    "kwork_manual": "Kwork · ручной",
+}
+
 CALLBACK_APPROVE = "approve"
 CALLBACK_REJECT = "reject"
 CALLBACK_JOURNAL_CONFIRM = "journal_ok"
 CALLBACK_PREPARE_RETRY = "prepare_retry"
+CALLBACK_REGENERATE = "regen"
 CALLBACK_OPEN = "open"
 
 
@@ -89,6 +95,7 @@ def format_review_card(offer: PendingOffer) -> str:
     )
     tier_badge = tier_label(acceptance_tier)
     platform_label = PLATFORM_LABELS.get(offer.platform, offer.platform)
+    source_label = SOURCE_LABELS.get(offer.source_key, offer.source_key)
     desc_preview = (project.full_description or "")[:300]
     skills = ", ".join(score.matched_skills) if score.matched_skills else "—"
     risks = ", ".join(score.risks) if score.risks else "—"
@@ -96,7 +103,7 @@ def format_review_card(offer: PendingOffer) -> str:
     max_b = _format_budget(project.max_budget)
     hire = project.buyer_hire_rate or "—"
 
-    header = f"🆕 {platform_label} · {offer.source_key}\n"
+    header = f"🆕 {platform_label} · {source_label}\n"
     if tier_badge:
         header += f"{tier_badge}\n"
 
@@ -147,6 +154,10 @@ def build_journal_confirm_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="✅ Подтвердить отклик",
                     callback_data=_callback_data(CALLBACK_JOURNAL_CONFIRM, p, s, pid),
+                ),
+                InlineKeyboardButton(
+                    text="🔄 Перегенерировать",
+                    callback_data=_callback_data(CALLBACK_REGENERATE, p, s, pid),
                 ),
             ],
         ]
@@ -205,6 +216,8 @@ class TelegramReviewBot:
         on_scan_report: Any | None = None,
         on_journal_confirm: Any | None = None,
         on_prepare_retry: Any | None = None,
+        on_regenerate: Any | None = None,
+        on_manual_project: Any | None = None,
     ) -> None:
         @self._dp.callback_query(F.data.startswith(f"{CALLBACK_APPROVE}:"))
         async def handle_approve(callback: CallbackQuery) -> None:
@@ -248,13 +261,43 @@ class TelegramReviewBot:
                 await callback.answer("Повторяю заполнение формы…")
                 await on_prepare_retry(platform, source_key, project_id, callback)
 
+        if on_regenerate is not None:
+
+            @self._dp.callback_query(F.data.startswith(f"{CALLBACK_REGENERATE}:"))
+            async def handle_regenerate(callback: CallbackQuery) -> None:
+                parsed = parse_callback_data(callback.data or "")
+                if not parsed:
+                    await callback.answer("Некорректный callback")
+                    return
+                _, platform, source_key, project_id = parsed
+                await callback.answer("Перегенерирую отклик…")
+                await on_regenerate(platform, source_key, project_id, callback)
+
         @self._dp.message(Command("start"))
         async def handle_start(message: Message) -> None:
             await message.answer(
                 "Freelance Auto-Responder\n"
                 "Отклик: карточка → автозаполнение формы на Kwork (VPS).\n"
+                "Ручной проект: пришли ссылку kwork.ru/projects/… или /project <url>\n"
                 "Excel: /journal · отчёт сканов: /report"
             )
+
+        if on_manual_project is not None:
+
+            @self._dp.message(Command("project"))
+            async def handle_project_command(message: Message) -> None:
+                parts = (message.text or "").split(maxsplit=1)
+                if len(parts) < 2:
+                    await message.answer(
+                        "Пришли ссылку на проект Kwork:\n"
+                        "/project https://kwork.ru/projects/123456/view"
+                    )
+                    return
+                project_id = extract_kwork_project_id(parts[1])
+                if not project_id:
+                    await message.answer("Не распознал project_id в ссылке Kwork")
+                    return
+                await on_manual_project(message, project_id)
 
         @self._dp.message(Command("report"))
         async def handle_report(message: Message) -> None:
@@ -274,6 +317,11 @@ class TelegramReviewBot:
             async def handle_text_message(message: Message) -> None:
                 if message.text and message.text.startswith("/"):
                     return
+                if on_manual_project is not None and message.text:
+                    project_id = extract_kwork_project_id(message.text)
+                    if project_id:
+                        await on_manual_project(message, project_id)
+                        return
                 await on_response_text(message)
 
     async def send_review_card(self, offer: PendingOffer) -> int:
@@ -314,7 +362,8 @@ class TelegramReviewBot:
             f"🔗 {html.escape(offer_url, quote=True)}\n"
             "Открой ссылку <b>под тем же аккаунтом Kwork</b>, что на VPS.\n"
             "Проверь форму и нажми «Предложить» на Kwork.\n"
-            "Затем нажми <b>Подтвердить отклик</b> ниже — только тогда запишу в журнал Excel."
+            "Затем <b>Подтвердить отклик</b> — запись в Excel.\n"
+            "Или <b>Перегенерировать</b> — новый текст + заполнение формы заново."
         )
         if deadline_manual:
             text += "\n⚠️ Срок в форме — выбери вручную в dropdown"

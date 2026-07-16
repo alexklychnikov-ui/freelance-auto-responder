@@ -24,6 +24,8 @@ ExportJournalHandler = Callable[[Message], Awaitable[None]]
 ScanReportHandler = Callable[[Message], Awaitable[None]]
 JournalConfirmHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 PrepareRetryHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
+RegenerateHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
+ManualProjectHandler = Callable[[Message, str], Awaitable[None]]
 
 
 class ReviewService:
@@ -40,6 +42,8 @@ class ReviewService:
         on_scan_report: ScanReportHandler | None = None,
         on_journal_confirm: JournalConfirmHandler | None = None,
         on_prepare_retry: PrepareRetryHandler | None = None,
+        on_regenerate: RegenerateHandler | None = None,
+        on_manual_project: ManualProjectHandler | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -51,6 +55,8 @@ class ReviewService:
         self._on_scan_report = on_scan_report
         self._on_journal_confirm = on_journal_confirm
         self._on_prepare_retry = on_prepare_retry
+        self._on_regenerate = on_regenerate
+        self._on_manual_project = on_manual_project
         self.tg_bot.register_handlers(
             on_approve=self._handle_approve,
             on_reject=self._handle_reject,
@@ -59,6 +65,8 @@ class ReviewService:
             on_scan_report=self._handle_scan_report,
             on_journal_confirm=self._handle_journal_confirm,
             on_prepare_retry=self._handle_prepare_retry,
+            on_regenerate=self._handle_regenerate,
+            on_manual_project=self._handle_manual_project,
         )
 
     def set_approve_handler(self, handler: ApproveHandler) -> None:
@@ -78,6 +86,12 @@ class ReviewService:
 
     def set_prepare_retry_handler(self, handler: PrepareRetryHandler) -> None:
         self._on_prepare_retry = handler
+
+    def set_regenerate_handler(self, handler: RegenerateHandler) -> None:
+        self._on_regenerate = handler
+
+    def set_manual_project_handler(self, handler: ManualProjectHandler) -> None:
+        self._on_manual_project = handler
 
     async def request_review(
         self,
@@ -221,7 +235,7 @@ class ReviewService:
         if offer is None:
             await callback.answer("Заявка не найдена", show_alert=True)
             return
-        if offer.status not in ("approved", "pending"):
+        if offer.status not in ("approved", "pending", "prepared"):
             await callback.answer(f"Статус: {offer.status}", show_alert=True)
             return
         chat_id = str(self.settings.telegram_chat_id)
@@ -229,6 +243,37 @@ class ReviewService:
             await callback.answer("Недоступно", show_alert=True)
             return
         await self._on_prepare_retry(platform, source_key, project_id, callback)
+
+    async def _handle_regenerate(
+        self,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        callback: CallbackQuery,
+    ) -> None:
+        if self._on_regenerate is None:
+            await callback.answer("Недоступно", show_alert=True)
+            return
+        offer = self.store.load(platform, source_key, project_id)
+        if offer is None:
+            await callback.answer("Заявка не найдена", show_alert=True)
+            return
+        if offer.status not in ("approved", "pending", "prepared"):
+            await callback.answer(f"Статус: {offer.status}", show_alert=True)
+            return
+        chat_id = str(self.settings.telegram_chat_id)
+        if callback.message and str(callback.message.chat.id) != chat_id:
+            await callback.answer("Недоступно", show_alert=True)
+            return
+        await self._on_regenerate(platform, source_key, project_id, callback)
+
+    async def _handle_manual_project(self, message: Message, project_id: str) -> None:
+        if self._on_manual_project is None:
+            await message.answer("Ручная обработка ссылок недоступна")
+            return
+        if str(message.chat.id) != str(self.tg_bot.chat_id):
+            return
+        await self._on_manual_project(message, project_id)
 
     async def _handle_export_journal(self, message: Message) -> None:
         if self._on_export_journal is None:

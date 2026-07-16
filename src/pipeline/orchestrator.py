@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import re
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from typing import Any
 
 import httpx
@@ -12,7 +14,12 @@ from src.adapters.kwork_pricing import (
     parse_budget_ceiling_rub,
     price_exceeds_budget_ceiling,
 )
-from src.adapters.kwork import KworkAdapter, kwork_offer_form_url, merge_preview_into_full
+from src.adapters.kwork import (
+    KworkAdapter,
+    _is_weak_description,
+    kwork_offer_form_url,
+    merge_preview_into_full,
+)
 from src.adapters.kwork_auth import KworkCredentials
 from src.analyzer.examples_loader import load_response_examples
 from src.analyzer.gpt_offer_estimator import GptOfferEstimator
@@ -28,7 +35,8 @@ from src.config import Settings, SourceConfig, get_enabled_sources, get_settings
 from src.journal.writer import JournalWriter
 from src.journal.vps_sync import sync_journal_on_vps
 from src.limits.daily import is_daily_limit_reached
-from src.models import PendingOffer, ProjectFull
+from src.adapters.kwork_urls import kwork_project_view_url
+from src.models import PendingOffer, ProjectFull, ProjectPreview
 from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
 from src.store.repository import ProjectRepository
 from src.store.scan_reports import ScanCycleStats, ScanReportStore
@@ -38,6 +46,18 @@ from src.telegram_bot.review_service import ReviewService
 from src.telegram_bot.scan_report import format_scan_reports_message
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_compare_title(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().lower())
+
+
+def _titles_differ_substantially(preview_title: str, page_title: str) -> bool:
+    a = _normalize_compare_title(preview_title)
+    b = _normalize_compare_title(page_title)
+    if not a or not b:
+        return False
+    return SequenceMatcher(None, a, b).ratio() < 0.35
 
 _PREPARE_FORM_ONLY_RETRY = (
     "prepare_milestone_click_failed",
@@ -82,9 +102,11 @@ class PipelineOrchestrator:
         self.review_service.set_approve_handler(self.handle_approve_click)
         self.review_service.set_journal_confirm_handler(self.handle_journal_confirm)
         self.review_service.set_prepare_retry_handler(self.handle_prepare_retry)
+        self.review_service.set_regenerate_handler(self.handle_regenerate_response)
         self.review_service.set_submit_text_handler(self.handle_user_response_text)
         self.review_service.set_export_journal_handler(self.export_prepared_to_journal)
         self.review_service.set_scan_report_handler(self.send_scan_report)
+        self.review_service.set_manual_project_handler(self.handle_manual_kwork_project)
 
     def close(self) -> None:
         if self._browser is not None:
@@ -116,6 +138,62 @@ class PipelineOrchestrator:
     def _is_bootstrap(self, source: SourceConfig) -> bool:
         state = self.repository.get_scan_state(source.id)
         return state is None and source.bootstrap
+
+    def _first_kwork_source(self) -> SourceConfig | None:
+        for source in get_enabled_sources(self.settings.sources_config_path):
+            if source.platform == "kwork":
+                return source
+        return None
+
+    def _resolve_source_config(self, source_key: str) -> SourceConfig | None:
+        if source_key == self.MANUAL_SOURCE_KEY:
+            return self._first_kwork_source()
+        return next(
+            (
+                s
+                for s in get_enabled_sources(self.settings.sources_config_path)
+                if s.id == source_key
+            ),
+            None,
+        )
+
+    MANUAL_SOURCE_KEY = "kwork_manual"
+
+    async def process_manual_kwork_project(self, project_id: str) -> dict[str, str]:
+        kwork_source = self._first_kwork_source()
+        if kwork_source is None:
+            raise RuntimeError("Нет включённого источника kwork в config/sources.yaml")
+
+        preview = ProjectPreview(
+            platform="kwork",
+            source_key=self.MANUAL_SOURCE_KEY,
+            project_id=project_id,
+            url=kwork_project_view_url(project_id),
+            title="",
+        )
+        if not self.repository.is_known(
+            preview.platform, preview.source_key, preview.project_id
+        ):
+            self.repository.insert_new(
+                platform=preview.platform,
+                source_key=preview.source_key,
+                project_id=preview.project_id,
+                url=preview.url,
+                status="new",
+            )
+
+        try:
+            outcome = await self._process_new_project(
+                kwork_source, preview, manual=True
+            )
+        except Exception as exc:
+            logger.exception("manual_kwork_project_failed project_id=%s", project_id)
+            await self.review_service.tg_bot.notify(
+                f"⚠️ Не удалось обработать проект {project_id}: {exc}"
+            )
+            return {"project_id": project_id, "outcome": "error"}
+
+        return {"project_id": project_id, "outcome": outcome}
 
     async def run_scan_cycle(self) -> dict[str, int]:
         totals = {"seen": 0, "new": 0, "skipped": 0, "scored": 0, "notified": 0}
@@ -185,11 +263,16 @@ class PipelineOrchestrator:
 
                 outcome = await self._process_new_project(source, preview)
                 source_stats.checked += 1
-                totals["scored"] += 1
+                if outcome == "extract_fail":
+                    totals["skipped"] += 1
+                else:
+                    totals["scored"] += 1
                 if outcome == "stack_reject":
                     source_stats.rejected_stack += 1
                 elif outcome == "budget_reject":
                     source_stats.rejected_budget += 1
+                elif outcome == "extract_fail":
+                    source_stats.rejected_stack += 1
                 elif outcome == "notified":
                     source_stats.notified += 1
                     totals["notified"] += 1
@@ -243,9 +326,63 @@ class PipelineOrchestrator:
         finally:
             close_browser_client(browser)
 
-    async def _process_new_project(self, source: SourceConfig, preview: Any) -> str:
+    async def _process_new_project(
+        self, source: SourceConfig, preview: Any, *, manual: bool = False
+    ) -> str:
         full = await asyncio.to_thread(self._read_full_listing, source, preview.project_id)
+        page_title = (full.title or "").strip()
+        page_desc = (full.full_description or "").strip()
+        page_extract_empty = not page_title and len(page_desc) < 20
+
         full = merge_preview_into_full(full, preview)
+        full = full.model_copy(
+            update={
+                "source_key": preview.source_key,
+                "url": preview.url or full.url,
+            }
+        )
+
+        title = (full.title or "").strip()
+        desc = (full.full_description or "").strip()
+        preview_title = str(getattr(preview, "title", "") or "").strip()
+        if preview_title and title and _titles_differ_substantially(preview_title, title):
+            logger.warning(
+                "title_mismatch preview=%r page=%r project_id=%s",
+                preview_title,
+                title,
+                full.project_id,
+            )
+        if page_extract_empty or not title or (len(desc) < 20 and len(title) < 10):
+            logger.warning(
+                "extract_fail project_id=%s title=%r desc_len=%s page_empty=%s",
+                full.project_id,
+                title,
+                len(desc),
+                page_extract_empty,
+            )
+            self.repository.update_status(
+                full.platform,
+                full.source_key,
+                full.project_id,
+                "skipped",
+            )
+            return "extract_fail"
+        if _is_weak_description(title, desc) or _is_weak_description(page_title, page_desc):
+            logger.warning(
+                "extract_fail_weak_desc project_id=%s title=%r desc_len=%s page_desc_len=%s",
+                full.project_id,
+                title,
+                len(desc),
+                len(page_desc),
+            )
+            self.repository.update_status(
+                full.platform,
+                full.source_key,
+                full.project_id,
+                "skipped",
+            )
+            return "extract_fail"
+
         context = await asyncio.to_thread(self.lightrag.get_scoring_context, full)
         examples = await asyncio.to_thread(
             load_response_examples, self.settings.response_examples_dir
@@ -253,7 +390,9 @@ class PipelineOrchestrator:
         score = await asyncio.to_thread(
             self.scorer.score, full, context, examples=examples
         )
-        acceptance_tier = resolve_acceptance_tier(full, score, self.settings)
+        acceptance_tier = (
+            "standard" if manual else resolve_acceptance_tier(full, score, self.settings)
+        )
         self.repository.update_status(
             full.platform,
             full.source_key,
@@ -274,8 +413,10 @@ class PipelineOrchestrator:
             )
             return "stack_reject"
 
-        if acceptance_tier == "standard" and await self._skip_over_budget_ceiling(
-            full, context
+        if (
+            not manual
+            and acceptance_tier == "standard"
+            and await self._skip_over_budget_ceiling(full, context)
         ):
             self.repository.update_status(
                 full.platform,
@@ -343,20 +484,14 @@ class PipelineOrchestrator:
         brief = build_project_brief(offer.project)
         if len(brief) >= 80 and len(offer.project.full_description or "") >= 40:
             return offer.project
-        source = next(
-            (
-                s
-                for s in get_enabled_sources(self.settings.sources_config_path)
-                if s.id == offer.source_key
-            ),
-            None,
-        )
+        source = self._resolve_source_config(offer.source_key)
         if source is None:
             return offer.project
         try:
             full = await asyncio.to_thread(
                 self._read_full_listing, source, offer.project_id
             )
+            full = full.model_copy(update={"source_key": offer.source_key})
             offer.project = full
             offer.title = full.title
             offer.url = full.url
@@ -371,7 +506,12 @@ class PipelineOrchestrator:
             logger.exception("project_refresh_failed project_id=%s", offer.project_id)
             return offer.project
 
-    async def _generate_response_text(self, offer: PendingOffer) -> str:
+    async def _generate_response_text(
+        self,
+        offer: PendingOffer,
+        *,
+        notify: Any | None = None,
+    ) -> str:
         await self._refresh_offer_project(offer)
         context = await asyncio.to_thread(self.lightrag.get_full_context)
         examples = await asyncio.to_thread(
@@ -380,23 +520,43 @@ class PipelineOrchestrator:
         recent = await asyncio.to_thread(
             load_recent_response_context, self.prepared_store
         )
-        text = await asyncio.to_thread(
-            self.response_generator.generate,
-            offer.project,
-            context,
-            examples=examples,
-            recent_responses=recent,
-        )
+        gen = self.response_generator
+        gen_with = getattr(gen, "generate_with_progress", None)
+        if (
+            notify is not None
+            and callable(gen_with)
+            and asyncio.iscoroutinefunction(gen_with)
+        ):
+            text = await gen_with(
+                offer.project,
+                context,
+                notify=notify,
+                examples=examples,
+                recent_responses=recent,
+            )
+        else:
+            text = await asyncio.to_thread(
+                gen.generate,
+                offer.project,
+                context,
+                examples=examples,
+                recent_responses=recent,
+            )
         return finalize_response_text(text.strip(), offer.project)
 
-    async def _ensure_response_text(self, offer: PendingOffer) -> str:
+    async def _ensure_response_text(
+        self,
+        offer: PendingOffer,
+        *,
+        notify: Any | None = None,
+    ) -> str:
         if (offer.response_text or "").strip():
             text = finalize_response_text(offer.response_text.strip(), offer.project)
             if text != offer.response_text:
                 offer.response_text = text
                 self.review_service.store.save(offer)
             return text
-        text = await self._generate_response_text(offer)
+        text = await self._generate_response_text(offer, notify=notify)
         offer.response_text = text
         self.review_service.store.save(offer)
         return text
@@ -412,8 +572,15 @@ class PipelineOrchestrator:
         if callback is not None:
             await self.review_service.tg_bot.mark_review_approved(callback)
 
+        async def _progress(msg: str) -> None:
+            await self.review_service.tg_bot.notify(msg)
+
         try:
-            await self._ensure_response_text(offer)
+            if not (offer.response_text or "").strip():
+                await self.review_service.tg_bot.notify(
+                    f"⏳ Генерирую отклик: {html.escape(offer.title)}"
+                )
+            await self._ensure_response_text(offer, notify=_progress)
         except httpx.HTTPStatusError as exc:
             offer.status = "pending"
             offer.approved_at = None
@@ -472,7 +639,7 @@ class PipelineOrchestrator:
                 f"⚠️ Заявка {project_id} не найдена в pending_offers"
             )
             return
-        if offer.status == "pending":
+        if offer.status in ("pending", "prepared"):
             offer.status = "approved"
             self.review_service.store.save(offer)
         prepared = self.prepared_store.load(platform, source_key, project_id)
@@ -480,6 +647,48 @@ class PipelineOrchestrator:
             offer.response_text = prepared.response_text
             self.review_service.store.save(offer)
         await self._prepare_offer_on_site(offer)
+
+    async def handle_regenerate_response(
+        self,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        callback: Any | None = None,
+    ) -> None:
+        offer = self.review_service.store.load(platform, source_key, project_id)
+        if offer is None:
+            await self.review_service.tg_bot.notify(
+                f"⚠️ Заявка {project_id} не найдена в pending_offers"
+            )
+            return
+
+        offer.status = "approved"
+        offer.response_text = None
+        offer.approved_at = datetime.now(timezone.utc)
+        self.review_service.store.save(offer)
+
+        async def _progress(msg: str) -> None:
+            await self.review_service.tg_bot.notify(msg)
+
+        await self.review_service.tg_bot.notify(
+            f"🔄 Перегенерирую отклик: {html.escape(offer.title)}"
+        )
+        try:
+            await self._ensure_response_text(offer, notify=_progress)
+        except Exception as exc:
+            logger.exception("regenerate_failed project_id=%s", project_id)
+            await self.review_service.tg_bot.notify(
+                f"❌ Не удалось перегенерировать: {html.escape(str(exc)[:500])}"
+            )
+            return
+
+        if self.settings.prepare_only_no_submit:
+            await self._prepare_offer_on_site(offer)
+        else:
+            await self.review_service.tg_bot.notify(
+                f"🔗 {kwork_offer_form_url(offer.project_id)}\n"
+                "Новый текст готов — открой форму на Kwork."
+            )
 
     async def handle_user_response_text(
         self, offer: PendingOffer, text: str
@@ -505,14 +714,7 @@ class PipelineOrchestrator:
         )
 
     async def _prepare_offer_on_site(self, offer: PendingOffer) -> None:
-        source = next(
-            (
-                s
-                for s in get_enabled_sources(self.settings.sources_config_path)
-                if s.id == offer.source_key
-            ),
-            None,
-        )
+        source = self._resolve_source_config(offer.source_key)
         if source is None:
             await self.review_service.tg_bot.notify(
                 f"⚠️ Источник {offer.source_key} не найден"
@@ -584,7 +786,12 @@ class PipelineOrchestrator:
                         )
                         offer.response_text = ""
                         self.review_service.store.save(offer)
-                        response_text = await self._generate_response_text(offer)
+                        async def _progress(msg: str) -> None:
+                            await self.review_service.tg_bot.notify(msg)
+
+                        response_text = await self._generate_response_text(
+                            offer, notify=_progress
+                        )
                         offer.response_text = response_text
                         self.review_service.store.save(offer)
                         context = await asyncio.to_thread(self.lightrag.get_full_context)
@@ -852,14 +1059,7 @@ class PipelineOrchestrator:
             )
             return
 
-        source = next(
-            (
-                s
-                for s in get_enabled_sources(self.settings.sources_config_path)
-                if s.id == source_key
-            ),
-            None,
-        )
+        source = self._resolve_source_config(source_key)
         if source is None:
             logger.warning(
                 "submit_blocked: unknown source_key=%s project_id=%s",
@@ -887,6 +1087,13 @@ class PipelineOrchestrator:
             await self.review_service.tg_bot.notify(
                 f"❌ Ошибка отклика: {project.title}\n{result.message or 'unknown'}"
             )
+
+    async def handle_manual_kwork_project(self, message: Any, project_id: str) -> None:
+        await message.answer(
+            f"🔍 Загружаю Kwork-проект <code>{html.escape(project_id)}</code>…",
+            parse_mode="HTML",
+        )
+        await self.process_manual_kwork_project(project_id)
 
 
 def build_orchestrator(settings: Settings | None = None) -> PipelineOrchestrator:

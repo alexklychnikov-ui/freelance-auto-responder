@@ -25,18 +25,24 @@ SCORING_SYSTEM_PROMPT = """\
 
 Стек Александра (подходит):
 - Python, FastAPI, aiogram, Telegram-боты, парсинг, API-интеграции
-- AI/LLM, RAG, автоматизация, MVP, небольшой веб (Next.js базово)
-- Docker, PostgreSQL
+- AI/LLM, RAG, автоматизация, MVP
+- Лендинг, одностраничный сайт, сайт-визитка на Next.js/React/Tailwind — кейс MyPortfolio (github.com/alexklychnikov-ui/MyPortfolio)
 
 Явно НЕ подходит / нет опыта (score <= 4, fit=false, recommendation=пропустить):
 - Нативные мобильные приложения Android и iOS (Swift, Kotlin, Java, Objective-C)
 - Flutter / React Native / Xamarin как основная разработка (без подтверждённого кейса в контексте)
-- Чистый дизайн, вёрстка без логики, 1С, WordPress/Тильда без кастомного кода
+- Чистый дизайн/макет БЕЗ разработки (только Figma/PSD, «нарисовать», без вёрстки и кода)
+- WordPress/Тильда без кастомного кода
 - Штатная позиция, не разовый проект
 
+ВАЖНО про лендинги:
+- «Создать одностраничный сайт / лендинг по ТЗ» на Next.js/React — это веб-MVP, НЕ «чистый дизайн»
+- Если в scoring_context есть кейс MyPortfolio — score >= 7, fit=true, suggested_project_type=Веб-MVP
+- matched_skills для лендинга: Next.js, TypeScript, Tailwind, React (если есть в github_stack/MyPortfolio)
+
 Критерии score >= 7:
-- Основная работа: Python / боты / AI / API / автоматизация / небольшой веб-MVP
-- Есть релевантный кейс в github_stack или lightrag_context
+- Основная работа: Python / боты / AI / API / автоматизация / веб-MVP / лендинг на Next.js
+- Есть релевантный кейс в github_stack или lightrag_context (для лендинга — MyPortfolio)
 - Реализуемо одним разработчиком за разумный срок
 
 Правила полей (обязательно):
