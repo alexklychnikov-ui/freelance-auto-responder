@@ -11,16 +11,27 @@ from typing import Any
 import httpx
 
 from src.adapters.kwork_pricing import (
+    budget_gap,
+    clamp_price_to_budget,
+    ensure_budget_mismatch_note,
+    format_rub_amount,
     parse_budget_ceiling_rub,
+    pick_commercial_price,
     price_exceeds_budget_ceiling,
 )
 from src.adapters.kwork import (
     KworkAdapter,
+    OfferFormSnapshot,
     _is_weak_description,
     kwork_offer_form_url,
     merge_preview_into_full,
+    read_submitted_offer_text,
 )
-from src.adapters.kwork_auth import KworkCredentials
+from src.adapters.kwork_auth import KworkAuthError, KworkCredentials, ensure_logged_in
+from src.adapters.flru import FlruAdapter, FlruAuthError
+from src.adapters.flru_urls import flru_project_url, extract_flru_project_id
+from src.adapters.yandex_urls import yandex_order_url
+from src.adapters.yandex_uslugi import YandexAuthError, YandexUslugiAdapter
 from src.analyzer.examples_loader import load_response_examples
 from src.analyzer.gpt_offer_estimator import GptOfferEstimator
 from src.analyzer.gpt_response_generator import GptResponseGenerator
@@ -34,7 +45,13 @@ from src.browser.factory import close_browser_client, get_browser_client
 from src.config import Settings, SourceConfig, get_enabled_sources, get_settings
 from src.journal.writer import JournalWriter
 from src.journal.vps_sync import sync_journal_on_vps
-from src.limits.daily import is_daily_limit_reached
+from src.pipeline.manual_copy import is_manual_copy_platform, journal_status_for_confirm
+from src.pipeline.tz_project import (
+    TZ_MANUAL_SOURCE_KEY,
+    TZ_MIN_CHARS,
+    build_tz_project,
+)
+from src.limits.daily import count_today_platform_prepared, is_daily_limit_reached
 from src.adapters.kwork_urls import kwork_project_view_url
 from src.models import PendingOffer, ProjectFull, ProjectPreview
 from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
@@ -106,7 +123,8 @@ class PipelineOrchestrator:
         self.review_service.set_submit_text_handler(self.handle_user_response_text)
         self.review_service.set_export_journal_handler(self.export_prepared_to_journal)
         self.review_service.set_scan_report_handler(self.send_scan_report)
-        self.review_service.set_manual_project_handler(self.handle_manual_kwork_project)
+        self.review_service.set_manual_project_handler(self.handle_manual_project)
+        self.review_service.set_manual_tz_handler(self.handle_manual_tz)
 
     def close(self) -> None:
         if self._browser is not None:
@@ -120,6 +138,21 @@ class PipelineOrchestrator:
         return self._browser
 
     def _default_adapter(self, source: SourceConfig, browser: Any | None = None):
+        if source.platform == "yandex_uslugi":
+            return YandexUslugiAdapter(
+                source_key=source.id,
+                listing_url=source.url or "",
+                settings=self.settings,
+                browser=browser,
+            )
+        if source.platform == "flru":
+            return FlruAdapter(
+                source_key=source.id,
+                listing_url=source.url or "",
+                settings=self.settings,
+                filters=source.filters,
+                browser=browser,
+            )
         browser = browser or self._get_browser()
         if source.platform == "kwork":
             creds = None
@@ -145,9 +178,25 @@ class PipelineOrchestrator:
                 return source
         return None
 
+    def _first_yandex_source(self) -> SourceConfig | None:
+        for source in get_enabled_sources(self.settings.sources_config_path):
+            if source.platform == "yandex_uslugi":
+                return source
+        return None
+
+    def _first_flru_source(self) -> SourceConfig | None:
+        for source in get_enabled_sources(self.settings.sources_config_path):
+            if source.platform == "flru":
+                return source
+        return None
+
     def _resolve_source_config(self, source_key: str) -> SourceConfig | None:
         if source_key == self.MANUAL_SOURCE_KEY:
             return self._first_kwork_source()
+        if source_key == self.YANDEX_MANUAL_SOURCE_KEY:
+            return self._first_yandex_source()
+        if source_key == self.FLRU_MANUAL_SOURCE_KEY:
+            return self._first_flru_source()
         return next(
             (
                 s
@@ -158,6 +207,8 @@ class PipelineOrchestrator:
         )
 
     MANUAL_SOURCE_KEY = "kwork_manual"
+    YANDEX_MANUAL_SOURCE_KEY = "yandex_manual"
+    FLRU_MANUAL_SOURCE_KEY = "flru_manual"
 
     async def process_manual_kwork_project(self, project_id: str) -> dict[str, str]:
         kwork_source = self._first_kwork_source()
@@ -210,6 +261,23 @@ class PipelineOrchestrator:
                     f"⚠️ Kwork login failed ({source.id}): {exc}"
                 )
                 continue
+            except YandexAuthError as exc:
+                # Soft fail: no crash loop. not_logged_in → log only (avoid TG spam).
+                msg = str(exc)
+                logger.error("Yandex auth/scan failed for %s: %s", source.id, msg)
+                if "not_logged_in" not in msg:
+                    await self.review_service.tg_bot.notify(
+                        f"⚠️ Яндекс Услуги ({source.id}): {html.escape(msg[:400])}"
+                    )
+                continue
+            except FlruAuthError as exc:
+                msg = str(exc)
+                logger.error("FL.ru auth/scan failed for %s: %s", source.id, msg)
+                if "not_logged_in" not in msg:
+                    await self.review_service.tg_bot.notify(
+                        f"⚠️ FL.ru ({source.id}): {html.escape(msg[:400])}"
+                    )
+                continue
             bootstrap = self._is_bootstrap(source)
 
             known_streak = 0
@@ -224,7 +292,14 @@ class PipelineOrchestrator:
                 if known:
                     totals["skipped"] += 1
                     known_streak += 1
-                    if known_streak >= self.settings.scan_early_exit_known_count:
+                    # Early-exit only on long listings (Kwork). Short cab pages
+                    # (Yandex/FL.ru ~10–30) mix known+new — cutting after N known
+                    # misses new cards at the bottom.
+                    if (
+                        len(previews)
+                        > max(40, self.settings.scan_early_exit_known_count * 4)
+                        and known_streak >= self.settings.scan_early_exit_known_count
+                    ):
                         break
                     continue
 
@@ -311,6 +386,14 @@ class PipelineOrchestrator:
         return totals
 
     def _scan_listings(self, source: SourceConfig) -> list[Any]:
+        if source.platform in ("yandex_uslugi", "flru"):
+            adapter = self._adapter_factory(source, None)
+            try:
+                return adapter.scan_new()
+            finally:
+                close = getattr(adapter, "close", None)
+                if callable(close):
+                    close()
         browser = get_browser_client(self.settings)
         try:
             adapter = self._adapter_factory(source, browser)
@@ -319,6 +402,14 @@ class PipelineOrchestrator:
             close_browser_client(browser)
 
     def _read_full_listing(self, source: SourceConfig, project_id: str) -> ProjectFull:
+        if source.platform in ("yandex_uslugi", "flru"):
+            adapter = self._adapter_factory(source, None)
+            try:
+                return adapter.read_full(project_id)
+            finally:
+                close = getattr(adapter, "close", None)
+                if callable(close):
+                    close()
         browser = get_browser_client(self.settings)
         try:
             adapter = self._adapter_factory(source, browser)
@@ -374,6 +465,42 @@ class PipelineOrchestrator:
                 title,
                 len(desc),
                 len(page_desc),
+            )
+            self.repository.update_status(
+                full.platform,
+                full.source_key,
+                full.project_id,
+                "skipped",
+            )
+            return "extract_fail"
+
+        return await self._process_project_full(full, manual=manual)
+
+    async def _process_project_full(
+        self, full: ProjectFull, *, manual: bool = False
+    ) -> str:
+        title = (full.title or "").strip()
+        desc = (full.full_description or "").strip()
+        if not title or len(desc) < 20:
+            logger.warning(
+                "extract_fail project_id=%s title=%r desc_len=%s",
+                full.project_id,
+                title,
+                len(desc),
+            )
+            self.repository.update_status(
+                full.platform,
+                full.source_key,
+                full.project_id,
+                "skipped",
+            )
+            return "extract_fail"
+        if _is_weak_description(title, desc):
+            logger.warning(
+                "extract_fail_weak_desc project_id=%s title=%r desc_len=%s",
+                full.project_id,
+                title,
+                len(desc),
             )
             self.repository.update_status(
                 full.platform,
@@ -447,7 +574,10 @@ class PipelineOrchestrator:
             status="approved",
             approved_at=datetime.now(timezone.utc),
         )
-        if self.settings.prepare_only_no_submit:
+        if is_manual_copy_platform(full.platform):
+            await self._ensure_response_text(offer)
+            await self._send_manual_copy(offer)
+        elif self.settings.prepare_only_no_submit:
             await self._prepare_offer_on_site(offer)
         else:
             await self._ensure_response_text(offer)
@@ -481,6 +611,8 @@ class PipelineOrchestrator:
         return False
 
     async def _refresh_offer_project(self, offer: PendingOffer) -> ProjectFull:
+        if offer.source_key == TZ_MANUAL_SOURCE_KEY:
+            return offer.project
         brief = build_project_brief(offer.project)
         if len(brief) >= 80 and len(offer.project.full_description or "") >= 40:
             return offer.project
@@ -520,6 +652,21 @@ class PipelineOrchestrator:
         recent = await asyncio.to_thread(
             load_recent_response_context, self.prepared_store
         )
+        fair_price = 0
+        try:
+            fair_price = int(
+                await asyncio.to_thread(
+                    self.offer_estimator.estimate_market_cost,
+                    offer.project,
+                    context,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "fair_price_estimate_failed project_id=%s", offer.project_id
+            )
+        gap = budget_gap(fair_price, offer.project) if fair_price > 0 else None
+        price_hint: int | str | None = fair_price if fair_price > 0 else None
         gen = self.response_generator
         gen_with = getattr(gen, "generate_with_progress", None)
         if (
@@ -533,6 +680,8 @@ class PipelineOrchestrator:
                 notify=notify,
                 examples=examples,
                 recent_responses=recent,
+                price_hint=price_hint,
+                budget_mismatch=gap,
             )
         else:
             text = await asyncio.to_thread(
@@ -541,8 +690,11 @@ class PipelineOrchestrator:
                 context,
                 examples=examples,
                 recent_responses=recent,
+                price_hint=price_hint,
+                budget_mismatch=gap,
             )
-        return finalize_response_text(text.strip(), offer.project)
+        text = finalize_response_text(text.strip(), offer.project)
+        return ensure_budget_mismatch_note(text, gap)
 
     async def _ensure_response_text(
         self,
@@ -618,6 +770,10 @@ class PipelineOrchestrator:
         offer.draft_message_id = link_msg_id
         self.review_service.store.save(offer)
 
+        if is_manual_copy_platform(platform):
+            await self._send_manual_copy(offer)
+            return
+
         if self.settings.prepare_only_no_submit:
             await self._prepare_offer_on_site(offer)
         else:
@@ -646,6 +802,9 @@ class PipelineOrchestrator:
         if prepared is not None and (prepared.response_text or "").strip():
             offer.response_text = prepared.response_text
             self.review_service.store.save(offer)
+        if is_manual_copy_platform(platform):
+            await self._send_manual_copy(offer)
+            return
         await self._prepare_offer_on_site(offer)
 
     async def handle_regenerate_response(
@@ -682,6 +841,10 @@ class PipelineOrchestrator:
             )
             return
 
+        if is_manual_copy_platform(platform):
+            await self._send_manual_copy(offer)
+            return
+
         if self.settings.prepare_only_no_submit:
             await self._prepare_offer_on_site(offer)
         else:
@@ -702,6 +865,10 @@ class PipelineOrchestrator:
         offer.response_text = finalize_response_text(text.strip(), offer.project)
         self.review_service.store.save(offer)
 
+        if is_manual_copy_platform(offer.platform):
+            await self._send_manual_copy(offer)
+            return
+
         if self.settings.prepare_only_no_submit:
             await self._prepare_offer_on_site(offer)
             return
@@ -711,6 +878,101 @@ class PipelineOrchestrator:
             offer.source_key,
             offer.project_id,
             offer,
+        )
+
+    async def _send_manual_copy(self, offer: PendingOffer) -> None:
+        """Manual-copy platforms: text + estimate to TG, no site prepare/submit."""
+        platform = offer.platform
+        response_text = await self._ensure_response_text(offer)
+        await self._refresh_offer_project(offer)
+        context = await asyncio.to_thread(self.lightrag.get_full_context)
+
+        soft_limits = {
+            "yandex_uslugi": int(self.settings.yandex_max_daily_responses or 7),
+            "flru": int(self.settings.flru_max_daily_responses or 10),
+        }
+        platform_labels = {
+            "yandex_uslugi": "Яндекс Услуги",
+            "flru": "FL.ru",
+        }
+        today_count = count_today_platform_prepared(self.prepared_store, platform)
+        soft_limit = soft_limits.get(platform, 10)
+        label = platform_labels.get(platform, platform)
+        if today_count >= soft_limit:
+            await self.review_service.tg_bot.notify(
+                f"⚠️ {label}: сегодня уже ~{today_count} откликов "
+                f"(мягкий лимит {soft_limit}/сутки). "
+                "Генерирую всё равно — копируй вручную осторожно."
+            )
+
+        terms = await asyncio.to_thread(
+            self.offer_estimator.estimate,
+            offer.project,
+            response_text,
+            lightrag_context=context,
+        )
+        fair_price = 0
+        try:
+            fair_price = int(
+                await asyncio.to_thread(
+                    self.offer_estimator.estimate_market_cost,
+                    offer.project,
+                    context,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "manual_copy_fair_price_failed project_id=%s platform=%s",
+                offer.project_id,
+                platform,
+            )
+        offer_price = int(terms.price_rub or 0)
+        commercial = pick_commercial_price(fair_price, offer_price)
+        gap_fair = fair_price if fair_price > 0 else offer_price
+        gap = budget_gap(gap_fair, offer.project) if gap_fair > 0 else None
+        price_rub = (
+            int(gap["fill_price"])
+            if gap
+            else clamp_price_to_budget(commercial, offer.project)
+        )
+        price_rub = clamp_price_to_budget(price_rub, offer.project)
+        delivery_days = terms.delivery_days
+        tier = offer.acceptance_tier or resolve_acceptance_tier(
+            offer.project, offer.score, self.settings
+        )
+        if tier in ("quick_win", "experience_win"):
+            delivery_days = min(
+                delivery_days, self.settings.quick_win_max_delivery_days
+            )
+
+        response_text = append_missing_checklist_answers(
+            response_text,
+            offer.project,
+            price_rub=gap_fair if gap else price_rub,
+            delivery_days=delivery_days,
+        )
+        response_text = ensure_budget_mismatch_note(response_text, gap)
+        if response_text != (offer.response_text or ""):
+            offer.response_text = response_text
+            self.review_service.store.save(offer)
+
+        price = str(price_rub)
+        await self._save_prepared_response(
+            offer, response_text, price, delivery_days
+        )
+        if platform == "yandex_uslugi":
+            project_url = offer.url or yandex_order_url(offer.project_id)
+        elif platform == "flru":
+            project_url = offer.url or flru_project_url(offer.project_id)
+        else:
+            project_url = offer.url or ""
+        await self.review_service.tg_bot.send_manual_copy(
+            offer,
+            response_text=response_text,
+            price=price,
+            delivery_days=delivery_days,
+            project_url=project_url,
+            soft_limit=soft_limit,
         )
 
     async def _prepare_offer_on_site(self, offer: PendingOffer) -> None:
@@ -730,21 +992,50 @@ class PipelineOrchestrator:
             response_text,
             lightrag_context=context,
         )
-        price = str(terms.price_rub)
+        fair_price = 0
+        try:
+            fair_price = int(
+                await asyncio.to_thread(
+                    self.offer_estimator.estimate_market_cost,
+                    offer.project,
+                    context,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "fair_price_estimate_failed project_id=%s", offer.project_id
+            )
+        # commercial = min(market, offer) for TG/form when no gap; gap uses market fair.
+        offer_price = int(terms.price_rub or 0)
+        commercial = pick_commercial_price(fair_price, offer_price)
+        gap_fair = fair_price if fair_price > 0 else offer_price
+        gap = budget_gap(gap_fair, offer.project) if gap_fair > 0 else None
+        fill_price = (
+            int(gap["fill_price"])
+            if gap
+            else clamp_price_to_budget(commercial, offer.project)
+        )
+        # Always clamp form fill to ceiling / project budget (never put fair into form).
+        fill_price = clamp_price_to_budget(fill_price, offer.project)
+        price = str(fill_price)
         delivery_days = terms.delivery_days
         tier = offer.acceptance_tier or resolve_acceptance_tier(
             offer.project, offer.score, self.settings
         )
-        if tier == "quick_win":
+        if tier in ("quick_win", "experience_win"):
             delivery_days = min(
                 delivery_days, self.settings.quick_win_max_delivery_days
             )
         response_text = append_missing_checklist_answers(
             response_text,
             offer.project,
-            price_rub=terms.price_rub,
+            price_rub=gap_fair if gap else fill_price,
             delivery_days=delivery_days,
         )
+        response_text = ensure_budget_mismatch_note(response_text, gap)
+        if response_text != (offer.response_text or ""):
+            offer.response_text = response_text
+            self.review_service.store.save(offer)
 
         def _run_prepare(text: str, price_val: str, days: int):
             browser = get_browser_client(self.settings)
@@ -767,9 +1058,28 @@ class PipelineOrchestrator:
         result = None
         last_msg = ""
         try:
+            ceiling = (
+                int(gap["ceiling"])
+                if gap
+                else parse_budget_ceiling_rub(offer.project)
+            )
+            # Gap: show market fair + потолок. No gap: same commercial for TG and form.
+            notify_price = gap_fair if gap else (
+                commercial if commercial > 0 else fill_price
+            )
+            if gap and ceiling is not None:
+                estimate_line = (
+                    f"Оценка: {format_rub_amount(notify_price)} ₽ "
+                    f"(потолок {format_rub_amount(ceiling)}) · "
+                    f"{delivery_days} дн."
+                )
+            else:
+                estimate_line = (
+                    f"Оценка: {format_rub_amount(notify_price)} ₽ "
+                    f"· {delivery_days} дн."
+                )
             await self.review_service.tg_bot.notify(
-                f"⏳ Готовлю отклик: {html.escape(offer.title)}\n"
-                f"Оценка: {price} ₽ · {delivery_days} дн."
+                f"⏳ Готовлю отклик: {html.escape(offer.title)}\n{estimate_line}"
             )
             for attempt in range(max_attempts):
                 if attempt > 0:
@@ -801,14 +1111,45 @@ class PipelineOrchestrator:
                             response_text,
                             lightrag_context=context,
                         )
-                        price = str(terms.price_rub)
+                        fair_price = 0
+                        try:
+                            fair_price = int(
+                                await asyncio.to_thread(
+                                    self.offer_estimator.estimate_market_cost,
+                                    offer.project,
+                                    context,
+                                )
+                            )
+                        except Exception:
+                            logger.exception(
+                                "fair_price_estimate_failed project_id=%s",
+                                offer.project_id,
+                            )
+                        offer_price = int(terms.price_rub or 0)
+                        commercial = pick_commercial_price(fair_price, offer_price)
+                        gap_fair = fair_price if fair_price > 0 else offer_price
+                        gap = (
+                            budget_gap(gap_fair, offer.project)
+                            if gap_fair > 0
+                            else None
+                        )
+                        fill_price = (
+                            int(gap["fill_price"])
+                            if gap
+                            else clamp_price_to_budget(commercial, offer.project)
+                        )
+                        fill_price = clamp_price_to_budget(fill_price, offer.project)
+                        price = str(fill_price)
                         delivery_days = terms.delivery_days
                         response_text = append_missing_checklist_answers(
                             response_text,
                             offer.project,
-                            price_rub=terms.price_rub,
+                            price_rub=gap_fair if gap else fill_price,
                             delivery_days=delivery_days,
                         )
+                        response_text = ensure_budget_mismatch_note(response_text, gap)
+                        offer.response_text = response_text
+                        self.review_service.store.save(offer)
 
                 result = await asyncio.to_thread(
                     _run_prepare, response_text, price, delivery_days
@@ -916,13 +1257,55 @@ class PipelineOrchestrator:
         item.journal_confirmed = True
         self.prepared_store.save(item)
 
+        response_text = item.response_text
+        price = item.price
+        delivery_days = item.delivery_days
+        if platform == "kwork":
+            try:
+                snap = await asyncio.to_thread(
+                    self._fetch_submitted_offer_text, project_id
+                )
+            except Exception as exc:
+                logger.warning(
+                    "journal_confirm_kwork_read_failed project_id=%s err=%s",
+                    project_id,
+                    exc,
+                )
+                snap = OfferFormSnapshot(
+                    description="", ok=False, error=f"read_exception: {exc}"
+                )
+            if snap.ok and (snap.description or "").strip():
+                response_text = snap.description.strip()
+                if snap.price:
+                    price = snap.price
+                if snap.delivery_days is not None:
+                    delivery_days = snap.delivery_days
+                item.response_text = response_text
+                item.price = price
+                item.delivery_days = delivery_days
+                self.prepared_store.save(item)
+                logger.info(
+                    "journal_confirm_used_kwork_text project_id=%s len=%d",
+                    project_id,
+                    len(response_text),
+                )
+            elif snap.error:
+                logger.warning(
+                    "journal_confirm_fallback_prepared project_id=%s err=%s",
+                    project_id,
+                    snap.error,
+                )
+
+        journal_status, journal_result = journal_status_for_confirm(platform)
         try:
             row = self.journal.append_prepared(
                 item.project,
                 item.score,
-                item.response_text,
-                price=item.price,
-                delivery_days=item.delivery_days,
+                response_text,
+                price=price,
+                delivery_days=delivery_days,
+                status=journal_status,
+                result=journal_result,
             )
         except Exception as exc:
             item.journal_confirmed = False
@@ -950,6 +1333,17 @@ class PipelineOrchestrator:
             "На ПК: /journal в TG — пришлёт актуальный journal.xlsx с VPS."
         )
         logger.info("journal_confirmed project_id=%s row=%s", project_id, row)
+
+    def _fetch_submitted_offer_text(self, project_id: str) -> OfferFormSnapshot:
+        browser = get_browser_client(self.settings)
+        try:
+            if pair := self.settings.kwork_credentials():
+                ensure_logged_in(
+                    browser, KworkCredentials(login=pair[0], password=pair[1])
+                )
+            return read_submitted_offer_text(browser, project_id)
+        finally:
+            close_browser_client(browser)
 
     async def _save_prepared_response(
         self,
@@ -1094,6 +1488,158 @@ class PipelineOrchestrator:
             parse_mode="HTML",
         )
         await self.process_manual_kwork_project(project_id)
+
+    async def process_manual_yandex_order(self, order_id: str) -> dict[str, str]:
+        yandex_source = self._first_yandex_source()
+        if yandex_source is None:
+            raise RuntimeError(
+                "Нет включённого источника yandex_uslugi в config/sources.yaml"
+            )
+        oid = order_id.lower().strip()
+        preview = ProjectPreview(
+            platform="yandex_uslugi",
+            source_key=self.YANDEX_MANUAL_SOURCE_KEY,
+            project_id=oid,
+            url=yandex_order_url(oid),
+            title="",
+        )
+        if not self.repository.is_known(
+            preview.platform, preview.source_key, preview.project_id
+        ):
+            self.repository.insert_new(
+                platform=preview.platform,
+                source_key=preview.source_key,
+                project_id=preview.project_id,
+                url=preview.url,
+                status="new",
+            )
+        try:
+            outcome = await self._process_new_project(
+                yandex_source, preview, manual=True
+            )
+        except Exception as exc:
+            logger.exception("manual_yandex_order_failed project_id=%s", oid)
+            await self.review_service.tg_bot.notify(
+                f"⚠️ Не удалось обработать заказ Яндекс {oid}: {exc}"
+            )
+            return {"project_id": oid, "outcome": "error"}
+        return {"project_id": oid, "outcome": outcome}
+
+    async def process_manual_flru_project(self, project_id: str) -> dict[str, str]:
+        flru_source = self._first_flru_source()
+        if flru_source is None:
+            raise RuntimeError(
+                "Нет включённого источника flru в config/sources.yaml"
+            )
+        pid = str(project_id).strip()
+        preview = ProjectPreview(
+            platform="flru",
+            source_key=self.FLRU_MANUAL_SOURCE_KEY,
+            project_id=pid,
+            url=flru_project_url(pid),
+            title="",
+        )
+        if not self.repository.is_known(
+            preview.platform, preview.source_key, preview.project_id
+        ):
+            self.repository.insert_new(
+                platform=preview.platform,
+                source_key=preview.source_key,
+                project_id=preview.project_id,
+                url=preview.url,
+                status="new",
+            )
+        try:
+            outcome = await self._process_new_project(
+                flru_source, preview, manual=True
+            )
+        except Exception as exc:
+            logger.exception("manual_flru_project_failed project_id=%s", pid)
+            await self.review_service.tg_bot.notify(
+                f"⚠️ Не удалось обработать проект FL.ru {pid}: {exc}"
+            )
+            return {"project_id": pid, "outcome": "error"}
+        return {"project_id": pid, "outcome": outcome}
+
+    async def handle_manual_project(
+        self, message: Any, project_id: str, *, platform: str | None = None
+    ) -> None:
+        pid = (project_id or "").strip()
+        if platform is None:
+            if re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                pid,
+                flags=re.I,
+            ):
+                platform = "yandex_uslugi"
+            elif extract_flru_project_id(pid) or (
+                pid.isdigit() and len(pid) >= 6 and "fl.ru" in (getattr(message, "text", "") or "")
+            ):
+                platform = "flru"
+            else:
+                platform = "kwork"
+        if platform == "yandex_uslugi":
+            await message.answer(
+                f"🔍 Загружаю заказ Яндекс Услуги "
+                f"<code>{html.escape(pid)}</code>…",
+                parse_mode="HTML",
+            )
+            await self.process_manual_yandex_order(pid)
+            return
+        if platform == "flru":
+            await message.answer(
+                f"🔍 Загружаю проект FL.ru <code>{html.escape(pid)}</code>…",
+                parse_mode="HTML",
+            )
+            await self.process_manual_flru_project(pid)
+            return
+        await self.handle_manual_kwork_project(message, pid)
+
+    async def handle_manual_tz(self, message: Any, text: str) -> None:
+        body = (text or "").strip()
+        if len(body) < TZ_MIN_CHARS:
+            await message.answer(
+                f"Слишком короткий текст (минимум {TZ_MIN_CHARS} символов). "
+                "Пришли полное ТЗ: /tz <текст>"
+            )
+            return
+        preview_title = body.splitlines()[0][:80] if body else "ТЗ"
+        await message.answer(
+            f"🔍 Обрабатываю ТЗ: <code>{html.escape(preview_title)}</code>…",
+            parse_mode="HTML",
+        )
+        await self.process_manual_tz_text(body)
+
+    async def process_manual_tz_text(self, text: str) -> dict[str, str]:
+        full = build_tz_project(text)
+        if not self.repository.is_known(
+            full.platform, full.source_key, full.project_id
+        ):
+            self.repository.insert_new(
+                platform=full.platform,
+                source_key=full.source_key,
+                project_id=full.project_id,
+                url=full.url,
+                title=full.title,
+                status="new",
+            )
+        try:
+            outcome = await self._process_project_full(full, manual=True)
+        except Exception as exc:
+            logger.exception("manual_tz_failed project_id=%s", full.project_id)
+            await self.review_service.tg_bot.notify(
+                f"⚠️ Не удалось обработать ТЗ: {html.escape(str(exc)[:300])}"
+            )
+            return {"project_id": full.project_id, "outcome": "error"}
+        if outcome == "extract_fail":
+            await self.review_service.tg_bot.notify(
+                "⚠️ Текст ТЗ слишком короткий или нечитаемый для анализа."
+            )
+        elif outcome == "stack_reject":
+            await self.review_service.tg_bot.notify(
+                f"⏭ Пропущено (не наш стек): {html.escape(full.title)}"
+            )
+        return {"project_id": full.project_id, "outcome": outcome}
 
 
 def build_orchestrator(settings: Settings | None = None) -> PipelineOrchestrator:

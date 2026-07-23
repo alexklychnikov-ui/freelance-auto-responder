@@ -455,6 +455,7 @@ async def test_handle_approved_unknown_source_notifies(
 async def test_journal_confirm_writes_excel(
     settings: Settings, project_full: ProjectFull, score: GptScoreResult
 ) -> None:
+    from src.adapters.kwork import OfferFormSnapshot
     from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
     from unittest.mock import MagicMock
 
@@ -483,6 +484,9 @@ async def test_journal_confirm_writes_excel(
     callback.answer = AsyncMock()
     orch.review_service.tg_bot.mark_journal_confirmed = AsyncMock()
     orch.review_service.tg_bot.notify = AsyncMock()
+    orch._fetch_submitted_offer_text = MagicMock(
+        return_value=OfferFormSnapshot(description="", ok=False, error="skip")
+    )
 
     await orch.handle_journal_confirm(
         "kwork", "kwork_dev_it", "999", callback
@@ -496,6 +500,130 @@ async def test_journal_confirm_writes_excel(
 
     wb = load_workbook(settings.response_journal)
     assert wb.active.max_row >= 2
+
+
+@pytest.mark.asyncio
+async def test_journal_confirm_uses_kwork_platform_text(
+    settings: Settings, project_full: ProjectFull, score: GptScoreResult
+) -> None:
+    from src.adapters.kwork import OfferFormSnapshot
+    from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
+    from openpyxl import load_workbook
+    from unittest.mock import MagicMock
+
+    orch, _ = _make_orchestrator(
+        settings, previews=[], project_full=project_full, score=score
+    )
+    store = PreparedResponseStore(
+        Path(settings.database_path).parent / "prepared"
+    )
+    orch.prepared_store = store
+    item = PreparedResponse(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="999",
+        url=project_full.url,
+        title=project_full.title,
+        project=project_full,
+        score=score,
+        response_text="AI ONLY DRAFT",
+        price="5000",
+        delivery_days=7,
+    )
+    store.save(item)
+
+    callback = MagicMock()
+    callback.answer = AsyncMock()
+    orch.review_service.tg_bot.mark_journal_confirmed = AsyncMock()
+    orch.review_service.tg_bot.notify = AsyncMock()
+    platform_text = "Edited offer text from Kwork form " + ("y" * 40)
+    orch._fetch_submitted_offer_text = MagicMock(
+        return_value=OfferFormSnapshot(
+            description=platform_text,
+            price="8800",
+            delivery_days=10,
+            ok=True,
+        )
+    )
+
+    await orch.handle_journal_confirm(
+        "kwork", "kwork_dev_it", "999", callback
+    )
+
+    saved = store.load("kwork", "kwork_dev_it", "999")
+    assert saved is not None
+    assert saved.response_text == platform_text
+    assert saved.price == "8800"
+    assert saved.delivery_days == 10
+
+    wb = load_workbook(settings.response_journal)
+    cell = str(wb.active.cell(row=2, column=9).value or "")
+    assert "Edited offer text from Kwork form" in cell
+    assert "AI ONLY DRAFT" not in cell
+    assert "8800" in cell
+
+
+@pytest.mark.asyncio
+async def test_journal_confirm_skips_kwork_snapshot_for_non_kwork(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
+    from unittest.mock import MagicMock
+
+    yandex_id = "342870b9-bea4-40b7-a616-81061dc845db"
+    project = ProjectFull(
+        platform="yandex_uslugi",
+        source_key="yandex_uslugi_it",
+        project_id=yandex_id,
+        url=f"https://uslugi.yandex.ru/order/{yandex_id}",
+        title="Yandex order",
+        full_description="desc",
+    )
+    orch, _ = _make_orchestrator(
+        settings, previews=[], project_full=project, score=score
+    )
+    store = PreparedResponseStore(
+        Path(settings.database_path).parent / "prepared"
+    )
+    orch.prepared_store = store
+    item = PreparedResponse(
+        platform="yandex_uslugi",
+        source_key="yandex_uslugi_it",
+        project_id=yandex_id,
+        url=project.url,
+        title=project.title,
+        project=project,
+        score=score,
+        response_text="Yandex prepared text",
+        price="3000",
+        delivery_days=5,
+    )
+    store.save(item)
+
+    callback = MagicMock()
+    callback.answer = AsyncMock()
+    orch.review_service.tg_bot.mark_journal_confirmed = AsyncMock()
+    orch.review_service.tg_bot.notify = AsyncMock()
+    orch._fetch_submitted_offer_text = MagicMock(
+        side_effect=AssertionError("kwork snapshot must not run for yandex")
+    )
+
+    await orch.handle_journal_confirm(
+        "yandex_uslugi", "yandex_uslugi_it", yandex_id, callback
+    )
+
+    orch._fetch_submitted_offer_text.assert_not_called()
+    saved = store.load("yandex_uslugi", "yandex_uslugi_it", yandex_id)
+    assert saved is not None
+    assert saved.journal_exported is True
+    assert saved.response_text == "Yandex prepared text"
+
+    from openpyxl import load_workbook
+
+    wb = load_workbook(settings.response_journal)
+    assert wb.active.cell(row=2, column=6).value == "Отправлен"
+    assert wb.active.cell(row=2, column=7).value == "Жду ответа"
+    wb.close()
 
 
 @pytest.mark.asyncio
@@ -586,6 +714,181 @@ async def test_prepare_offer_resolves_kwork_manual_source(
     )
     await orch._prepare_offer_on_site(offer)
     mock_adapter.prepare_response.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_prepare_uses_same_commercial_price_for_tg_and_form(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    """Market 40k + offer terms 60k → both TG Оценка and form use min (40k)."""
+    settings.prepare_only_no_submit = True
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="dual_price",
+        url="https://kwork.ru/projects/dual_price",
+        title="Dual price project",
+        full_description="Python bot with integrations.",
+        desired_budget="до 20 000 ₽",
+        max_budget="до 100 000 ₽",
+    )
+    orch, mock_adapter = _make_orchestrator(
+        settings,
+        previews=[],
+        project_full=project,
+        score=score,
+    )
+    orch.offer_estimator.estimate.return_value = OfferTerms(
+        price_rub=60_000, delivery_days=10, plan_summary=""
+    )
+    orch.offer_estimator.estimate_market_cost.return_value = 40_000
+    mock_adapter.prepare_response.return_value = MagicMock(
+        success=True,
+        project_id="dual_price",
+        message="prepared",
+    )
+    offer = PendingOffer(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="dual_price",
+        url=project.url,
+        title=project.title,
+        project=project,
+        score=score,
+        created_at=datetime.now(timezone.utc),
+        status="approved",
+        approved_at=datetime.now(timezone.utc),
+        response_text="Срок — 10 дней. Стоимость — от 40 000 ₽.",
+    )
+    await orch._prepare_offer_on_site(offer)
+    prepared_price = mock_adapter.prepare_response.call_args.args[2]
+    assert prepared_price == "40000"
+    ready_kw = orch.review_service.tg_bot.send_form_prepared_ready.call_args.kwargs
+    assert ready_kw["price"] == "40000"
+    notify_text = " ".join(
+        str(c.args[0]) for c in orch.review_service.tg_bot.notify.await_args_list
+    )
+    assert "40 000" in notify_text
+    assert "60 000" not in notify_text
+
+
+@pytest.mark.asyncio
+async def test_prepare_budget_gap_clamps_form_price_and_appends_note(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    settings.prepare_only_no_submit = True
+    cheap = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="999",
+        url="https://kwork.ru/projects/999",
+        title="Big bot tiny budget",
+        full_description="Нужен сложный AI Telegram-бот с интеграциями.",
+        max_budget="до 1 500 ₽",
+    )
+    orch, mock_adapter = _make_orchestrator(
+        settings,
+        previews=[],
+        project_full=cheap,
+        score=score,
+    )
+    orch.offer_estimator.estimate.return_value = OfferTerms(
+        price_rub=1500, delivery_days=14, plan_summary=""
+    )
+    orch.offer_estimator.estimate_market_cost.return_value = 20_000
+    mock_adapter.prepare_response.return_value = MagicMock(
+        success=True,
+        project_id="999",
+        message="prepared",
+    )
+    offer = PendingOffer(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="999",
+        url=cheap.url,
+        title=cheap.title,
+        project=cheap,
+        score=score,
+        created_at=datetime.now(timezone.utc),
+        status="approved",
+        approved_at=datetime.now(timezone.utc),
+        response_text=(
+            "Соберу бота под задачу.\n"
+            "Срок — 14 дней. Стоимость — от 20 000 ₽.\n"
+            "Предлагаю обсудить детали и приступить."
+        ),
+    )
+    await orch._prepare_offer_on_site(offer)
+    mock_adapter.prepare_response.assert_called_once()
+    args = mock_adapter.prepare_response.call_args
+    # prepare_response(project_id, text, price, ...)
+    prepared_text = args.args[1] if args.args else args.kwargs.get("text")
+    prepared_price = args.args[2] if len(args.args) > 2 else args.kwargs.get("price")
+    assert prepared_price == "1500"
+    assert "обсудить сумму" in prepared_text.lower()
+    assert "занижен" in prepared_text.lower()
+    notify_text = " ".join(
+        str(c.args[0]) for c in orch.review_service.tg_bot.notify.await_args_list
+    )
+    assert "20 000" in notify_text or "20000" in notify_text.replace(" ", "")
+    assert "1500" in notify_text.replace(" ", "") or "1 500" in notify_text
+
+
+@pytest.mark.asyncio
+async def test_prepare_budget_gap_from_desired_only_shows_ceiling_in_tg(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    """3218308: max_budget None, desired «до 1 500» — still gap + потолок in TG."""
+    settings.prepare_only_no_submit = True
+    cheap = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3218308",
+        url="https://kwork.ru/projects/3218308",
+        title="Checko Python",
+        full_description="Интеграция Checko API на Python.",
+        desired_budget="до 1 500 ₽",
+        max_budget=None,
+    )
+    orch, mock_adapter = _make_orchestrator(
+        settings,
+        previews=[],
+        project_full=cheap,
+        score=score,
+    )
+    orch.offer_estimator.estimate.return_value = OfferTerms(
+        price_rub=25_000, delivery_days=7, plan_summary=""
+    )
+    orch.offer_estimator.estimate_market_cost.return_value = 25_000
+    mock_adapter.prepare_response.return_value = MagicMock(
+        success=True,
+        project_id="3218308",
+        message="prepared",
+    )
+    offer = PendingOffer(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3218308",
+        url=cheap.url,
+        title=cheap.title,
+        project=cheap,
+        score=score,
+        created_at=datetime.now(timezone.utc),
+        status="approved",
+        approved_at=datetime.now(timezone.utc),
+        response_text="Срок — 7 дней. Стоимость — от 25 000 ₽.",
+    )
+    await orch._prepare_offer_on_site(offer)
+    args = mock_adapter.prepare_response.call_args
+    prepared_text = args.args[1] if args.args else args.kwargs.get("text")
+    prepared_price = args.args[2] if len(args.args) > 2 else args.kwargs.get("price")
+    assert prepared_price == "1500"
+    assert "обсудить сумму" in prepared_text.lower()
+    notify_text = " ".join(
+        str(c.args[0]) for c in orch.review_service.tg_bot.notify.await_args_list
+    )
+    assert "потолок" in notify_text.lower()
+    assert "1 500" in notify_text or "1500" in notify_text.replace(" ", "")
 
 
 @pytest.mark.asyncio

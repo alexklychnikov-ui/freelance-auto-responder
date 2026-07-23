@@ -17,7 +17,9 @@ from aiogram.types import (
     Message,
 )
 
+from src.adapters.flru_urls import extract_flru_project_id
 from src.adapters.kwork_urls import extract_kwork_project_id
+from src.adapters.yandex_urls import extract_yandex_order_id
 from src.analyzer.project_tier import resolve_acceptance_tier, tier_label
 from src.config import get_settings
 from src.models import GptScoreResult, PendingOffer, ProjectFull
@@ -28,11 +30,37 @@ PLATFORM_LABELS = {
     "kwork": "Kwork",
     "flru": "FL.ru",
     "telegram": "Telegram",
+    "yandex_uslugi": "Яндекс Услуги",
 }
 
 SOURCE_LABELS = {
     "kwork_manual": "Kwork · ручной",
+    "yandex_manual": "Яндекс · ручной",
+    "flru_manual": "FL.ru · ручной",
+    "tz_manual": "ТЗ · ручной",
+    "yandex_uslugi_it": "Яндекс IT",
+    "flru_orders": "FL.ru заказы",
 }
+
+# Short aliases — Telegram callback_data max 64 bytes (UUID project ids).
+_CB_PLATFORM = {
+    "yandex_uslugi": "ya",
+    "kwork": "kwork",
+    "flru": "flru",
+    "telegram": "tg",
+}
+_CB_PLATFORM_REV = {v: k for k, v in _CB_PLATFORM.items()}
+_CB_PLATFORM_REV.update({k: k for k in _CB_PLATFORM})
+
+_CB_SOURCE = {
+    "yandex_uslugi_it": "yai",
+    "yandex_manual": "yam",
+    "flru_orders": "flo",
+    "flru_manual": "flm",
+    "tz_manual": "tzm",
+}
+_CB_SOURCE_REV = {v: k for k, v in _CB_SOURCE.items()}
+_CB_SOURCE_REV.update({k: k for k in _CB_SOURCE})
 
 CALLBACK_APPROVE = "approve"
 CALLBACK_REJECT = "reject"
@@ -61,20 +89,32 @@ def _chunk_text(text: str, max_len: int = 4000) -> list[str]:
 
 def _project_view_url(url: str) -> str:
     base = url.rstrip("/")
+    if "uslugi.yandex.ru" in base:
+        return base
+    if "fl.ru/projects/" in base:
+        return base
     if base.endswith("/view"):
         return base
     return f"{base}/view"
 
 
 def _callback_data(action: str, platform: str, source_key: str, project_id: str) -> str:
-    return f"{action}:{platform}:{source_key}:{project_id}"
+    p = _CB_PLATFORM.get(platform, platform)
+    s = _CB_SOURCE.get(source_key, source_key)
+    data = f"{action}:{p}:{s}:{project_id}"
+    if len(data.encode("utf-8")) > 64:
+        logger.warning("callback_data_too_long len=%s data=%s", len(data), data[:80])
+    return data
 
 
 def parse_callback_data(data: str) -> tuple[str, str, str, str] | None:
     parts = data.split(":", 3)
     if len(parts) != 4:
         return None
-    return parts[0], parts[1], parts[2], parts[3]
+    action, platform, source_key, project_id = parts
+    platform = _CB_PLATFORM_REV.get(platform, platform)
+    source_key = _CB_SOURCE_REV.get(source_key, source_key)
+    return action, platform, source_key, project_id
 
 
 def _format_budget(value: str | None) -> str:
@@ -107,43 +147,48 @@ def format_review_card(offer: PendingOffer) -> str:
     if tier_badge:
         header += f"{tier_badge}\n"
 
-    return (
-        header
-        + f"📌 {offer.title}\n"
+    body = (
+        f"📌 {offer.title}\n"
         f"💰 {desired} / {max_b}\n"
         f"👥 Откликов: {project.offers_count if project.offers_count is not None else '—'} · "
         f"Покупатель: {project.buyer or '—'} ({hire})\n"
         f"⏱ {project.time_left or '—'}\n"
-        f"🔗 {offer.url}\n\n"
-        f"📊 Оценка GPT: {score.score}/10 — {score.reason}\n"
+    )
+    if offer.url:
+        body += f"🔗 {offer.url}\n"
+    body += (
+        f"\n📊 Оценка GPT: {score.score}/10 — {score.reason}\n"
         f"✅ Стек: {skills}\n"
         f"⚠️ Риски: {risks}\n\n"
         f"📝 Кратко:\n{desc_preview}"
     )
+    return header + body
 
 
 def build_review_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
     p, s, pid = offer.platform, offer.source_key, offer.project_id
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✅ Откликнуть",
-                    callback_data=_callback_data(CALLBACK_APPROVE, p, s, pid),
-                ),
-                InlineKeyboardButton(
-                    text="❌ Пропустить",
-                    callback_data=_callback_data(CALLBACK_REJECT, p, s, pid),
-                ),
-            ],
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="✅ Откликнуть",
+                callback_data=_callback_data(CALLBACK_APPROVE, p, s, pid),
+            ),
+            InlineKeyboardButton(
+                text="❌ Пропустить",
+                callback_data=_callback_data(CALLBACK_REJECT, p, s, pid),
+            ),
+        ],
+    ]
+    if offer.url:
+        rows.append(
             [
                 InlineKeyboardButton(
                     text="👁 Открыть",
                     url=offer.url,
                 ),
-            ],
-        ]
-    )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def build_journal_confirm_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
@@ -184,6 +229,42 @@ def build_prepare_retry_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
     )
 
 
+def build_manual_copy_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
+    """Regenerate + journal confirm for manual-copy platforms."""
+    p, s, pid = offer.platform, offer.source_key, offer.project_id
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="✅ Подтвердить отклик",
+                callback_data=_callback_data(CALLBACK_JOURNAL_CONFIRM, p, s, pid),
+            ),
+            InlineKeyboardButton(
+                text="🔄 Перегенерировать",
+                callback_data=_callback_data(CALLBACK_REGENERATE, p, s, pid),
+            ),
+        ],
+    ]
+    if offer.url:
+        open_label = (
+            "👁 Открыть заказ"
+            if offer.platform == "yandex_uslugi"
+            else "👁 Открыть проект"
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=open_label,
+                    url=_project_view_url(offer.url),
+                ),
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_yandex_manual_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
+    return build_manual_copy_keyboard(offer)
+
+
 class TelegramReviewBot:
     def __init__(
         self,
@@ -198,6 +279,7 @@ class TelegramReviewBot:
             default=DefaultBotProperties(parse_mode=ParseMode.HTML),
         )
         self._dp = Dispatcher()
+        self._tz_awaiting_chats: set[str] = set()
 
     @property
     def bot(self) -> Bot:
@@ -218,6 +300,7 @@ class TelegramReviewBot:
         on_prepare_retry: Any | None = None,
         on_regenerate: Any | None = None,
         on_manual_project: Any | None = None,
+        on_manual_tz: Any | None = None,
     ) -> None:
         @self._dp.callback_query(F.data.startswith(f"{CALLBACK_APPROVE}:"))
         async def handle_approve(callback: CallbackQuery) -> None:
@@ -277,10 +360,27 @@ class TelegramReviewBot:
         async def handle_start(message: Message) -> None:
             await message.answer(
                 "Freelance Auto-Responder\n"
-                "Отклик: карточка → автозаполнение формы на Kwork (VPS).\n"
-                "Ручной проект: пришли ссылку kwork.ru/projects/… или /project <url>\n"
+                "Kwork: карточка → автозаполнение формы (VPS).\n"
+                "Яндекс / FL.ru: карточка → текст в TG → копируй вручную.\n"
+                "Ручной: /project <ссылка> · /tz <текст ТЗ без ссылки>\n"
                 "Excel: /journal · отчёт сканов: /report"
             )
+
+        if on_manual_tz is not None:
+
+            @self._dp.message(Command("tz"))
+            async def handle_tz_command(message: Message) -> None:
+                if str(message.chat.id) != self.chat_id:
+                    return
+                parts = (message.text or "").split(maxsplit=1)
+                if len(parts) >= 2 and parts[1].strip():
+                    await on_manual_tz(message, parts[1].strip())
+                    return
+                self._tz_awaiting_chats.add(str(message.chat.id))
+                await message.answer(
+                    "Пришли текст ТЗ следующим сообщением (без ссылки).\n"
+                    "Или сразу: /tz <полный текст заказа>"
+                )
 
         if on_manual_project is not None:
 
@@ -289,15 +389,27 @@ class TelegramReviewBot:
                 parts = (message.text or "").split(maxsplit=1)
                 if len(parts) < 2:
                     await message.answer(
-                        "Пришли ссылку на проект Kwork:\n"
-                        "/project https://kwork.ru/projects/123456/view"
+                        "Пришли ссылку:\n"
+                        "/project https://kwork.ru/projects/123456/view\n"
+                        "/project https://uslugi.yandex.ru/order/<uuid>\n"
+                        "/project https://www.fl.ru/projects/5514790/..."
                     )
+                    return
+                flru_id = extract_flru_project_id(parts[1])
+                if flru_id:
+                    await on_manual_project(message, flru_id, "flru")
+                    return
+                yandex_id = extract_yandex_order_id(parts[1])
+                if yandex_id:
+                    await on_manual_project(message, yandex_id, "yandex_uslugi")
                     return
                 project_id = extract_kwork_project_id(parts[1])
                 if not project_id:
-                    await message.answer("Не распознал project_id в ссылке Kwork")
+                    await message.answer(
+                        "Не распознал ссылку Kwork, Яндекс Услуги или FL.ru"
+                    )
                     return
-                await on_manual_project(message, project_id)
+                await on_manual_project(message, project_id, "kwork")
 
         @self._dp.message(Command("report"))
         async def handle_report(message: Message) -> None:
@@ -317,10 +429,24 @@ class TelegramReviewBot:
             async def handle_text_message(message: Message) -> None:
                 if message.text and message.text.startswith("/"):
                     return
+                if on_manual_tz is not None and message.text:
+                    chat_key = str(message.chat.id)
+                    if chat_key in self._tz_awaiting_chats:
+                        self._tz_awaiting_chats.discard(chat_key)
+                        await on_manual_tz(message, message.text.strip())
+                        return
                 if on_manual_project is not None and message.text:
+                    flru_id = extract_flru_project_id(message.text)
+                    if flru_id:
+                        await on_manual_project(message, flru_id, "flru")
+                        return
+                    yandex_id = extract_yandex_order_id(message.text)
+                    if yandex_id:
+                        await on_manual_project(message, yandex_id, "yandex_uslugi")
+                        return
                     project_id = extract_kwork_project_id(message.text)
                     if project_id:
-                        await on_manual_project(message, project_id)
+                        await on_manual_project(message, project_id, "kwork")
                         return
                 await on_response_text(message)
 
@@ -335,9 +461,12 @@ class TelegramReviewBot:
         return msg.message_id
 
     async def send_offer_link(self, offer: PendingOffer) -> int:
-        view_url = html.escape(_project_view_url(offer.url), quote=True)
         safe_title = html.escape(offer.title, quote=False)
-        text = f"✍️ <b>Черновик отклика</b> · {safe_title}\n🔗 {view_url}"
+        if offer.url:
+            view_url = html.escape(_project_view_url(offer.url), quote=True)
+            text = f"✍️ <b>Черновик отклика</b> · {safe_title}\n🔗 {view_url}"
+        else:
+            text = f"✍️ <b>Черновик отклика</b> · {safe_title}"
         msg = await self._bot.send_message(
             chat_id=self.chat_id,
             text=text,
@@ -429,6 +558,91 @@ class TelegramReviewBot:
                 text=f"{label}\n\n{chunk}",
                 parse_mode=None,
             )
+
+    async def send_manual_copy(
+        self,
+        offer: PendingOffer,
+        *,
+        response_text: str,
+        price: str,
+        delivery_days: int,
+        project_url: str,
+        soft_limit: int = 10,
+    ) -> int:
+        label = PLATFORM_LABELS.get(offer.platform, offer.platform)
+        safe_title = html.escape(offer.title, quote=False)
+        hint = (
+            "Скопируй отклик в Яндекс Услуги вручную."
+            if offer.platform == "yandex_uslugi"
+            else "Скопируй отклик на площадку вручную."
+            if offer.platform == "telegram"
+            else "Скопируй отклик на FL.ru вручную (кнопка «Откликнуться»)."
+        )
+        link_line = (
+            f"🔗 {html.escape(project_url, quote=True)}\n\n" if project_url else "\n"
+        )
+        header = (
+            f"📋 <b>{label} — скопируй вручную</b>\n"
+            f"📌 {safe_title}\n"
+            f"💰 {html.escape(str(price))} ₽ · {delivery_days} дн.\n"
+            f"{link_line}"
+            f"{hint} Лимит ~{soft_limit}/сутки.\n"
+            "Затем <b>Подтвердить отклик</b> — запись в Excel.\n"
+            "Или <b>Перегенерировать</b> — новый текст."
+        )
+        msg = await self._bot.send_message(
+            chat_id=self.chat_id,
+            text=header,
+            disable_web_page_preview=True,
+        )
+        chunks = _chunk_text(response_text)
+        last_i = len(chunks) - 1
+        text_msg_id = msg.message_id
+        for i, chunk in enumerate(chunks):
+            link_suffix = f"\n🔗 {project_url}" if project_url else ""
+            if i == 0:
+                label_txt = (
+                    f"📝 Текст отклика\n"
+                    f"📌 {offer.title}"
+                    f"{link_suffix}\n"
+                    f"———"
+                )
+            else:
+                label_txt = (
+                    f"📝 (продолжение)\n"
+                    f"📌 {offer.title}"
+                    f"{link_suffix}\n"
+                    f"———"
+                )
+            # Buttons on the last text chunk — that's what you read/copy.
+            kb = build_manual_copy_keyboard(offer) if i == last_i else None
+            text_msg = await self._bot.send_message(
+                chat_id=self.chat_id,
+                text=f"{label_txt}\n\n{chunk}",
+                parse_mode=None,
+                reply_markup=kb,
+            )
+            text_msg_id = text_msg.message_id
+        return text_msg_id
+
+    async def send_yandex_manual_copy(
+        self,
+        offer: PendingOffer,
+        *,
+        response_text: str,
+        price: str,
+        delivery_days: int,
+        order_url: str,
+        soft_limit: int = 7,
+    ) -> int:
+        return await self.send_manual_copy(
+            offer,
+            response_text=response_text,
+            price=price,
+            delivery_days=delivery_days,
+            project_url=order_url,
+            soft_limit=soft_limit,
+        )
 
     async def mark_journal_confirmed(self, callback: CallbackQuery) -> None:
         if callback.message is None:

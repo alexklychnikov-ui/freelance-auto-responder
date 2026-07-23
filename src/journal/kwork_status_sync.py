@@ -31,6 +31,7 @@ def sync_journal_from_kwork_offers(
     settings: Settings | None = None,
     offers: dict[str, KworkMyOfferStatus] | None = None,
     project_types: dict[str, str] | None = None,
+    browser: BrowserClient | None = None,
 ) -> KworkStatusSyncResult:
     settings = settings or get_settings()
     writer = JournalWriter(journal_path)
@@ -39,20 +40,25 @@ def sync_journal_from_kwork_offers(
     if offers is None:
         # Ленивый импорт: sync_journal должен работать без обязательного mcp-пакета,
         # если офферы не нужны или если браузерная часть отключена.
+        own_browser = browser is None
+        active_browser = browser
+        if active_browser is None:
+            try:
+                from src.browser.factory import close_browser_client, get_browser_client
+            except ModuleNotFoundError as exc:
+                return KworkStatusSyncResult(
+                    error=f"browser_dep_missing: {exc.name}"
+                )
+            active_browser = get_browser_client(settings)
         try:
-            from src.browser.factory import close_browser_client, get_browser_client
-        except ModuleNotFoundError as exc:
-            return KworkStatusSyncResult(
-                error=f"browser_dep_missing: {exc.name}"
-            )
-
-        browser: BrowserClient = get_browser_client(settings)
-        try:
-            offers = fetch_my_offer_statuses(browser)
+            offers = fetch_my_offer_statuses(active_browser)
         except Exception as exc:
             return KworkStatusSyncResult(error=str(exc))
         finally:
-            close_browser_client(browser)
+            if own_browser and active_browser is not None:
+                from src.browser.factory import close_browser_client
+
+                close_browser_client(active_browser)
 
     result = KworkStatusSyncResult()
     types = project_types or {}

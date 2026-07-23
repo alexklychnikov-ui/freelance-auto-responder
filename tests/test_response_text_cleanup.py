@@ -65,3 +65,31 @@ def test_strip_portfolio_footer_only() -> None:
 def test_strip_github_links() -> None:
     text = "См. github.com/alexklychnikov-ui и https://github.com/foo/bar"
     assert strip_github_links(text) == "См. и"
+
+
+def test_strip_hallucinated_irina_when_no_buyer() -> None:
+    project = _project("Нужен парсер hh.ru")
+    project = project.model_copy(update={"buyer": None})
+    text = (
+        "Ирина, здравствуйте! Предлагаю связать API hh.ru с ChatGPT. "
+        "Сделаю поиск и анализ резюме. Срок — 14 дней, стоимость — от 120000 руб. "
+        "Дайте знать, с чего удобнее начать."
+    )
+    out = finalize_response_text(text, project)
+    assert not out.lower().startswith("ирина")
+    assert "\n\n" in out
+    assert "hh.ru" in out
+
+
+def test_keep_real_buyer_greeting() -> None:
+    project = _project("бот").model_copy(update={"buyer": "Ирина · 80%"})
+    text = "Ирина, здравствуйте! Сделаю бота под заявки. Срок — 5 дней."
+    out = finalize_response_text(text, project)
+    assert out.startswith("Ирина, здравствуйте!")
+
+
+def test_buyer_first_name_rejects_ui_noise() -> None:
+    from src.analyzer.response_text import buyer_first_name
+
+    assert buyer_first_name("Чаты") is None
+    assert buyer_first_name("Ирина · 80%") == "Ирина"

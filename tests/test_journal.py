@@ -141,6 +141,27 @@ def test_project_ids_in_journal(journal_path: Path, project: ProjectFull, score:
     assert writer.project_ids_in_journal() == {"100"}
 
 
+def test_project_ids_in_journal_yandex_and_flru(tmp_path: Path) -> None:
+    from src.adapters.flru_urls import flru_project_url
+    from src.adapters.yandex_urls import yandex_order_url
+
+    journal_path = tmp_path / "journal.xlsx"
+    JournalWriter.create_template_copy(journal_path)
+    writer = JournalWriter(journal_path)
+
+    yandex_id = "342870b9-bea4-40b7-a616-81061dc845db"
+    flru_id = "5514795"
+
+    wb = load_workbook(journal_path)
+    ws = wb.active
+    ws.cell(row=2, column=4, value=yandex_order_url(yandex_id))
+    ws.cell(row=3, column=4, value=flru_project_url(flru_id))
+    wb.save(journal_path)
+    wb.close()
+
+    assert writer.project_ids_in_journal() == {yandex_id, flru_id}
+
+
 def test_update_status_by_project_id(
     journal_path: Path, project: ProjectFull, score: GptScoreResult
 ) -> None:
@@ -195,3 +216,29 @@ def test_journal_template_header_row(
     assert ws.cell(row=6, column=1).value == 2
     assert ws.cell(row=6, column=3).value == "Kwork"
     wb.close()
+
+def test_append_prepared_custom_status(journal_path: Path, project: ProjectFull, score: GptScoreResult) -> None:
+    writer = JournalWriter(journal_path)
+    writer.append_prepared(
+        project,
+        score,
+        "text",
+        price="1000",
+        status="Отправлен",
+        result="Жду ответа",
+    )
+
+    wb = load_workbook(journal_path)
+    ws = wb.active
+    assert ws.cell(row=2, column=6).value == "Отправлен"
+    assert ws.cell(row=2, column=7).value == "Жду ответа"
+    wb.close()
+
+
+def test_journal_status_for_confirm() -> None:
+    from src.pipeline.manual_copy import journal_status_for_confirm
+
+    assert journal_status_for_confirm("yandex_uslugi") == ("Отправлен", "Жду ответа")
+    assert journal_status_for_confirm("flru") == ("Отправлен", "Жду ответа")
+    assert journal_status_for_confirm("kwork") == ("Подготовлен", "Жду ответа")
+

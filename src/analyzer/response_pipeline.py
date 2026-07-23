@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 
+from src.adapters.kwork_pricing import budget_mismatch_issues
 from src.analyzer.gpt_scorer import _extract_json
 from src.analyzer.project_brief import (
     build_project_brief,
@@ -20,6 +21,7 @@ from src.analyzer.project_brief import (
     extract_tz_facts,
 )
 from src.analyzer.response_text import (
+    buyer_first_name as _buyer_first_name,
     finalize_response_text,
     kwork_compliance_issues,
     payment_mismatch_issues,
@@ -59,6 +61,10 @@ _BANNED_PHRASES = (
     "буду рад сотрудничеству",
     "уважаемый заказчик",
     "обращайтесь",
+    "понимаю, что вам",
+    "понимаю что вам",
+    "понимаю вашу задачу",
+    "понимаю вашу потребность",
     "понимаю, что основная задача заключается",
     "ознакомился с тз",
     "ознакомился с заданием",
@@ -68,6 +74,16 @@ _BANNED_PHRASES = (
     "заинтересовал ваш проект",
     "наткнулся",
     "работаю более",
+    "предлагаю обсудить детали и приступить",
+    "задача понятна",
+    "я занимаюсь",
+    "я специализируюсь",
+    "по договоренности",
+    "по договорённости",
+    "обсудим стоимость",
+    "если интересно — пишите",
+    "если интересно-пишите",
+    "когда удобно созвониться",
 )
 
 _NAMED_HELLO_RE = re.compile(
@@ -76,74 +92,121 @@ _NAMED_HELLO_RE = re.compile(
 )
 
 DRAFT_SYSTEM_PROMPT = """\
-Ты — DraftWriter: пишешь продающий отклик от имени Александра Клычникова \
-(Python / AI / Telegram / MVP) для биржи Kwork.
+Ты — DraftWriter: эксперт по продающим откликам на биржах фриланса. \
+Пишешь от имени Александра Клычникова (Python / AI / Telegram / MVP) для Kwork.
 
-Это не массовая рассылка: текст под конкретный заказ.
+Главная цель: за 10–15 секунд заказчик думает \
+«Этот человек уже понял задачу и знает, как её решить.» \
+Не продавай себя — продавай решение проблемы клиента.
 
-*** АЛГОРИТМ ПРОДАЮЩЕГО ОТКЛИКА (СТРОГО) ***
+Это не массовая рассылка: текст только под этот заказ.
 
-0. Сначала определи, что заказчик ценит больше всего (скорость / цена / качество / \
-автоматизация / надёжность / экспертиза и т.д.) — это база первой фразы.
+*** ПЕРЕД НАПИСАНИЕМ ***
+Проанализируй заказ и определи: что хочет получить; главную боль; \
+что важнее всего (скорость / стоимость / качество / автоматизация / простота / \
+надёжность / масштабируемость / удобство / интеграция / безопасность / \
+экономия времени / другое). Эта мысль — основа первого предложения.
 
-1. Если в project.buyer есть имя — начни с приветствия: «Ирина, здравствуйте!» \
-(подставь реальное имя). Если имени нет — НЕ выдумывай и НЕ пиши голое «Здравствуйте!».
+*** АЛГОРИТМ (СТРОГО) ***
 
-2. Первая содержательная фраза = РЕШЕНИЕ / результат / выгода / понимание задачи. \
-НИКОГДА про себя («изучил ТЗ», «ознакомился», «готов выполнить», «заинтересовал»).
+0. Ценность заказчика (см. выше) → база первой фразы.
 
-3. Одно предложение — КАК ты решишь задачу (конкретный подход).
+1. Обращение: ТОЛЬКО если buyer_name в payload задан — «{buyer_name}, здравствуйте!» \
+(ровно это имя, не другое). Если buyer_name пуст/null — БЕЗ обращения по имени: \
+сразу первое содержательное предложение. НЕ выдумывай имена (запрещены шаблонные \
+Ирина/Александр/Анна и любые имена не из buyer_name). НЕ пиши голое «Здравствуйте!».
 
-4. Одна полезная рекомендация — ТОЛЬКО если она реально полезна по ТЗ. Не выдумывай.
+2. Первое предложение — самое важное. Сразу: решение / результат / выгода / \
+экспертная мысль по ЭТОМУ заказу. Чередуй способы (не один шаблон):
+- через решение: «Настрою …, который …»
+- через результат: «После запуска … сможет …»
+- через выгоду: «Здесь ключевое — сократить …»
+- через экспертную мысль: «В таких проектах важнее …, чем просто …»
+НЕ через парафраз ТЗ («Понимаю, что вам…»). \
+Глагол действия ротируй; НЕ дефолт «Соберу». Если recent_openings с «Соберу» — другой глагол.
 
-5. Срок — можно ориентировочно: «Срок — 5–7 дней.» (используй days_hint / default_days).
+3. Одно предложение — КАК решишь задачу. Не пересказывай ТЗ. Покажи понимание.
 
-6. Цена — диапазон или «от»: «Стоимость — от 20 000 ₽.» \
-(используй price_hint или desired_budget / max_budget проекта, если есть).
+4. Экспертная рекомендация — ОДНА короткая, только если реально полезна. \
+Иначе пропусти. Не выдумывай ради шаблона.
 
-7. CTA: предложи обсудить: «Предлагаю обсудить детали и приступить.»
+5. Срок — всегда, хотя бы ориентир: «Срок — 5–7 дней.» (days_hint / default_days).
 
-8. Если buyer_questions не пуст — ОБЯЗАТЕЛЬНО ответь на КАЖДЫЙ пункт явно \
-(короткие ответы ок). Нельзя уходить в общие абзацы без покрытия пунктов списка.
+6. Стоимость — всегда: «от … ₽» или диапазон. ЗАПРЕЩЕНО: «по договорённости», \
+«обсудим стоимость» без цифры. (price_hint / бюджет проекта.)
+
+7. CTA — мягкий следующий шаг. ЗАПРЕЩЕНО дословно: \
+«Предлагаю обсудить детали и приступить» (+ «…к работе»). Варианты (ротируй):
+- «Напишите, с чего удобнее начать — уточню срок и стоимость.»
+- «Готов разобрать объём по вашему ТЗ и зафиксировать этапы.»
+- «Если подход ок — напишите, согласуем старт.»
+- «Могу сначала набросать план работ под вашу базу/сценарии.»
+- «Дайте знать удобный следующий шаг — уточню оценку.»
+
+8. Если buyer_questions не пуст — ответь на КАЖДЫЙ пункт явно.
+
+9. budget_mismatch (fair_price > ceiling): цена = «от {fair_price} ₽»; \
+мягко, что бюджет заказа занижен; CTA обсудить сумму; без «Понимаю…».
+
+*** ЯЗЫК И ФОРМАТ ***
+- 5–7 предложений. Простой человеческий язык. Без воды, биографии, длинных вступлений.
+- Абзацы: разделяй смысловые блоки пустой строкой (\\n\\n): \
+(1) обращение+открытие, (2) как решишь, (3) срок+цена, (4) CTA. \
+Не сваливай весь текст в одну простыню.
+- Каждое предложение помогает получить заказ.
+- Используй слова заказчика из ТЗ (Telegram, WordPress, MAX, ChatGPT, amoCRM и т.д.).
+- Не придумывай технологии, которых нет в заказе.
+- Не перечисляй стек без необходимости.
+- Не задавай больше одного уточняющего вопроса.
+- Не рассказывай о себе и не перечисляй опыт списком.
+- Похожий кейс — максимум одна короткая фраза, только если уместно.
 
 *** ЗАПРЕЩЕНО НАВСЕГДА ***
-- ознакомился с ТЗ / изучил заказ / заинтересовал проект / наткнулся
+- ознакомился с ТЗ / изучил заказ / наткнулся / заинтересовал проект / задача понятна
 - готов выполнить / работаю более N лет / буду рад сотрудничеству / имею большой опыт
-- массовые шаблонные открывашки без имени
-- голое «Здравствуйте!» / «Добрый день» без имени заказчика
-- markdown-списки, внешние URL / GitHub / портфолио-ссылки
+- я занимаюсь… / я специализируюсь…
+- «Понимаю, что вам…» / любая «Понимаю, что…» после hello
+- голое «Здравствуйте!» / «Добрый день» без имени
+- markdown-списки, URL / GitHub / портфолио-ссылки
 - созвоны, мессенджеры, контакты вне Kwork
-- игнорировать buyer_questions / отвечать в общих словах без пунктов
-
-*** РАЗРЕШЕНО ***
-- «Имя, здравствуйте!» если buyer известен
+- «если интересно — пишите» / «когда удобно созвониться?»
+- игнор buyer_questions; ceiling как «достаточная» цена при budget_mismatch
 
 *** АНТИ-ШАБЛОН ***
-Смотри recent_responses / recent_openings — НЕ повторяй те же первые фразы. \
-Варьируй ритм и начало.
+Смотри recent_responses / recent_openings / recent_closings. \
+Не повторяй первые/последние фразы. Не открывай снова с «Соберу». \
+Не заканчивай «Предлагаю обсудить детали и приступить.» \
+Не штампуй одно и то же «Сделаю…» / «Разработаю…» / «Для такого проекта важно…» \
+в каждом отклике. Живой текст, не шаблон нейросети.
 
 *** KWORK ***
-Только чат площадки. Длина ~700–1600 знаков. Русский. Без markdown.
+Только чат площадки. ~700–1600 знаков ≈ 5–7 предложений. Русский. Без markdown.
 
-Если в feedback / critique / expert_notes есть замечания — учти их и перепиши.
-
+Если в feedback / critique / expert_notes есть замечания — учти и перепиши.
 Верни ТОЛЬКО текст отклика.
 """
 
 LOGIC_CRITIC_PROMPT = """\
-Ты — LogicCritic: проверяешь структуру, стиль и полноту продающего отклика.
+Ты — LogicCritic: структура, стиль и полнота продающего отклика.
 
-Проверь:
-1) Есть ли приветствие по имени ТОЛЬКО если buyer задан; нет голого «Здравствуйте!»
-2) Первая содержательная фраза — про решение/выгоду/понимание, не про «изучил ТЗ»
-3) Есть подход к решению
-4) Срок и цена присутствуют (хотя бы ориентир)
-5) Есть CTA обсудить
-6) Нет запрещённых клише и нарушений Kwork (ссылки, созвоны, markdown-списки)
-7) Длина разумная (~700–1600), текст по делу
-8) ОБЯЗАТЕЛЬНО: если buyer_questions не пуст — у КАЖДОГО пункта есть явный ответ \
-в тексте. Если хотя бы один пункт без ответа → verdict=fail и перечисли \
-неотвеченные в missing. Нельзя ставить pass при неполном покрытии вопросов.
+Чеклист (fail → issues / missing):
+1) Приветствие по имени ТОЛЬКО если buyer_name задан и совпадает с именем в тексте. \
+Fail: любое «Имя, здравствуйте!» при пустом buyer_name; fail: имя ≠ buyer_name. \
+Нет голого «Здравствуйте!»
+2) Первое содержательное предложение цепляет: решение/результат/выгода/экспертная мысль; \
+НЕ парафраз ТЗ; НЕ «Понимаю, что…». \
+Fail если первый глагол «Соберу» (или снова «Соберу» при recent_openings с «Соберу»).
+3) Есть короткое «как решим» без пересказа ТЗ
+4) Срок есть; цена есть цифрой («от»/диапазон). Fail: «по договорённости», \
+«обсудим стоимость» без суммы
+5) CTA есть. Fail: «Предлагаю обсудить детали и приступить» (+ «к работе»)
+6) Нет клише/био/перечня опыта; нет стопки стека без нужды; ≤1 уточняющий вопрос
+7) Нет нарушений Kwork (ссылки, созвоны, markdown-списки)
+8) Длина ~5–7 предложений / ~700–1600 знаков, по делу
+9) buyer_questions: у каждого пункта явный ответ, иначе fail + missing
+10) budget_mismatch: fair_price в тексте + мягко про заниженный бюджет + CTA по сумме
+11) Используются ключевые слова из ТЗ (если в заказе Telegram/WordPress/… — они в тексте, \
+если уместно); нет выдуманных технологий вне заказа
 
 Верни СТРОГО JSON:
 {
@@ -155,15 +218,28 @@ LOGIC_CRITIC_PROMPT = """\
 """
 
 EXPERT_REVIEWER_PROMPT = """\
-Ты — ExpertReviewer: финальный гейт качества продающего отклика на Kwork.
+Ты — ExpertReviewer: финальный гейт. Текст должен читаться как живой пресейл, \
+не как шаблон GPT.
 
-Оцени, выглядит ли текст как живой пресейл сильного специалиста, а не шаблон.
-Учитывай critique (если есть) и соответствие ТЗ.
+Тест 10–15 секунд: заказчик думает \
+«Этот исполнитель уже знает, как решить мою задачу»? Если нет → revise_draft.
+
+Учитывай critique и соответствие ТЗ.
+
+Авто-revise_draft (must_fix):
+- «Понимаю, что…» / парафраз ТЗ вместо результата
+- opener «Соберу…» (особенно vs recent_openings)
+- CTA «Предлагаю обсудить детали и приступить» (+ «к работе»)
+- рассказ о себе / список опыта / стопка стека без нужды
+- цена без цифры («по договорённости»)
+- выдуманные технологии не из заказа
+- шаблонность vs recent_openings/closings
+- budget_mismatch без fair_price + обсуждения суммы
 
 verdict:
 - "pass" — можно сдавать
 - "revise_draft" — вернуть DraftWriter с must_fix
-- "revise_logic" — редко: структура ок, но LogicCritic пропустил важное; укажи в feedback
+- "revise_logic" — редко: структура ок, LogicCritic пропустил важное
 
 score: целое 1–10.
 
@@ -177,6 +253,15 @@ score: целое 1–10.
 """
 
 
+def _content_after_named_hello(text: str) -> str:
+    """Strip optional «Имя, здравствуйте!» so opener checks see the first content verb."""
+    stripped = text.strip()
+    match = _NAMED_HELLO_RE.match(stripped)
+    if not match:
+        return stripped
+    return stripped[match.end() :].lstrip()
+
+
 def soft_banned_issues(text: str) -> list[str]:
     """Named «Имя, здравствуйте!» allowed; bare «Здравствуйте!» and clichés banned."""
     issues: list[str] = []
@@ -186,6 +271,9 @@ def soft_banned_issues(text: str) -> list[str]:
         for pattern in _BANNED_OPENERS:
             if re.search(pattern, lower):
                 issues.append(f"opener:{pattern}")
+    body = _content_after_named_hello(stripped)
+    if body.lower().startswith("соберу"):
+        issues.append("opener:^соберу")
     for phrase in _BANNED_PHRASES:
         if phrase in lower:
             issues.append(f"phrase:{phrase}")
@@ -225,20 +313,6 @@ def force_logic_fail_for_questions(
     ):
         forced.append("too_short_for_all_questions")
     return forced
-
-
-def _buyer_first_name(buyer: str | None) -> str | None:
-    if not buyer:
-        return None
-    name = buyer.strip()
-    if not name or name.lower() in {"неизвестно", "unknown", "-", "—"}:
-        return None
-    # drop hire-rate suffixes like "Ирина · 80%"
-    name = re.split(r"[·|•,/]", name, maxsplit=1)[0].strip()
-    token = name.split()[0].strip()
-    if len(token) < 2 or not re.search(r"[А-ЯЁA-Z]", token, re.I):
-        return None
-    return token
 
 
 def _price_from_project(project: ProjectFull) -> str | None:
@@ -355,10 +429,11 @@ class ResponsePipeline:
         price_hint: int | str | None = None,
         days_hint: int | None = None,
         feedback: dict[str, Any] | str | None = None,
+        budget_mismatch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         buyer_name = _buyer_first_name(project.buyer)
         budget_digits = _price_from_project(project)
-        return {
+        payload: dict[str, Any] = {
             "task": "Напиши продающий отклик по алгоритму DraftWriter.",
             "platform": project.platform,
             "project": project.model_dump(mode="json"),
@@ -376,6 +451,9 @@ class ResponsePipeline:
             "days_hint": days_hint or self.settings.default_offer_days,
             "feedback": feedback,
         }
+        if budget_mismatch:
+            payload["budget_mismatch"] = budget_mismatch
+        return payload
 
     def _draft(
         self,
@@ -387,6 +465,7 @@ class ResponsePipeline:
         price_hint: int | str | None = None,
         days_hint: int | None = None,
         feedback: dict[str, Any] | str | None = None,
+        budget_mismatch: dict[str, Any] | None = None,
     ) -> str:
         payload = self._build_draft_payload(
             project,
@@ -396,6 +475,7 @@ class ResponsePipeline:
             price_hint=price_hint,
             days_hint=days_hint,
             feedback=feedback,
+            budget_mismatch=budget_mismatch,
         )
         logger.info("response_pipeline draft project_id=%s", project.project_id)
         text = self._openai_text(
@@ -410,6 +490,7 @@ class ResponsePipeline:
         ] + [
             f"checklist:{v}" for v in buyer_checklist_issues(project, text)
         ] + [f"tz:{v}" for v in payment_mismatch_issues(project, text)]
+        banned += budget_mismatch_issues(text, budget_mismatch)
         if banned:
             logger.info(
                 "response_pipeline draft soft_retry project_id=%s issues=%s",
@@ -421,7 +502,15 @@ class ResponsePipeline:
                 "banned_detected": banned,
                 "note": (
                     "Перепиши: убери клише. Имя+здравствуйте — только если buyer_name есть; "
-                    "голое Здравствуйте запрещено. Без URL/созвонов."
+                    "голое Здравствуйте запрещено. Не открывай с «Соберу». "
+                    "Не заканчивай «Предлагаю обсудить детали и приступить.» "
+                    "Без URL/созвонов."
+                    + (
+                        " При budget_mismatch: цена = fair_price, мягко отметь заниженный "
+                        "бюджет заказа и предложи обсудить сумму."
+                        if budget_mismatch
+                        else ""
+                    )
                 ),
             }
             text = self._openai_text(
@@ -433,16 +522,27 @@ class ResponsePipeline:
             text = finalize_response_text(text, project)
         return text
 
-    def _critique_logic(self, draft: str, project: ProjectFull) -> dict[str, Any]:
+    def _critique_logic(
+        self,
+        draft: str,
+        project: ProjectFull,
+        *,
+        budget_mismatch: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         buyer_questions = extract_buyer_questions(project)
-        payload = {
+        local_issues = soft_banned_issues(draft) + [
+            f"kwork:{v}" for v in kwork_compliance_issues(draft)
+        ]
+        local_issues += budget_mismatch_issues(draft, budget_mismatch)
+        payload: dict[str, Any] = {
             "project_brief": build_project_brief(project),
             "buyer_name": _buyer_first_name(project.buyer),
             "buyer_questions": buyer_questions,
             "response_text": draft,
-            "local_issues": soft_banned_issues(draft)
-            + [f"kwork:{v}" for v in kwork_compliance_issues(draft)],
+            "local_issues": local_issues,
         }
+        if budget_mismatch:
+            payload["budget_mismatch"] = budget_mismatch
         data = self._openai_json(
             system=LOGIC_CRITIC_PROMPT,
             user=payload,
@@ -482,13 +582,17 @@ class ResponsePipeline:
         draft: str,
         critique: dict[str, Any],
         project: ProjectFull,
+        *,
+        budget_mismatch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        payload = {
+        payload: dict[str, Any] = {
             "project_brief": build_project_brief(project),
             "buyer_name": _buyer_first_name(project.buyer),
             "response_text": draft,
             "critique": critique,
         }
+        if budget_mismatch:
+            payload["budget_mismatch"] = budget_mismatch
         data = self._openai_json(
             system=EXPERT_REVIEWER_PROMPT,
             user=payload,
@@ -497,16 +601,22 @@ class ResponsePipeline:
         verdict = str(data.get("verdict") or "revise_draft").lower().strip()
         if verdict not in {"pass", "revise_draft", "revise_logic"}:
             verdict = "revise_draft"
+        mismatch = budget_mismatch_issues(draft, budget_mismatch)
+        if mismatch and verdict == "pass":
+            verdict = "revise_draft"
         try:
             score = int(data.get("score") or 5)
         except (TypeError, ValueError):
             score = 5
         score = max(1, min(10, score))
+        must_fix = list(data.get("must_fix") or [])
+        if mismatch:
+            must_fix = list(must_fix) + mismatch
         return {
             "verdict": verdict,
             "score": score,
             "feedback": str(data.get("feedback") or ""),
-            "must_fix": list(data.get("must_fix") or []),
+            "must_fix": must_fix,
         }
 
     def generate(
@@ -519,6 +629,7 @@ class ResponsePipeline:
         progress: ProgressFn | None = None,
         price_hint: int | str | None = None,
         days_hint: int | None = None,
+        budget_mismatch: dict[str, Any] | None = None,
     ) -> str:
         def _notify(msg: str) -> None:
             if progress is not None:
@@ -536,6 +647,7 @@ class ResponsePipeline:
                 recent_responses=recent_responses,
                 price_hint=price_hint,
                 days_hint=days_hint,
+                budget_mismatch=budget_mismatch,
                 threaded=False,
             )
 
@@ -552,6 +664,7 @@ class ResponsePipeline:
             progress=progress,
             price_hint=price_hint,
             days_hint=days_hint,
+            budget_mismatch=budget_mismatch,
         )
 
     @staticmethod
@@ -580,6 +693,7 @@ class ResponsePipeline:
         progress: ProgressFn | None = None,
         price_hint: int | str | None = None,
         days_hint: int | None = None,
+        budget_mismatch: dict[str, Any] | None = None,
     ) -> str:
         def notify(msg: str) -> None:
             self._safe_progress(progress, msg)
@@ -592,13 +706,16 @@ class ResponsePipeline:
             recent_responses=recent_responses,
             price_hint=price_hint,
             days_hint=days_hint,
+            budget_mismatch=budget_mismatch,
         )
         best = draft
         best_score = 0
 
         for cycle in range(1, MAX_REVISION_CYCLES + 1):
             notify(MSG_LOGIC)
-            critique = self._critique_logic(draft, project)
+            critique = self._critique_logic(
+                draft, project, budget_mismatch=budget_mismatch
+            )
             if critique.get("verdict") != "pass":
                 notify(MSG_REVISE.format(n=cycle))
                 draft = self._draft(
@@ -608,12 +725,15 @@ class ResponsePipeline:
                     recent_responses=recent_responses,
                     price_hint=price_hint,
                     days_hint=days_hint,
+                    budget_mismatch=budget_mismatch,
                     feedback={"role": "LogicCritic", **critique},
                 )
                 continue
 
             notify(MSG_EXPERT)
-            expert = self._expert_review(draft, critique, project)
+            expert = self._expert_review(
+                draft, critique, project, budget_mismatch=budget_mismatch
+            )
             score = int(expert.get("score") or 0)
             if score >= best_score:
                 best_score = score
@@ -631,6 +751,7 @@ class ResponsePipeline:
                 recent_responses=recent_responses,
                 price_hint=price_hint,
                 days_hint=days_hint,
+                budget_mismatch=budget_mismatch,
                 feedback={"role": "ExpertReviewer", **expert},
             )
 
@@ -647,6 +768,7 @@ class ResponsePipeline:
         recent_responses: Any = None,
         price_hint: int | str | None = None,
         days_hint: int | None = None,
+        budget_mismatch: dict[str, Any] | None = None,
         threaded: bool = True,
     ) -> str:
         async def _call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -663,13 +785,19 @@ class ResponsePipeline:
             recent_responses=recent_responses,
             price_hint=price_hint,
             days_hint=days_hint,
+            budget_mismatch=budget_mismatch,
         )
         best = draft
         best_score = 0
 
         for cycle in range(1, MAX_REVISION_CYCLES + 1):
             await self._safe_notify(notify, MSG_LOGIC)
-            critique = await _call(self._critique_logic, draft, project)
+            critique = await _call(
+                self._critique_logic,
+                draft,
+                project,
+                budget_mismatch=budget_mismatch,
+            )
             if critique.get("verdict") != "pass":
                 await self._safe_notify(notify, MSG_REVISE.format(n=cycle))
                 draft = await _call(
@@ -680,12 +808,19 @@ class ResponsePipeline:
                     recent_responses=recent_responses,
                     price_hint=price_hint,
                     days_hint=days_hint,
+                    budget_mismatch=budget_mismatch,
                     feedback={"role": "LogicCritic", **critique},
                 )
                 continue
 
             await self._safe_notify(notify, MSG_EXPERT)
-            expert = await _call(self._expert_review, draft, critique, project)
+            expert = await _call(
+                self._expert_review,
+                draft,
+                critique,
+                project,
+                budget_mismatch=budget_mismatch,
+            )
             score = int(expert.get("score") or 0)
             if score >= best_score:
                 best_score = score
@@ -704,6 +839,7 @@ class ResponsePipeline:
                 recent_responses=recent_responses,
                 price_hint=price_hint,
                 days_hint=days_hint,
+                budget_mismatch=budget_mismatch,
                 feedback={"role": "ExpertReviewer", **expert},
             )
 

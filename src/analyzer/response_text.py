@@ -76,10 +76,102 @@ def payment_mismatch_issues(project: ProjectFull, response: str) -> list[str]:
     return []
 
 
+_NAMED_HELLO_RE = re.compile(
+    r"^([А-ЯЁA-Z][\w\-]*(?:\s+[А-ЯЁA-Z][\w\-]*)?),\s*здравствуйте\s*[!.]?\s*",
+    re.I,
+)
+
+_BUYER_NOISE = frozenset(
+    {
+        "войти",
+        "вход",
+        "логин",
+        "чаты",
+        "чат",
+        "отклики",
+        "заказчик",
+        "покупатель",
+        "фрилансер",
+        "профиль",
+        "настройки",
+        "уведомления",
+        "помощь",
+        "поддержка",
+        "меню",
+        "кабинет",
+        "пользователь",
+        "user",
+        "login",
+        "customer",
+        "author",
+    }
+)
+
+
+def buyer_first_name(buyer: str | None) -> str | None:
+    if not buyer:
+        return None
+    name = buyer.strip()
+    if not name or name.lower() in {"неизвестно", "unknown", "-", "—"}:
+        return None
+    name = re.split(r"[·|•,/]", name, maxsplit=1)[0].strip()
+    token = name.split()[0].strip()
+    if len(token) < 2 or not re.search(r"[А-ЯЁA-Z]", token, re.I):
+        return None
+    if token.lower() in _BUYER_NOISE:
+        return None
+    if re.fullmatch(r"\d+", token):
+        return None
+    return token
+
+
+def strip_hallucinated_greeting(text: str, buyer_name: str | None) -> str:
+    body = (text or "").strip()
+    m = _NAMED_HELLO_RE.match(body)
+    if not m:
+        return body
+    used = m.group(1).strip()
+    if not buyer_name:
+        return body[m.end() :].lstrip()
+    if used.casefold() != buyer_name.casefold():
+        return f"{buyer_name}, здравствуйте! {body[m.end() :].lstrip()}"
+    return body
+
+
+def ensure_response_paragraphs(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return raw
+    if "\n\n" in raw:
+        return re.sub(r"\n{3,}", "\n\n", raw).strip()
+
+    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", raw) if p.strip()]
+    if len(parts) <= 2:
+        return "\n\n".join(parts)
+
+    blocks: list[str] = [parts[0]]
+    mid = parts[1:-2] if len(parts) >= 4 else parts[1:-1]
+    if mid:
+        if len(mid) <= 2:
+            blocks.append(" ".join(mid))
+        else:
+            half = max(1, len(mid) // 2)
+            blocks.append(" ".join(mid[:half]))
+            blocks.append(" ".join(mid[half:]))
+    tail = parts[-2:] if len(parts) >= 4 else parts[-1:]
+    blocks.append(" ".join(tail))
+    return "\n\n".join(b for b in blocks if b)
+
+
 def finalize_response_text(text: str, project: ProjectFull | None = None) -> str:
     cleaned = strip_response_markdown(text)
     cleaned = strip_github_links(cleaned)
     cleaned = strip_portfolio_footer(cleaned)
+    if project is not None:
+        cleaned = strip_hallucinated_greeting(
+            cleaned, buyer_first_name(project.buyer)
+        )
+        cleaned = ensure_response_paragraphs(cleaned)
     return cleaned.strip()
 
 

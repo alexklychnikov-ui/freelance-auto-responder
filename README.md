@@ -5,13 +5,20 @@
 ![Mockup](Docs/mockups/generated-2-20260627-145042.png)
 <!-- MOCKUPS:END -->
 
-Автоматический пайплайн откликов на фриланс-проекты (сейчас Kwork): daemon каждые **15 минут** сканирует ленту → для новых проектов подтягивает контекст из **LightRAG** и примеры откликов → **GPT** оценивает fit и риски → в **Telegram** приходит карточка с кнопкой «Откликнуть». После approve бот генерирует текст, оценивает цену/срок и **заполняет черновик формы Kwork** (Playwright на VPS): поэтапная оплата, 2+ задачи с суммами, описание, цена, срок — **без нажатия «Предложить»**. После prepare — кнопка **«Подтвердить отклик»** (строка в Excel на VPS) или команда **`/journal`** (обновить журнал + статусы с Kwork `/offers` и прислать `.xlsx` в чат).
+Автоматический пайплайн откликов на фриланс-проекты: **Kwork**, **Яндекс Услуги**, **FL.ru** (и ручной ввод через TG). Daemon сканирует ленты по `config/sources.yaml` → для новых проектов подтягивает контекст из **LightRAG** и примеры откликов → **GPT** оценивает fit и риски → в **Telegram** приходит карточка с кнопкой «Откликнуть».
+
+| Площадка | После approve |
+|----------|---------------|
+| **Kwork** | Playwright на VPS заполняет черновик формы (этапы, цена, срок) **без «Предложить»** → ты проверяешь на сайте → **Подтвердить отклик** |
+| **Яндекс / FL.ru / ТЗ из TG** | Бот присылает текст + цену + срок → **копируешь вручную** на площадку → **Подтвердить отклик** |
+
+Журнал Excel на VPS. **`/journal`** — дописать подтверждённые отклики, подтянуть статусы Kwork с `/offers`, прислать `.xlsx` в чат.
 
 ## Архитектура
 
 | Где | Роль |
 |-----|------|
-| **VPS** (`/opt/freelance-responder`) | daemon: скан, GPT, TG-бот, Playwright prepare, **Excel-журнал** |
+| **VPS** (`/opt/freelance-responder`) | daemon: скан Kwork/Яндекс/FL.ru, GPT, TG-бот, Playwright prepare (Kwork), **Excel-журнал** |
 | **ПК (Windows)** | разработка, Kwork-login, опционально локальная копия журнала |
 | **LightRAG** | на том же VPS (`http://127.0.0.1:9621`) |
 | **Excel** | на VPS: `/opt/freelance-responder/data/response_journal.xlsx` (лист «Мои отклики»); бот присылает файл в TG по `/journal` |
@@ -20,16 +27,18 @@
 
 ---
 
-## Последние изменения (июнь 2026)
+## Последние изменения (июль 2026)
 
 | Область | Что сделано |
 |---------|-------------|
-| **Интервал скана** | `SCAN_INTERVAL_MINUTES` и daemon: **15 мин** (было 30) |
-| **Prepare Kwork** | Клик «По мере выполнения задач» до заполнения этапов; reassert после price/deadline |
-| **Черновик этапов** | Сохранение через `updatePaymentType` + `updateDataStages` + `changeDraftContent` (без `setRequestDataStages`) |
-| **Verify prepare** | Проверка этапов, milestone, цены и описания в той же сессии; retry GPT+форма (2 попытки) |
-| **TG** | Кнопка «Заполнить форму снова»; `/journal` — Excel; **`/report`** — отчёт по 3 последним сканам |
-| **Журнал Excel** | Гиперссылки в колонке D; тип проекта при sync с `/offers`; repair строк |
+| **Мультиплатформа** | Скан и отклики: Kwork + Яндекс Услуги + FL.ru (`config/sources.yaml`) |
+| **Manual-copy flow** | Яндекс / FL.ru / ТЗ из TG: текст в TG → ручная отправка на сайте → confirm в журнал |
+| **TG-команды** | `/project <url>` — ручной заказ с любой площадки; `/tz <текст>` — ТЗ без ссылки |
+| **Журнал: dedupe** | `project_ids_in_journal()` парсит Kwork `/projects/{id}`, FL.ru `/projects/{id}`, Яндекс `/order/{uuid}` — повторный confirm не дублирует строку |
+| **Журнал: snapshot** | Чтение текста с Kwork `/offers` только для `platform == "kwork"`; Яндекс/FL.ru берут текст из prepared_store |
+| **Журнал: статусы** | После confirm: **«Отправлен»** (Яндекс/FL.ru/TG) или **«Подготовлен»** (Kwork, ждёт sync с `/offers`) |
+| **Prepare Kwork** | Клик «По мере выполнения задач»; verify этапов/цены; retry GPT+форма; «Заполнить форму снова» |
+| **TG-сервис** | `/journal` — Excel + sync; **`/report`** — отчёт по 3 последним сканам |
 | **VPS sync** | `deploy/sync_journal_from_vps.py`, `sync_journal_on_vps.py` — offers + prepared на сервере |
 
 ---
@@ -78,6 +87,9 @@ copy .env.example .env
 | `RESPONSE_JOURNAL` | `C:/Python/Projects/Zerocode2md/ResponseJournal/journal.xlsx` |
 | `RESPONSE_EXAMPLES_DIR` | `C:/Python/Projects/Zerocode2md/Output/Отклики` |
 | `BROWSER_ADAPTER` | `external` (локальная отладка) или `playwright` |
+| `FLRU_STORAGE_STATE` | `data/flru_storage.json` (сессия FL.ru) |
+| `FLRU_MAX_DAILY_RESPONSES` | soft-лимит FL.ru manual-copy (default 10) |
+| `YANDEX_MAX_DAILY_RESPONSES` | soft-лимит Яндекс manual-copy (default 7) |
 
 Для локальной отладки браузера через BrowserMCP — `BROWSERMCP_SERVER`.
 
@@ -240,17 +252,146 @@ ssh LightRAG_Naive "cd /opt/freelance-responder && .venv/bin/pip install -r requ
 
 ---
 
-## Рабочий процесс (TG)
+## Telegram — как пользоваться
 
-1. Daemon находит проект → карточка в Telegram  
-2. **Откликнуть** → GPT-черновик  
-3. Reply на черновик с финальным текстом (или сразу approve)  
-4. Бот заполняет форму Kwork (без «Предложить»)  
-5. **Подтвердить отклик** → строка в Excel на VPS  
-6. **`/journal`** → обновление журнала (prepared + offers) и файл `.xlsx` в чат  
-7. **`/report`** → отчёт по последним 3 сканам (время в `OPERATOR_TIMEZONE`, проверено / не стек / не бюджет)
+### Команды
 
-Локальная копия на ПК — по желанию: `python deploy\sync_journal_from_vps.py`.
+| Команда | Что делает |
+|---------|------------|
+| `/start` | Краткая справка по боту |
+| `/project <url>` | Ручной разбор заказа по ссылке (Kwork / Яндекс / FL.ru) |
+| `/tz <текст>` | Ручной разбор ТЗ без ссылки (или `/tz` → следующим сообщением текст) |
+| `/journal` | Sync журнала на VPS + файл `journal.xlsx` в чат |
+| `/report` | Отчёт по 3 последним сканам (время в `OPERATOR_TIMEZONE`) |
+
+Можно просто **вставить ссылку** в чат (без `/project`) — бот распознает Kwork, Яндекс или FL.ru.
+
+Reply на черновик отклика = правка текста перед отправкой (работает для всех площадок).
+
+---
+
+### Общий сценарий (автоскан)
+
+1. Daemon находит проект → **карточка** в Telegram (оценка GPT, риски, ссылка).
+2. **Откликнуть** → GPT генерирует черновик.
+3. (опционально) Reply с правками текста.
+4. Дальше — по площадке (см. ниже).
+5. **✅ Подтвердить отклик** → строка в Excel на VPS.
+6. **`/journal`** — скачать актуальный журнал + обновить статусы Kwork.
+
+---
+
+### Kwork — автозаполнение формы
+
+```
+Карточка → Откликнуть → (правки reply) → форма заполнена на VPS
+→ открываешь ссылку под тем же аккаунтом Kwork
+→ проверяешь → «Предложить» на сайте
+→ ✅ Подтвердить отклик в TG
+```
+
+**Кнопки после prepare:**
+
+| Кнопка | Действие |
+|--------|----------|
+| **✅ Подтвердить отклик** | Запись в Excel. Бот попробует прочитать финальный текст с Kwork `/offers`; если не вышло — возьмёт prepared-текст |
+| **🔄 Перегенерировать** | Новый GPT-текст + повторное заполнение формы |
+| **🔁 Заполнить форму снова** | (если prepare упал) — retry без перегенерации |
+
+**Статус в Excel после confirm:** `Подготовлен` → `/journal` обновит с `/offers` на `Отправлен` / `Отклонён` / и т.д.
+
+---
+
+### Яндекс Услуги / FL.ru — manual copy
+
+Площадки без автозаполнения формы на VPS. Бот присылает готовый текст блоками (удобно копировать).
+
+```
+Карточка → Откликнуть → (правки reply)
+→ 📋 «скопируй вручную» + текст + цена + срок + ссылка
+→ открываешь заказ на площадке → вставляешь → отправляешь
+→ ✅ Подтвердить отклик в TG
+```
+
+**Кнопки:**
+
+| Кнопка | Действие |
+|--------|----------|
+| **✅ Подтвердить отклик** | Запись в Excel **после** того как ты реально отправил на сайте |
+| **🔄 Перегенерировать** | Новый текст (без браузера) |
+
+**Статус в Excel сразу после confirm:** `Отправлен` / `Жду ответа`.
+
+Лимиты (soft, показываются в сообщении): Яндекс ~7/сутки, FL.ru ~10/сутки (`YANDEX_MAX_DAILY_RESPONSES`, `FLRU_MAX_DAILY_RESPONSES` в `.env`).
+
+**Dedupe:** если заказ уже есть в Excel (по URL `/order/{uuid}` или `fl.ru/projects/{id}`), кнопка ответит «Уже в журнале» — дубль не создастся.
+
+---
+
+### Ручной ввод — `/project` и `/tz`
+
+**Пропустил автоскан или заказ пришёл из другого канала:**
+
+```
+/project https://uslugi.yandex.ru/order/342870b9-bea4-40b7-a616-81061dc845db
+/project https://www.fl.ru/projects/5514790/some-title.html
+/project https://kwork.ru/projects/123456/view
+```
+
+```
+/tz Нужен бот для Telegram, бюджет 15к, срок 2 недели...
+```
+
+или:
+
+```
+/tz
+→ следующим сообщением полный текст ТЗ
+```
+
+Дальше тот же flow: карточка → approve → Kwork prepare **или** manual copy.
+
+---
+
+### Журнал Excel — колонки и статусы
+
+| Колонка | Содержимое |
+|---------|------------|
+| A | № |
+| B | Дата |
+| C | Площадка (Kwork / Яндекс Услуги / FL.ru / Telegram) |
+| D | URL (гиперссылка) |
+| E | Тип проекта |
+| F | **Статус** |
+| G | **Результат** |
+| H | Описание заказа |
+| I | Текст отклика + цена + срок |
+
+**Статус после «Подтвердить отклик»:**
+
+| Площадка | Кол. F (статус) | Когда меняется дальше |
+|----------|-----------------|------------------------|
+| Kwork | `Подготовлен` | `/journal` → sync с `/offers` |
+| Яндекс / FL.ru / TG | `Отправлен` | вручную в Excel или phase 2 (автосинк) |
+
+**`/journal`** делает на VPS:
+1. Дописывает подтверждённые `prepared_responses`, которых ещё нет в Excel.
+2. Для **Kwork** — обновляет статусы с `/offers`.
+3. Присылает `.xlsx` в Telegram.
+
+Локальная копия на ПК (опционально): `python deploy\sync_journal_from_vps.py`.
+
+---
+
+### Частые ситуации
+
+| Ситуация | Что делать |
+|----------|------------|
+| Нажал confirm, но ещё не отправил на сайте (Яндекс/FL.ru) | Не нажимай confirm до реальной отправки — статус сразу `Отправлен` |
+| Confirm для Kwork — текст в Excel не тот | Бот читает с `/offers`; если сессия Kwork протухла — будет prepared-текст; обнови `kwork_storage.json` |
+| «Уже в журнале» | Заказ уже в Excel (dedupe по project_id из URL) |
+| Нужен свежий Excel | `/journal` в TG |
+| Prepare упал на Kwork | **Заполнить форму снова** или **Перегенерировать** |
 
 ---
 
@@ -307,7 +448,10 @@ tar czf /root/freelance-backup-$(date +%F).tar.gz \
 | Prepare: greenlet error | обновить `src/pipeline/orchestrator.py` на VPS |
 | Журнал пустой / нет строки | `/journal` в TG; проверить `journal_confirmed` в `prepared_responses/` |
 | `/journal` без файла | смотреть лог daemon; путь `RESPONSE_JOURNAL` на VPS |
-| 0 проектов в скане | проверить Kwork-селекторы / сессию |
+| Яндекс/FL.ru: «Уже в журнале» без кнопки | норма — dedupe по UUID/id из URL в Excel |
+| Яндекс/FL.ru: confirm, но статус «Подготовлен» | обновить код на VPS (старый билд); manual-copy → «Отправлен» |
+| 0 проектов в скане | проверить сессию / `enabled: true` в `sources.yaml` |
+| FL.ru not_logged_in | обновить `flru_storage.json` (аналог kwork login) |
 
 ---
 
@@ -315,15 +459,15 @@ tar czf /root/freelance-backup-$(date +%F).tar.gz \
 
 ```
 src/
-  adapters/          # Kwork, auth, pricing
+  adapters/          # Kwork, Yandex, FL.ru, auth, pricing
   analyzer/          # GPT scorer, LightRAG client
   browser/           # Playwright / MCP
-  journal/           # Excel writer
-  pipeline/          # orchestrator
+  journal/           # Excel writer, kwork status sync, vps sync
+  pipeline/          # orchestrator, manual_copy
   telegram_bot/      # aiogram bot
   responses/         # prepared_store
-deploy/              # деплой, sync, kwork login
-config/sources.yaml  # источники скана
+deploy/              # деплой, sync, kwork/flru login
+config/sources.yaml  # источники скана (kwork, yandex, flru, telegram)
 data/                # runtime (не в git)
 tests/
 ```

@@ -25,7 +25,8 @@ ScanReportHandler = Callable[[Message], Awaitable[None]]
 JournalConfirmHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 PrepareRetryHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 RegenerateHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
-ManualProjectHandler = Callable[[Message, str], Awaitable[None]]
+ManualProjectHandler = Callable[[Message, str, str | None], Awaitable[None]]
+ManualTzHandler = Callable[[Message, str], Awaitable[None]]
 
 
 class ReviewService:
@@ -44,6 +45,7 @@ class ReviewService:
         on_prepare_retry: PrepareRetryHandler | None = None,
         on_regenerate: RegenerateHandler | None = None,
         on_manual_project: ManualProjectHandler | None = None,
+        on_manual_tz: ManualTzHandler | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -57,6 +59,7 @@ class ReviewService:
         self._on_prepare_retry = on_prepare_retry
         self._on_regenerate = on_regenerate
         self._on_manual_project = on_manual_project
+        self._on_manual_tz = on_manual_tz
         self.tg_bot.register_handlers(
             on_approve=self._handle_approve,
             on_reject=self._handle_reject,
@@ -67,6 +70,7 @@ class ReviewService:
             on_prepare_retry=self._handle_prepare_retry,
             on_regenerate=self._handle_regenerate,
             on_manual_project=self._handle_manual_project,
+            on_manual_tz=self._handle_manual_tz,
         )
 
     def set_approve_handler(self, handler: ApproveHandler) -> None:
@@ -93,12 +97,15 @@ class ReviewService:
     def set_manual_project_handler(self, handler: ManualProjectHandler) -> None:
         self._on_manual_project = handler
 
+    def set_manual_tz_handler(self, handler: ManualTzHandler) -> None:
+        self._on_manual_tz = handler
+
     async def request_review(
         self,
         project: ProjectFull,
         score: GptScoreResult,
         *,
-        acceptance_tier: Literal["standard", "quick_win"] | None = None,
+        acceptance_tier: Literal["standard", "quick_win", "experience_win"] | None = None,
     ) -> PendingOffer:
         offer = PendingOffer(
             platform=project.platform,
@@ -267,13 +274,23 @@ class ReviewService:
             return
         await self._on_regenerate(platform, source_key, project_id, callback)
 
-    async def _handle_manual_project(self, message: Message, project_id: str) -> None:
+    async def _handle_manual_project(
+        self, message: Message, project_id: str, platform: str | None = None
+    ) -> None:
         if self._on_manual_project is None:
             await message.answer("Ручная обработка ссылок недоступна")
             return
         if str(message.chat.id) != str(self.tg_bot.chat_id):
             return
-        await self._on_manual_project(message, project_id)
+        await self._on_manual_project(message, project_id, platform)
+
+    async def _handle_manual_tz(self, message: Message, text: str) -> None:
+        if self._on_manual_tz is None:
+            await message.answer("Команда /tz недоступна")
+            return
+        if str(message.chat.id) != str(self.tg_bot.chat_id):
+            return
+        await self._on_manual_tz(message, text)
 
     async def _handle_export_journal(self, message: Message) -> None:
         if self._on_export_journal is None:

@@ -1,4 +1,4 @@
-"""Дополнительный трек quick_win поверх стандартного отбора (крупные заказы не трогаем)."""
+"""Треки отбора: standard, quick_win (мелкие быстрые), experience_win (500–1000 ₽ за опыт)."""
 from __future__ import annotations
 
 import re
@@ -20,7 +20,7 @@ _QUICK_WIN_TASK_RE = re.compile(
 
 _OUT_OF_STACK_RE = re.compile(
     r"android|ios|swift|kotlin|flutter|1с|wordpress|тильда|"
-    r"дизайн без|верстк[аи]\s+без|штатн",
+    r"дизайн без|верстк[аи]\s+без|штатн|pdf|пдф|photoshop|figma\s+без",
     re.I,
 )
 
@@ -33,6 +33,17 @@ _NATIVE_MOBILE_RE = re.compile(
 def max_listed_budget_rub(project: ProjectFull) -> int | None:
     amounts = _budget_amounts(project)
     return max(amounts) if amounts else None
+
+
+def is_out_of_stack(project: ProjectFull) -> bool:
+    brief = build_project_brief(project)
+    if not brief:
+        return True
+    if _OUT_OF_STACK_RE.search(brief):
+        return True
+    if _NATIVE_MOBILE_RE.search(brief):
+        return True
+    return False
 
 
 def passes_standard_gate(score: GptScoreResult, settings: Settings) -> bool:
@@ -48,9 +59,7 @@ def is_quick_win_candidate(project: ProjectFull, settings: Settings) -> bool:
     brief = build_project_brief(project)
     if not brief or not _QUICK_WIN_TASK_RE.search(brief):
         return False
-    if _OUT_OF_STACK_RE.search(brief):
-        return False
-    if _NATIVE_MOBILE_RE.search(brief):
+    if is_out_of_stack(project):
         return False
 
     max_budget = max_listed_budget_rub(project)
@@ -73,18 +82,55 @@ def passes_quick_win_gate(
     return int(score.score) >= settings.quick_win_min_score
 
 
+def is_experience_win_budget(project: ProjectFull, settings: Settings) -> bool:
+    max_budget = max_listed_budget_rub(project)
+    if max_budget is None:
+        return False
+    return (
+        settings.experience_win_min_budget_rub
+        <= max_budget
+        <= settings.experience_win_max_budget_rub
+    )
+
+
+def is_experience_win_candidate(project: ProjectFull, settings: Settings) -> bool:
+    """Микробюджет 500–1000 ₽: главное совпадение со стеком, не заработок."""
+    if not settings.experience_win_enabled:
+        return False
+    if not is_experience_win_budget(project, settings):
+        return False
+    if is_out_of_stack(project):
+        return False
+    return True
+
+
+def passes_experience_win_gate(
+    project: ProjectFull, score: GptScoreResult, settings: Settings
+) -> bool:
+    if not is_experience_win_candidate(project, settings):
+        return False
+    if int(score.score) < settings.experience_win_min_score:
+        return False
+    skills = [s.strip() for s in (score.matched_skills or []) if str(s).strip()]
+    return len(skills) >= settings.experience_win_min_matched_skills
+
+
 def resolve_acceptance_tier(
     project: ProjectFull, score: GptScoreResult, settings: Settings
 ) -> str | None:
-    """standard — старые правила; quick_win — только если standard не прошёл."""
+    """standard → quick_win → experience_win (если предыдущие не прошли)."""
     if passes_standard_gate(score, settings):
         return "standard"
     if passes_quick_win_gate(project, score, settings):
         return "quick_win"
+    if passes_experience_win_gate(project, score, settings):
+        return "experience_win"
     return None
 
 
 def tier_label(tier: str | None) -> str:
     if tier == "quick_win":
         return "⚡ Быстрый заказ"
+    if tier == "experience_win":
+        return "🎯 За опыт"
     return ""

@@ -3,8 +3,10 @@ from __future__ import annotations
 import pytest
 
 from src.analyzer.project_tier import (
+    is_experience_win_candidate,
     is_quick_win_candidate,
     max_listed_budget_rub,
+    passes_experience_win_gate,
     passes_quick_win_gate,
     passes_standard_gate,
     resolve_acceptance_tier,
@@ -26,6 +28,10 @@ def settings() -> Settings:
         quick_win_min_score=5,
         quick_win_max_budget_rub=10_000,
         quick_win_max_offers_count=40,
+        experience_win_enabled=True,
+        experience_win_min_budget_rub=500,
+        experience_win_max_budget_rub=1_000,
+        experience_win_min_score=4,
         _env_file=None,
     )
 
@@ -121,3 +127,74 @@ def test_quick_win_candidate_landing(settings: Settings) -> None:
     assert is_quick_win_candidate(project, settings)
     low = _score(value=6, fit=False)
     assert resolve_acceptance_tier(project, low, settings) == "quick_win"
+
+
+def test_experience_win_microbudget_stack_match(settings: Settings) -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="micro1",
+        url="https://kwork.ru/projects/micro1/view",
+        title="Telegram-бот для уведомлений",
+        full_description="Небольшой бот на Python aiogram, 2 команды",
+        max_budget="800 ₽",
+        offers_count=5,
+    )
+    score = _score(value=4, fit=False)
+    assert is_experience_win_candidate(project, settings)
+    assert passes_experience_win_gate(project, score, settings)
+    assert resolve_acceptance_tier(project, score, settings) == "experience_win"
+
+
+def test_experience_win_rejects_without_stack_match(settings: Settings) -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="micro2",
+        url="https://kwork.ru/projects/micro2/view",
+        title="Telegram-бот",
+        full_description="Небольшой бот",
+        max_budget="700 ₽",
+        offers_count=3,
+    )
+    score = GptScoreResult(
+        score=4,
+        fit=False,
+        reason="weak",
+        matched_skills=[],
+        risks=[],
+        suggested_project_type="Telegram-бот",
+        competition_level="low",
+        recommendation="пропустить",
+    )
+    assert not passes_experience_win_gate(project, score, settings)
+
+
+def test_experience_win_rejects_out_of_stack(settings: Settings) -> None:
+    project = ProjectFull(
+        platform="yandex_uslugi",
+        source_key="yandex_uslugi_it",
+        project_id="micro-wp",
+        url="https://uslugi.yandex.ru/order/x",
+        title="WordPress блог",
+        full_description="Настроить wordpress",
+        max_budget="900 ₽",
+        offers_count=2,
+    )
+    score = _score(value=5, fit=False)
+    assert not is_experience_win_candidate(project, settings)
+
+
+def test_experience_win_rejects_over_budget(settings: Settings) -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="micro3",
+        url="https://kwork.ru/projects/micro3/view",
+        title="Парсинг",
+        full_description="Небольшой парсинг csv",
+        max_budget="3 000 ₽",
+        offers_count=2,
+    )
+    score = _score(value=4, fit=False)
+    assert not is_experience_win_candidate(project, settings)

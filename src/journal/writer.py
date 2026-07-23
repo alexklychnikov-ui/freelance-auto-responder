@@ -12,6 +12,9 @@ from openpyxl.styles import Alignment
 from openpyxl.styles import Font
 from openpyxl.styles import PatternFill
 
+from src.adapters.flru_urls import extract_flru_project_id
+from src.adapters.kwork_urls import extract_kwork_project_id
+from src.adapters.yandex_urls import extract_yandex_order_id
 from src.models import GptScoreResult, ProjectFull
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,7 @@ PLATFORM_DISPLAY = {
     "kwork": "Kwork",
     "flru": "FL.ru",
     "telegram": "Telegram",
+    "yandex_uslugi": "Яндекс Услуги",
 }
 
 
@@ -58,6 +62,26 @@ def infer_project_type(title: str) -> str:
     if any(x in low for x in ("автомат", "скрипт", "excel", "google sheet")):
         return "Автоматизация"
     return "Другое"
+
+
+def extract_journal_project_id(text: str) -> str | None:
+    """Extract canonical project/order id from a journal URL cell."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    normalized = raw.replace("\\", "/")
+    for extractor in (
+        extract_kwork_project_id,
+        extract_flru_project_id,
+        extract_yandex_order_id,
+    ):
+        project_id = extractor(normalized)
+        if project_id:
+            return project_id
+    for part in normalized.split("/"):
+        if part.isdigit() and len(part) >= 3:
+            return part
+    return None
 
 
 def format_response_payload(
@@ -195,13 +219,9 @@ class JournalWriter:
             if cell.value is None:
                 continue
             text = self._url_from_cell(cell)
-            match = re.search(r"/projects/(\d+)", text.replace("\\", "/"))
-            if match:
-                ids.add(match.group(1))
-                continue
-            for part in text.replace("\\", "/").split("/"):
-                if part.isdigit() and len(part) >= 3:
-                    ids.add(part)
+            project_id = extract_journal_project_id(text)
+            if project_id:
+                ids.add(project_id)
         wb.close()
         return ids
 
@@ -431,6 +451,8 @@ class JournalWriter:
         *,
         price: str | None = None,
         delivery_days: int | None = None,
+        status: str = "Подготовлен",
+        result: str = "Жду ответа",
     ) -> int:
         self._ensure_workbook()
         wb = load_workbook(self.journal_path)
@@ -450,8 +472,8 @@ class JournalWriter:
         ws.cell(row=row, column=3, value=platform_label)
         self._set_url_cell(ws, row, project.url)
         ws.cell(row=row, column=5, value=score.suggested_project_type)
-        ws.cell(row=row, column=6, value="Подготовлен")
-        ws.cell(row=row, column=7, value="Жду ответа")
+        ws.cell(row=row, column=6, value=status)
+        ws.cell(row=row, column=7, value=result)
         ws.cell(row=row, column=8, value=project.full_description)
         ws.cell(row=row, column=9, value=response_payload)
         ws.cell(row=row, column=8).alignment = Alignment(vertical="top", wrap_text=True)
@@ -459,9 +481,10 @@ class JournalWriter:
 
         wb.save(self.journal_path)
         logger.info(
-            "journal_prepared project_id=%s row=%d",
+            "journal_prepared project_id=%s row=%d status=%r",
             project.project_id,
             row,
+            status,
         )
         return row
 

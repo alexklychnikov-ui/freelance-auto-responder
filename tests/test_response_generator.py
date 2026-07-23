@@ -139,7 +139,7 @@ def test_banned_phrase_triggers_retry(monkeypatch) -> None:
         return (
             "По выгрузке ведомостей из Excel логично начать с формата файла. "
             "Срок — 3–5 дней. Стоимость — от 15 000 ₽. "
-            "Предлагаю обсудить детали и приступить."
+            "Если подход ок — напишите, согласуем старт."
         )
 
     def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):

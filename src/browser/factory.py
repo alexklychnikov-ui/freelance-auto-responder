@@ -8,12 +8,19 @@ from src.browser.mcp_session import resolve_server_path
 from src.config import Settings
 
 
-def get_browser_client(settings: Settings) -> BrowserClient:
+def get_browser_client(
+    settings: Settings,
+    *,
+    storage_state_path: str | None = None,
+) -> BrowserClient:
     adapter = settings.browser_adapter.lower().strip()
     server_path = resolve_server_path(settings.browsermcp_server)
     wait = settings.browser_navigate_wait_seconds
     if adapter == "playwright":
-        storage = (settings.kwork_storage_state or "").strip() or None
+        if storage_state_path is not None:
+            storage = (storage_state_path or "").strip() or None
+        else:
+            storage = (settings.kwork_storage_state or "").strip() or None
         return PlaywrightBrowserAdapter(storage_state_path=storage)
     if adapter == "external":
         return ExternalBrowserMcpAdapter(

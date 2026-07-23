@@ -14,7 +14,8 @@ if str(REPO) not in sys.path:
 
 from src.config import get_settings
 from src.journal.kwork_status_sync import sync_journal_from_kwork_offers
-from src.journal.writer import JournalWriter, format_response_payload
+from src.journal.writer import JournalWriter
+from src.pipeline.manual_copy import journal_status_for_confirm
 from src.responses.prepared_store import PreparedResponse
 
 VPS = os.environ.get("FREELANCE_VPS_HOST", "LightRAG_Naive")
@@ -166,20 +167,14 @@ def main() -> int:
                 continue
 
             in_journal = item.project_id in existing_ids
-            response_payload = format_response_payload(
-                item.response_text,
-                price=item.price,
-                delivery_days=item.delivery_days,
-            )
 
+            # Never overwrite journal column I with AI prepared.response_text.
+            # Platform text is refreshed on VPS via sync_journal_on_vps / backfill.
             if item.journal_exported and in_journal:
-                if writer.update_response_by_project_id(item.project_id, response_payload):
-                    print(f"OK response: {item.title}")
                 continue
             if (not item.journal_exported) and in_journal:
-                if writer.update_response_by_project_id(item.project_id, response_payload):
-                    print(f"OK response: {item.title}")
                 _mark_exported_on_vps(path.name)
+                print(f"OK marked exported (kept existing I): {item.title}")
                 continue
             if item.journal_exported and not in_journal:
                 print(
@@ -198,12 +193,15 @@ def main() -> int:
             return _sync_kwork_offer_statuses(journal_path)
 
         for filename, item in pending:
+            journal_status, journal_result = journal_status_for_confirm(item.platform)
             row = writer.append_prepared(
                 item.project,
                 item.score,
                 item.response_text,
                 price=item.price,
                 delivery_days=item.delivery_days,
+                status=journal_status,
+                result=journal_result,
             )
             existing_ids.add(item.project_id)
             _mark_exported_on_vps(filename)

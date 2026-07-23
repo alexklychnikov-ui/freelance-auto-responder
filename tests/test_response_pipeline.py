@@ -47,20 +47,60 @@ def _project(*, buyer: str | None = None) -> ProjectFull:
 
 
 SAMPLE_DRAFT = (
-    "Соберу Telegram-бота под заявки менеджеру: каталог, форма и уведомление.\n"
+    "Сделаю Telegram-бота под заявки менеджеру: каталог, форма и уведомление.\n"
     "Сделаю на aiogram + SQLite, сценарий: заявка уходит менеджеру.\n"
     "Срок — 5–7 дней. Стоимость — от 20 000 ₽.\n"
-    "Предлагаю обсудить детали и приступить."
+    "Если подход ок — напишите, согласуем старт."
 )
 
 
 def test_named_hello_allowed_bare_banned() -> None:
-    assert soft_banned_issues("Здравствуйте! Готов помочь.") 
+    assert soft_banned_issues("Здравствуйте! Готов помочь.")
     assert any("opener" in i for i in soft_banned_issues("Здравствуйте! Готов помочь."))
-    named = "Ирина, здравствуйте! Соберу бота под ваши заявки за 5 дней."
+    named = "Ирина, здравствуйте! Сделаю бота под ваши заявки за 5 дней."
     assert not any(i.startswith("opener:") for i in soft_banned_issues(named))
     assert _buyer_first_name("Ирина · 80%") == "Ирина"
     assert _buyer_first_name(None) is None
+
+
+def test_soft_banned_sobery_opener_and_cta() -> None:
+    sobery = soft_banned_issues("Соберу бота под ваши заявки за 5 дней.")
+    assert any(i == "opener:^соберу" for i in sobery)
+    named_sobery = soft_banned_issues(
+        "Ирина, здравствуйте! Соберу бота под ваши заявки за 5 дней."
+    )
+    assert any(i == "opener:^соберу" for i in named_sobery)
+    cta = soft_banned_issues(
+        "Сделаю бота. Срок — 5 дней. Стоимость — от 20 000 ₽. "
+        "Предлагаю обсудить детали и приступить."
+    )
+    assert any("предлагаю обсудить детали и приступить" in i for i in cta)
+    clean = soft_banned_issues(
+        "Ирина, здравствуйте! Сделаю бота под ваши заявки. "
+        "Если подход ок — напишите, согласуем старт."
+    )
+    assert clean == []
+
+
+def test_soft_banned_docx_prompt_phrases() -> None:
+    assert any("задача понятна" in i for i in soft_banned_issues("Задача понятна. Сделаю бота."))
+    assert any(
+        "по договорённости" in i or "по договоренности" in i
+        for i in soft_banned_issues("Сделаю бота. Стоимость — по договорённости.")
+    )
+    assert any(
+        "я специализируюсь" in i
+        for i in soft_banned_issues("Я специализируюсь на ботах. Сделаю интеграцию.")
+    )
+
+
+def test_soft_banned_ponimayu_template_opener() -> None:
+    template = "Ирина, здравствуйте! Понимаю, что вам требуется бот."
+    issues = soft_banned_issues(template)
+    assert any("понимаю, что вам" in i for i in issues)
+    assert not soft_banned_issues(
+        "Ирина, здравствуйте! Сделаю Telegram-бота под заявки менеджеру."
+    )
 
 
 def test_pipeline_happy_path_one_draft(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -92,7 +132,7 @@ def test_pipeline_happy_path_one_draft(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(pipe, "_openai_json", fake_json)
 
     out = pipe.generate(_project(), "ctx", progress=texts.append)
-    assert "Соберу Telegram-бота" in out
+    assert "Сделаю Telegram-бота" in out
     assert drafts == 1
     assert texts[0] == MSG_DRAFT
     assert MSG_LOGIC in texts
@@ -297,6 +337,31 @@ def test_draft_too_short_for_many_questions() -> None:
     assert draft_too_short_for_questions(long, questions) is False
 
 
+def test_build_draft_payload_includes_budget_mismatch() -> None:
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+    gap = {
+        "ceiling": 1500,
+        "fair_price": 20_000,
+        "fill_price": 1500,
+        "ratio": 13.3333,
+    }
+    payload = pipe._build_draft_payload(
+        _project(),
+        "ctx",
+        price_hint=20_000,
+        budget_mismatch=gap,
+    )
+    assert payload["budget_mismatch"] == gap
+    assert payload["price_hint"] == 20_000
+    plain = pipe._build_draft_payload(_project(), "ctx")
+    assert "budget_mismatch" not in plain
+
+
+def test_soft_banned_still_flags_ponimayu_with_budget_gap() -> None:
+    template = "Ирина, здравствуйте! Понимаю, что вам требуется бот."
+    assert any("понимаю, что вам" in i for i in soft_banned_issues(template))
+
+
 def test_critique_force_fail_short_draft_many_questions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -310,7 +375,7 @@ def test_critique_force_fail_short_draft_many_questions(
         full_description=f"Нужен бот.\n{questions_block}",
         desired_budget="от 20000",
     )
-    short = "Соберу бота. Срок 5 дней. Стоимость от 20 000. Обсудим."
+    short = "Сделаю бота. Срок 5 дней. Стоимость от 20 000. Обсудим."
     assert force_logic_fail_for_questions(
         short, project, verdict="pass", missing=[]
     ) == ["too_short_for_all_questions"]

@@ -49,5 +49,23 @@ def test_factory_unknown_raises() -> None:
         get_browser_client(settings)
 
 
+def test_factory_playwright_custom_storage(tmp_path) -> None:
+    from src.browser.playwright_adapter import PlaywrightBrowserAdapter
+
+    state = tmp_path / "yandex_storage.json"
+    settings = Settings(
+        openai_api_key="k",
+        telegram_bot_token="t",
+        telegram_chat_id="1",
+        response_journal="j.xlsx",
+        browser_adapter="playwright",
+        kwork_storage_state=str(tmp_path / "kwork_storage.json"),
+        _env_file=None,
+    )
+    client = get_browser_client(settings, storage_state_path=str(state))
+    assert isinstance(client, PlaywrightBrowserAdapter)
+    assert client._storage_state_path == str(state)
+
+
 def test_browser_client_protocol() -> None:
     assert isinstance(CursorBrowserAdapter(), BrowserClient)

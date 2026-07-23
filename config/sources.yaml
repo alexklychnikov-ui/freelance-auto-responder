@@ -20,6 +20,16 @@ sources:
     scan_interval_minutes: 15
     bootstrap: true
 
+  - id: flru_orders
+    platform: flru
+    enabled: true
+    url: https://www.fl.ru/projects/?kind=1
+    scan_interval_minutes: 30
+    bootstrap: true
+    filters:
+      skip_closed: true
+      skip_vacancy: true
+
   - id: flru_ai
     platform: flru
     enabled: false
@@ -38,9 +48,10 @@ sources:
 
   - id: yandex_uslugi_it
     platform: yandex_uslugi
-    enabled: false
-    url: https://uslugi.yandex.ru/
+    enabled: true
+    url: https://uslugi.yandex.ru/cab/orders?completely_moderated=1&rubric=4479&rubric=4772&rubric=4781&rubric=4789&type=new
     scan_interval_minutes: 30
+    bootstrap: true
 
   - id: tg_job_webdev
     platform: telegram

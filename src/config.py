@@ -55,11 +55,19 @@ class Settings(BaseSettings):
     scan_interval_minutes: int = 15
     min_gpt_score: int = 7
     budget_ceiling_price_multiplier: float = 2.0
+    offer_price_competitive_factor: float = 0.8
+
     quick_win_enabled: bool = True
     quick_win_min_score: int = 5
     quick_win_max_budget_rub: int = 10_000
     quick_win_max_offers_count: int = 40
     quick_win_max_delivery_days: int = 2
+
+    experience_win_enabled: bool = True
+    experience_win_min_budget_rub: int = 500
+    experience_win_max_budget_rub: int = 1_000
+    experience_win_min_score: int = 4
+    experience_win_min_matched_skills: int = 1
     max_daily_responses: int = 5
     require_telegram_approval: bool = True
     scan_bootstrap_skip_pipeline: bool = True
@@ -77,6 +85,12 @@ class Settings(BaseSettings):
     kwork_password: str | None = None
     kwork_auto_login: bool = True
     kwork_storage_state: str = ""
+
+    yandex_storage_state: str = ""
+    yandex_max_daily_responses: int = 7
+
+    flru_storage_state: str = ""
+    flru_max_daily_responses: int = 10
 
     @model_validator(mode="before")
     @classmethod

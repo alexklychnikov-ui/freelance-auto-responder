@@ -84,6 +84,87 @@ async def test_kwork_url_triggers_manual_project_handler() -> None:
     await bot.close()
 
 
+@pytest.mark.asyncio
+async def test_tz_command_triggers_manual_tz_handler() -> None:
+    tz_handler = AsyncMock()
+    text_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_response_text=text_handler,
+        on_manual_tz=tz_handler,
+    )
+
+    await bot.dispatcher.feed_update(
+        bot.bot,
+        _make_update("/tz Нужен парсер данных с сайта " + ("x" * 40)),
+    )
+
+    tz_handler.assert_awaited_once()
+    text_handler.assert_not_awaited()
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_tz_awaiting_next_message() -> None:
+    tz_handler = AsyncMock()
+    text_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_response_text=text_handler,
+        on_manual_tz=tz_handler,
+    )
+
+    bot._tz_awaiting_chats.add("123")
+    body = "Нужен скрипт на Python " + ("x" * 40)
+    await bot.dispatcher.feed_update(bot.bot, _make_update(body))
+
+    tz_handler.assert_awaited_once()
+    assert tz_handler.await_args.args[1] == body
+    text_handler.assert_not_awaited()
+    await bot.close()
+
+
+def test_review_keyboard_without_url_has_no_open_button() -> None:
+    from datetime import datetime, timezone
+
+    from src.models import GptScoreResult, PendingOffer, ProjectFull
+    from src.telegram_bot.bot import build_review_keyboard
+
+    offer = PendingOffer(
+        platform="telegram",
+        source_key="tz_manual",
+        project_id="tz_123",
+        url="",
+        title="ТЗ без ссылки",
+        project=ProjectFull(
+            platform="telegram",
+            source_key="tz_manual",
+            project_id="tz_123",
+            url="",
+            title="ТЗ без ссылки",
+            full_description="desc " * 20,
+        ),
+        score=GptScoreResult(
+            score=8,
+            fit=True,
+            reason="ok",
+            matched_skills=[],
+            risks=[],
+            suggested_project_type="Telegram-бот",
+            competition_level="low",
+            recommendation="откликаться",
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+    kb = build_review_keyboard(offer)
+    assert len(kb.inline_keyboard) == 1
+    assert kb.inline_keyboard[0][0].text == "✅ Откликнуть"
+
+
 def test_prepared_keyboard_has_confirm_and_regenerate() -> None:
     from datetime import datetime, timezone
 

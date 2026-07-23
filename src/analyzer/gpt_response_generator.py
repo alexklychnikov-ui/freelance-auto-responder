@@ -11,6 +11,8 @@ import httpx
 from src.analyzer.project_brief import build_project_brief
 from src.analyzer.response_pipeline import (
     ResponsePipeline,
+    _BANNED_OPENERS,
+    _BANNED_PHRASES,
     soft_banned_issues,
 )
 from src.analyzer.response_qa import ResponseQaValidator
@@ -19,30 +21,7 @@ from src.models import ProjectFull
 
 logger = logging.getLogger(__name__)
 
-# Re-export for older tests / callers
-_BANNED_OPENERS = (
-    r"^добрый день",
-    r"^здравствуйте",
-    r"^доброго времени",
-    r"^приветствую",
-    r"^изучив ваш проект",
-    r"^изучил ваш",
-)
-
-_BANNED_PHRASES = (
-    "с удовольствием помогу",
-    "имею большой опыт",
-    "готов выполнить ваш проект",
-    "готов выполнить",
-    "буду рад сотрудничеству",
-    "уважаемый заказчик",
-    "обращайтесь",
-    "понимаю, что основная задача заключается",
-    "ознакомился с тз",
-    "изучил заказ",
-    "заинтересовал проект",
-    "наткнулся",
-)
+# Re-export for older tests / callers — single source in response_pipeline
 
 
 def _soft_banned_check(text: str) -> list[str]:
@@ -99,6 +78,7 @@ class GptResponseGenerator:
         progress: Callable[[str], None] | None = None,
         price_hint: int | str | None = None,
         days_hint: int | None = None,
+        budget_mismatch: dict[str, Any] | None = None,
     ) -> str:
         _ = platform_label  # reserved for multi-platform prompts
         return self._pipeline.generate(
@@ -109,6 +89,7 @@ class GptResponseGenerator:
             progress=progress,
             price_hint=price_hint,
             days_hint=days_hint,
+            budget_mismatch=budget_mismatch,
         )
 
     async def generate_with_progress(
@@ -122,6 +103,7 @@ class GptResponseGenerator:
         platform_label: str | None = None,
         price_hint: int | str | None = None,
         days_hint: int | None = None,
+        budget_mismatch: dict[str, Any] | None = None,
     ) -> str:
         _ = platform_label
         return await self._pipeline.generate_with_progress(
@@ -132,5 +114,6 @@ class GptResponseGenerator:
             recent_responses=recent_responses or {"count": 0},
             price_hint=price_hint,
             days_hint=days_hint,
+            budget_mismatch=budget_mismatch,
             threaded=True,
         )

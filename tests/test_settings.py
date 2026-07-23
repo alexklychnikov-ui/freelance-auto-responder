@@ -26,12 +26,20 @@ def test_load_sources_yaml() -> None:
     assert by_id["kwork_dev_it"].url == "https://kwork.ru/projects?c=11"
     assert by_id["kwork_c5"].url == "https://kwork.ru/projects?c=5"
     assert by_id["kwork_c15"].url == "https://kwork.ru/projects?c=15"
+    yandex = next(s for s in sources if s.id == "yandex_uslugi_it")
+    assert yandex.platform == "yandex_uslugi"
+    assert yandex.enabled is True
+    assert "cab/orders" in (yandex.url or "")
+    assert "rubric=4479" in (yandex.url or "")
 
 
-def test_enabled_sources_only_kwork() -> None:
+def test_enabled_sources_include_kwork_and_yandex() -> None:
     enabled = get_enabled_sources("config/sources.yaml")
-    assert len(enabled) == 3
-    assert {s.id for s in enabled} == {"kwork_dev_it", "kwork_c5", "kwork_c15"}
+    ids = {s.id for s in enabled}
+    assert {"kwork_dev_it", "kwork_c5", "kwork_c15", "yandex_uslugi_it", "flru_orders"} <= ids
+    flru = next(s for s in enabled if s.id == "flru_orders")
+    assert flru.platform == "flru"
+    assert "kind=1" in (flru.url or "")
 
 
 def test_settings_from_env(env_vars: None) -> None:

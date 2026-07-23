@@ -8,10 +8,15 @@ from typing import Any
 import httpx
 
 from src.adapters.kwork_delivery import snap_delivery_days
-from src.adapters.kwork_pricing import clamp_price_to_budget, suggest_offer_price
+from src.adapters.kwork_pricing import (
+    apply_competitive_price,
+    clamp_price_to_budget,
+    suggest_offer_price,
+)
 from src.analyzer.gpt_scorer import _extract_json
 from src.config import Settings
 from src.models import OfferTerms, ProjectFull
+
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +61,12 @@ def _days_from_response_text(text: str) -> int | None:
     return max(1, min(30, int(match.group(1))))
 
 
-def _normalize_terms(raw: dict[str, Any], project: ProjectFull) -> OfferTerms:
+def _normalize_terms(
+    raw: dict[str, Any],
+    project: ProjectFull,
+    *,
+    competitive_factor: float = 0.8,
+) -> OfferTerms:
     price_raw = raw.get("price_rub", raw.get("price", 0))
     if isinstance(price_raw, str):
         price_raw = int(re.sub(r"\D", "", price_raw) or 0)
@@ -69,10 +79,12 @@ def _normalize_terms(raw: dict[str, Any], project: ProjectFull) -> OfferTerms:
 
     if price < 500:
         price = int(suggest_offer_price(project))
+    price = apply_competitive_price(price, competitive_factor)
     price = clamp_price_to_budget(price, project)
 
     summary = str(raw.get("plan_summary") or "").strip()
     return OfferTerms(price_rub=price, delivery_days=days, plan_summary=summary)
+
 
 
 class GptOfferEstimator:
@@ -135,10 +147,15 @@ class GptOfferEstimator:
             response = self._get_client().post(url, headers=headers, json=body)
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
-            return _normalize_terms(_extract_json(content), project)
+            return _normalize_terms(
+                _extract_json(content),
+                project,
+                competitive_factor=self.settings.offer_price_competitive_factor,
+            )
         except Exception:
             logger.exception("gpt_estimate_offer_failed project_id=%s", project.project_id)
             return self.fallback(project, response_text)
+
 
     def estimate_market_cost(
         self,
@@ -179,15 +196,27 @@ class GptOfferEstimator:
             price_raw = raw.get("price_rub", raw.get("price", 0))
             if isinstance(price_raw, str):
                 price_raw = int(re.sub(r"\D", "", price_raw) or 0)
-            return max(0, int(price_raw or 0))
+            price = max(0, int(price_raw or 0))
+            if price <= 0:
+                return 0
+            return apply_competitive_price(
+                price, self.settings.offer_price_competitive_factor
+            )
         except Exception:
             logger.exception(
                 "gpt_estimate_market_cost_failed project_id=%s", project.project_id
             )
-            return int(suggest_offer_price(project))
+            return apply_competitive_price(
+                int(suggest_offer_price(project)),
+                self.settings.offer_price_competitive_factor,
+            )
 
     def fallback(self, project: ProjectFull, response_text: str) -> OfferTerms:
-        price = int(suggest_offer_price(project))
+        price = apply_competitive_price(
+            int(suggest_offer_price(project)),
+            self.settings.offer_price_competitive_factor,
+        )
+        price = clamp_price_to_budget(price, project)
         days = _days_from_response_text(response_text) or self.settings.default_offer_days
         return OfferTerms(
             price_rub=price,

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
@@ -11,7 +12,13 @@ from src.adapters.kwork_delivery import (
     KWORK_DELIVERY_DAY_OPTIONS,
     snap_delivery_days,
 )
-from src.adapters.kwork_pricing import clamp_price_to_budget, parse_form_price_bounds
+from src.adapters.kwork_pricing import (
+    budget_gap,
+    clamp_price_to_budget,
+    ensure_budget_mismatch_note,
+    parse_budget_ceiling_rub,
+    parse_form_price_bounds,
+)
 from src.adapters.kwork_stages import plan_offer_stages
 from src.adapters.kwork_auth import (
     KworkAuthError,
@@ -189,9 +196,31 @@ PROJECT_EXTRACTOR_JS = """
     .filter(Boolean);
 
   const pageText = norm(document.body?.innerText || root.textContent || '');
+  const fmtDo = (n) => (n ? ('до ' + norm(n) + ' ₽') : null);
+  // labelRe is fed to RegExp — pass \\\\s from Python so the pattern keeps whitespace class
   const budgetAfter = (labelRe) => {
-    const m = pageText.match(new RegExp(labelRe + '[^\\d]{0,30}([\\d\\s]+)\\s*₽', 'i'));
-    return m ? norm(m[1]) + ' ₽' : null;
+    const m = pageText.match(
+      new RegExp(labelRe + '[^\\\\d]{0,40}([\\\\d\\\\s\\\\u00a0]+)\\\\s*(?:₽|руб\\\\.?)', 'i')
+    );
+    return m ? fmtDo(m[1]) : null;
+  };
+  const budgetDoOnly = () => {
+    // «Цена до: 1 500 ₽» / «до 1 500 ₽» without «допустимый» label
+    const m = pageText.match(
+      /(?:^|[^а-яёa-z0-9])(?:цена\\s*)?до[:\\s]*([\\d\\s\\u00a0]+)\\s*(?:₽|руб\\.?)/i
+    );
+    return fmtDo(m ? m[1] : null);
+  };
+  // Explicit «Допустимый: до 45 000 ₽» — must not fall through to first «до X» (желаемый)
+  const budgetDopustimy = () => {
+    let m = pageText.match(
+      /допустим(?:ый|ая|ое|ого)?\\s*:?\\s*до[:\\s]*([\\d\\s\\u00a0]+)\\s*(?:₽|руб\\.?)/i
+    );
+    if (m) return fmtDo(m[1]);
+    m = pageText.match(
+      /допустим(?:ый|ая|ое|ого)?[^\\d]{0,30}([\\d\\s\\u00a0]+)\\s*(?:₽|руб\\.?)/i
+    );
+    return fmtDo(m ? m[1] : null);
   };
 
   const offersRaw = root.querySelector('.offers-count, [data-offers]');
@@ -241,12 +270,26 @@ PROJECT_EXTRACTOR_JS = """
     full_description: fullDescription,
     desired_budget:
       norm(root.querySelector('.desired-budget, [data-desired-budget]')?.textContent || '')
-      || budgetAfter('желаем(?:ый|ого)?\\s+бюджет')
+      || (() => {
+          const m = pageText.match(
+            /желаем(?:ый|ая|ое|ого)?\\s+бюджет[^\\d]{0,40}([\\d\\s\\u00a0]+)\\s*(?:₽|руб\\.?)/i
+          );
+          return m ? fmtDo(m[1]) : null;
+        })()
+      || budgetAfter('желаем(?:ый|ого)?\\\\s+бюджет')
+      || budgetDoOnly()
       || null,
     max_budget:
       norm(root.querySelector('.max-budget, [data-max-budget]')?.textContent || '')
-      || budgetAfter('допустим(?:ый|ого)?')
-      || budgetAfter('до')
+      || budgetDopustimy()
+      || budgetAfter('допустим(?:ый|ая|ое|ого)?\\\\s*(?:бюджет)?')
+      || (() => {
+          const m = pageText.match(
+            /цена\\s*до[:\\s]*([\\d\\s\\u00a0]+)\\s*(?:₽|руб\\.?)/i
+          );
+          return m ? fmtDo(m[1]) : null;
+        })()
+      // no budgetDoOnly here — first «до X» is желаемый and steals ceiling
       || null,
     offers_count: offers,
     buyer,
@@ -482,13 +525,57 @@ EXTRACT_ORDER_TITLE_ON_PAGE_JS = """
 }
 """
 
+READ_OFFER_DESCRIPTION_JS = """
+() => {
+  const strip = (s) => (s || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\\s+/g, ' ')
+    .trim();
+  const ta =
+    document.querySelector('textarea[name="description"]') ||
+    document.querySelector('textarea.v-textarea') ||
+    document.querySelector('.wants-offer__description textarea') ||
+    document.querySelector('textarea');
+  const ed =
+    ta?.closest('.trumbowyg-box')?.querySelector('.trumbowyg-editor') ||
+    document.querySelector('.wants-offer__description .trumbowyg-editor') ||
+    document.querySelector('.trumbowyg-editor[contenteditable="true"]');
+  const fromTa = strip(ta?.value || '');
+  const fromEd = strip(ed?.innerText || ed?.textContent || '');
+  const description = fromEd.length >= fromTa.length ? fromEd : fromTa;
+  const hasForm = Boolean(
+    document.querySelector(
+      '.custom-kwork-offer__wrapper, .offer-custom, textarea[name="description"]'
+    )
+  );
+  return {
+    url: location.href,
+    hasForm,
+    description,
+    fromTaLen: fromTa.length,
+    fromEdLen: fromEd.length,
+  };
+}
+"""
+
 READ_OFFER_FORM_JS = f"""
 () => {{
+  const strip = (s) => (s || '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\\s+/g, ' ')
+    .trim();
   const desc =
     document.querySelector('textarea[name="description"]') ||
     document.querySelector('textarea.v-textarea') ||
     document.querySelector('.wants-offer__description textarea') ||
     document.querySelector('textarea');
+  const ed =
+    desc?.closest('.trumbowyg-box')?.querySelector('.trumbowyg-editor') ||
+    document.querySelector('.wants-offer__description .trumbowyg-editor') ||
+    document.querySelector('.trumbowyg-editor[contenteditable="true"]');
+  const fromTa = strip(desc?.value || '');
+  const fromEd = strip(ed?.innerText || ed?.textContent || '');
+  const description = fromEd.length >= fromTa.length ? fromEd : fromTa;
   const priceInput = (() => {{
     const findPrice = {FIND_PRICE_INPUT_JS};
     return findPrice();
@@ -521,8 +608,9 @@ READ_OFFER_FORM_JS = f"""
     : '';
   return {{
     url: location.href,
-    descLen: (desc?.value || '').length,
-    descPreview: (desc?.value || '').slice(0, 100),
+    description,
+    descLen: description.length,
+    descPreview: description.slice(0, 100),
     price: (priceInput?.value || '').replace(/\\s/g, ''),
     title: titlePlain,
     deadline: (() => {{
@@ -1206,6 +1294,18 @@ def _check_offer_form_available(
     if state.get("hasForm"):
         return None
 
+    # Guest (+ listing redirect) must not look like a generic form-unavailable.
+    try:
+        logged_in = bool(is_logged_in(browser))
+    except Exception:
+        logged_in = False
+    if not logged_in:
+        return SubmitResult(
+            success=False,
+            project_id=project_id,
+            message="not_logged_in: нужен логин Kwork на VPS",
+        )
+
     on_offers = _project_on_my_offers(browser, project_id)
     if on_offers or state.get("projectClosed"):
         return SubmitResult(
@@ -1239,6 +1339,161 @@ def _fill_first(browser: BrowserClient, selectors: tuple[str, ...], value: str) 
 def _read_offer_form(browser: BrowserClient) -> dict[str, Any]:
     data = browser.evaluate(READ_OFFER_FORM_JS)
     return data if isinstance(data, dict) else {}
+
+
+@dataclass
+class OfferFormSnapshot:
+    description: str
+    price: str | None = None
+    delivery_days: int | None = None
+    ok: bool = False
+    error: str | None = None
+
+
+def _parse_delivery_days_label(raw: str | None) -> int | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    match = re.search(r"(\d+)", text)
+    if not match:
+        return None
+    try:
+        return snap_delivery_days(int(match.group(1)))
+    except Exception:
+        return None
+
+
+def _read_offer_text_from_new_offer_form(
+    browser: BrowserClient, project_id: str
+) -> OfferFormSnapshot:
+    """Fallback: draft still editable on new_offer form."""
+    pid = str(project_id or "").strip()
+    try:
+        browser.navigate(kwork_offer_form_url(pid))
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(4000)
+    except Exception as exc:
+        return OfferFormSnapshot(
+            description="", ok=False, error=f"navigate_failed: {exc}"
+        )
+
+    try:
+        if not is_logged_in(browser):
+            return OfferFormSnapshot(description="", ok=False, error="not_logged_in")
+    except Exception as exc:
+        return OfferFormSnapshot(
+            description="", ok=False, error=f"login_check_failed: {exc}"
+        )
+
+    state = _read_offer_form_state(browser)
+    if not state.get("hasForm"):
+        return OfferFormSnapshot(
+            description="",
+            ok=False,
+            error=f"form_missing: {state}",
+        )
+
+    description = ""
+    price: str | None = None
+    delivery_days: int | None = None
+    try:
+        desc_raw = browser.evaluate(READ_OFFER_DESCRIPTION_JS)
+        if isinstance(desc_raw, dict):
+            description = str(desc_raw.get("description") or "").strip()
+    except Exception as exc:
+        return OfferFormSnapshot(
+            description="", ok=False, error=f"description_read_failed: {exc}"
+        )
+
+    try:
+        form = _read_offer_form(browser)
+        if not description:
+            description = str(form.get("description") or "").strip()
+        price_raw = str(form.get("price") or "").strip()
+        price = price_raw or None
+        delivery_days = _parse_delivery_days_label(
+            str(form.get("deadline") or form.get("deadlineLabel") or "")
+        )
+    except Exception:
+        pass
+
+    if not description:
+        return OfferFormSnapshot(
+            description="",
+            price=price,
+            delivery_days=delivery_days,
+            ok=False,
+            error="empty_description",
+        )
+
+    return OfferFormSnapshot(
+        description=description,
+        price=price,
+        delivery_days=delivery_days,
+        ok=True,
+        error=None,
+    )
+
+
+def read_submitted_offer_text(
+    browser: BrowserClient,
+    project_id: str,
+    *,
+    comments: dict[str, Any] | None = None,
+    navigate_offers: bool = True,
+) -> OfferFormSnapshot:
+    """Primary: /offers stateData.offers[].comment; fallback: new_offer form (draft)."""
+    from src.adapters.kwork_offers import (
+        KworkOfferComment,
+        fetch_my_offer_comment_details,
+    )
+
+    pid = str(project_id or "").strip()
+    if not pid:
+        return OfferFormSnapshot(description="", ok=False, error="empty_project_id")
+
+    details: dict[str, KworkOfferComment] | None = None
+    if comments is not None:
+        # Accept plaintext map or KworkOfferComment map from a prior batch fetch.
+        entry = comments.get(pid)
+        if isinstance(entry, KworkOfferComment):
+            if entry.comment.strip():
+                return OfferFormSnapshot(
+                    description=entry.comment.strip(),
+                    price=entry.price,
+                    delivery_days=entry.delivery_days,
+                    ok=True,
+                )
+        elif isinstance(entry, str) and entry.strip():
+            return OfferFormSnapshot(description=entry.strip(), ok=True)
+    else:
+        try:
+            details = fetch_my_offer_comment_details(
+                browser, navigate=navigate_offers
+            )
+            hit = details.get(pid)
+            if hit is not None and hit.comment.strip():
+                return OfferFormSnapshot(
+                    description=hit.comment.strip(),
+                    price=hit.price,
+                    delivery_days=hit.delivery_days,
+                    ok=True,
+                )
+        except Exception as exc:
+            logger.warning(
+                "offers_statedata_read_failed project_id=%s err=%s", pid, exc
+            )
+
+    snap = _read_offer_text_from_new_offer_form(browser, pid)
+    if snap.ok:
+        return snap
+    if details is not None:
+        return OfferFormSnapshot(
+            description="",
+            ok=False,
+            error=f"comment_missing_and_{snap.error or 'form_failed'}",
+        )
+    return snap
 
 
 def _resolve_order_title(
@@ -2540,13 +2795,45 @@ def parse_project_from_html(html: str, project_id: str | None = None) -> dict[st
 
     desired = _optional_text(r'class="desired-budget"[^>]*>([^<]+)', root)
     if not desired:
-        m = re.search(r"желаем(?:ый|ого)?\s+бюджет[^₽\d]{0,30}([\d\s]+)\s*₽", plain, re.I)
+        m = re.search(
+            r"желаем(?:ый|ого)?\s+бюджет[^₽\d]{0,40}([\d\s]+)\s*(?:₽|руб\.?)",
+            plain,
+            re.I,
+        )
         desired = f"до {m.group(1).strip()} ₽" if m else None
 
     max_b = _optional_text(r'class="max-budget"[^>]*>([^<]+)', root)
     if not max_b:
-        m = re.search(r"допустим(?:ый|ого)?[^₽\d]{0,30}([\d\s]+)\s*₽", plain, re.I)
+        m = re.search(
+            r"допустим(?:ый|ая|ое|ого)?\s*:?\s*до[:\s]*([\d\s\u00a0]+)\s*(?:₽|руб\.?)",
+            plain,
+            re.I,
+        )
         max_b = f"до {m.group(1).strip()} ₽" if m else None
+    if not max_b:
+        m = re.search(
+            r"допустим(?:ый|ая|ое|ого)?[^\d]{0,30}([\d\s\u00a0]+)\s*(?:₽|руб\.?)",
+            plain,
+            re.I,
+        )
+        max_b = f"до {m.group(1).strip()} ₽" if m else None
+    if not max_b:
+        m = re.search(
+            r"цена\s*до[:\s]*([\d\s\u00a0]+)\s*(?:₽|руб\.?)",
+            plain,
+            re.I,
+        )
+        max_b = f"до {m.group(1).strip()} ₽" if m else None
+    # Generic «до X» only when no labeled desired — otherwise steals желаемый amount
+    if not max_b and not desired:
+        m = re.search(
+            r"(?:^|[^а-яёa-z0-9])до[:\s]*([\d\s\u00a0]+)\s*(?:₽|руб\.?)",
+            plain,
+            re.I,
+        )
+        max_b = f"до {m.group(1).strip()} ₽" if m else None
+    if not desired and max_b:
+        desired = max_b
 
     buyer = _optional_text(r'class="buyer-link"[^>]*>([^<]+)', root)
     if not buyer:
@@ -2720,7 +3007,11 @@ def merge_preview_into_full(
     # Do not copy preview budget if page already has any budget fields
     if preview.budget_text and not data.get("desired_budget") and not data.get("max_budget"):
         bt = preview.budget_text.strip()
-        data["desired_budget"] = bt if "₽" in bt else f"{bt} ₽"
+        normalized = bt if "₽" in bt else f"{bt} ₽"
+        data["desired_budget"] = normalized
+        # Listing cards usually show the ceiling as «до X ₽»
+        if re.search(r"\bдо\b", normalized, flags=re.IGNORECASE):
+            data["max_budget"] = normalized
     # Keep explicit page description (preview has no full_description)
     if page_desc:
         data["full_description"] = page_desc
@@ -2937,12 +3228,41 @@ class KworkAdapter:
         )
 
         form_min, form_max = _read_form_price_bounds(self.browser)
+        digits = re.sub(r"\D", "", str(price) or "")
+        price_before = int(digits) if digits else 0
         price = _normalize_offer_price(
             price,
             project,
             form_min=form_min,
             form_max=form_max,
         )
+        # Soft note: compare fair vs project допустимый; form_max only if no project ceiling.
+        # Form fill already clamped via form_max above — do not let tighter form band
+        # override TG «потолок» when допустимый is known.
+        if form_max is not None and price_before > int(form_max):
+            fair_for_note = price_before
+            proj = project or ProjectFull(
+                platform="kwork",
+                source_key="kwork",
+                project_id=str(project_id),
+                url="",
+                title="",
+                full_description="",
+            )
+            gap_from_form = budget_gap(
+                fair_for_note,
+                proj,
+                form_max=int(form_max),
+            )
+            if gap_from_form is None and parse_budget_ceiling_rub(proj) is None:
+                gap_from_form = {
+                    "ceiling": int(form_max),
+                    "fair_price": fair_for_note,
+                    "fill_price": int(form_max),
+                    "ratio": round(fair_for_note / int(form_max), 4),
+                }
+            if gap_from_form is not None:
+                text = ensure_budget_mismatch_note(text, gap_from_form)
 
         if not _prime_payment_ui(self.browser, str(price)):
             diag = _read_payment_diag(self.browser)

@@ -43,6 +43,66 @@ def test_parse_project_meta_from_plain_text() -> None:
     assert data["time_left"]
 
 
+def test_parse_project_dopustimy_not_stolen_by_desired() -> None:
+    """3218832-like: max must be Допустимый 45k, not Желаемый 15k."""
+    from src.adapters.kwork_pricing import parse_budget_ceiling_rub
+    from src.models import ProjectFull
+
+    html = """
+    <html><body>
+    <h1>Telegram-бот</h1>
+    <div class="wants-card__description-text">Нужен бот под задачу.</div>
+    <div>Желаемый бюджет: до 15 000 ₽</div>
+    <div>Допустимый: до 45 000 ₽</div>
+    <div>Предложений: 2</div>
+  </body></html>
+    """
+    data = parse_project_from_html(html, project_id="3218832")
+    assert "15 000" in (data["desired_budget"] or "")
+    assert "45 000" in (data["max_budget"] or "")
+    assert "15 000" not in (data["max_budget"] or "")
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3218832",
+        url="https://kwork.ru/projects/3218832",
+        title=data["title"],
+        full_description=data["full_description"] or "",
+        desired_budget=data["desired_budget"],
+        max_budget=data["max_budget"],
+    )
+    assert parse_budget_ceiling_rub(project) == 45_000
+
+
+def test_parse_project_budget_do_only_no_labels() -> None:
+    """Checko-like page: only «до 1 500 ₽» without желаемый/допустимый labels."""
+    html = """
+    <html><body>
+    <h1>Интеграция Checko на Python</h1>
+    <div class="wants-card__description-text">Нужен парсер и API.</div>
+    <div>Бюджет до 1 500 ₽</div>
+    <div>Предложений: 4</div>
+  </body></html>
+    """
+    data = parse_project_from_html(html, project_id="3218308")
+    assert "1 500" in (data["max_budget"] or "")
+    assert data["desired_budget"]  # filled from max fallback
+    assert "1 500" in (data["desired_budget"] or "")
+
+
+def test_parse_project_budget_cena_do_colon() -> None:
+    """Live Kwork wording: «Цена до: 1 500 ₽»."""
+    html = """
+    <html><body>
+    <h1>Python</h1>
+    <div>son-xlsx 16 07 2026.xlsx Цена до: 1 500 ₽ N Покупатель: nixserver</div>
+  </body></html>
+    """
+    data = parse_project_from_html(html, project_id="3218308")
+    assert data["max_budget"] == "до 1 500 ₽"
+    assert "1 500" in (data["desired_budget"] or "")
+
+
 def test_merge_preview_into_full() -> None:
     full = ProjectFull(
         platform="kwork",
@@ -65,6 +125,7 @@ def test_merge_preview_into_full() -> None:
     assert merged.title == "Telegram-бот СДЭК"
     assert merged.offers_count == 12
     assert "5 000" in (merged.desired_budget or "")
+    assert merged.max_budget == "до 5 000 ₽"
 
 
 def test_merge_preview_keeps_page_title() -> None:
