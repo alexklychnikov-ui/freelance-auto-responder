@@ -358,6 +358,7 @@ class TelegramReviewBot:
 
         @self._dp.message(Command("start"))
         async def handle_start(message: Message) -> None:
+            self._tz_awaiting_chats.discard(str(message.chat.id))
             await message.answer(
                 "Freelance Auto-Responder\n"
                 "Kwork: карточка → автозаполнение формы (VPS).\n"
@@ -386,6 +387,7 @@ class TelegramReviewBot:
 
             @self._dp.message(Command("project"))
             async def handle_project_command(message: Message) -> None:
+                self._tz_awaiting_chats.discard(str(message.chat.id))
                 parts = (message.text or "").split(maxsplit=1)
                 if len(parts) < 2:
                     await message.answer(
@@ -413,12 +415,14 @@ class TelegramReviewBot:
 
         @self._dp.message(Command("report"))
         async def handle_report(message: Message) -> None:
+            self._tz_awaiting_chats.discard(str(message.chat.id))
             if on_scan_report is None:
                 return
             await on_scan_report(message)
 
         @self._dp.message(Command("journal", "journal_sync"))
         async def handle_journal_sync(message: Message) -> None:
+            self._tz_awaiting_chats.discard(str(message.chat.id))
             if on_export_journal is None:
                 return
             await on_export_journal(message)
@@ -432,9 +436,13 @@ class TelegramReviewBot:
                 if on_manual_tz is not None and message.text:
                     chat_key = str(message.chat.id)
                     if chat_key in self._tz_awaiting_chats:
+                        flru_id = extract_flru_project_id(message.text)
+                        yandex_id = extract_yandex_order_id(message.text)
+                        project_id = extract_kwork_project_id(message.text)
                         self._tz_awaiting_chats.discard(chat_key)
-                        await on_manual_tz(message, message.text.strip())
-                        return
+                        if not (flru_id or yandex_id or project_id):
+                            await on_manual_tz(message, message.text.strip())
+                            return
                 if on_manual_project is not None and message.text:
                     flru_id = extract_flru_project_id(message.text)
                     if flru_id:

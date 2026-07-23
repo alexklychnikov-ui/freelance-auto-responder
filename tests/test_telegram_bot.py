@@ -128,6 +128,34 @@ async def test_tz_awaiting_next_message() -> None:
     await bot.close()
 
 
+@pytest.mark.asyncio
+async def test_tz_awaiting_kwork_url_routes_to_manual_project() -> None:
+    manual_handler = AsyncMock()
+    tz_handler = AsyncMock()
+    text_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_response_text=text_handler,
+        on_manual_project=manual_handler,
+        on_manual_tz=tz_handler,
+    )
+
+    bot._tz_awaiting_chats.add("123")
+    await bot.dispatcher.feed_update(
+        bot.bot,
+        _make_update("https://kwork.ru/projects/3204427/view"),
+    )
+
+    manual_handler.assert_awaited_once()
+    assert manual_handler.await_args.args[1:] == ("3204427", "kwork")
+    tz_handler.assert_not_awaited()
+    text_handler.assert_not_awaited()
+    assert "123" not in bot._tz_awaiting_chats
+    await bot.close()
+
+
 def test_review_keyboard_without_url_has_no_open_button() -> None:
     from datetime import datetime, timezone
 
