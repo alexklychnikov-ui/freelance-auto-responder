@@ -40,6 +40,8 @@ def test_enabled_sources_include_kwork_and_yandex() -> None:
     flru = next(s for s in enabled if s.id == "flru_orders")
     assert flru.platform == "flru"
     assert "kind=1" in (flru.url or "")
+    assert "for_all=1" in (flru.url or "")
+    assert flru.filters.get("for_all") is True
 
 
 def test_settings_from_env(env_vars: None) -> None:

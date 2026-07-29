@@ -67,6 +67,7 @@ CALLBACK_REJECT = "reject"
 CALLBACK_JOURNAL_CONFIRM = "journal_ok"
 CALLBACK_PREPARE_RETRY = "prepare_retry"
 CALLBACK_REGENERATE = "regen"
+CALLBACK_CORRECT = "corr"
 CALLBACK_OPEN = "open"
 
 
@@ -205,6 +206,12 @@ def build_journal_confirm_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
                     callback_data=_callback_data(CALLBACK_REGENERATE, p, s, pid),
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    text="✏️ Корректировка",
+                    callback_data=_callback_data(CALLBACK_CORRECT, p, s, pid),
+                ),
+            ],
         ]
     )
 
@@ -241,6 +248,12 @@ def build_manual_copy_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
             InlineKeyboardButton(
                 text="🔄 Перегенерировать",
                 callback_data=_callback_data(CALLBACK_REGENERATE, p, s, pid),
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="✏️ Корректировка",
+                callback_data=_callback_data(CALLBACK_CORRECT, p, s, pid),
             ),
         ],
     ]
@@ -280,6 +293,7 @@ class TelegramReviewBot:
         )
         self._dp = Dispatcher()
         self._tz_awaiting_chats: set[str] = set()
+        self._corr_awaiting: dict[str, tuple[str, str, str]] = {}
 
     @property
     def bot(self) -> Bot:
@@ -288,6 +302,14 @@ class TelegramReviewBot:
     @property
     def dispatcher(self) -> Dispatcher:
         return self._dp
+
+    def set_correct_awaiting(
+        self, chat_id: str, platform: str, source_key: str, project_id: str
+    ) -> None:
+        self._corr_awaiting[str(chat_id)] = (platform, source_key, project_id)
+
+    def clear_correct_awaiting(self, chat_id: str) -> None:
+        self._corr_awaiting.pop(str(chat_id), None)
 
     def register_handlers(
         self,
@@ -299,6 +321,8 @@ class TelegramReviewBot:
         on_journal_confirm: Any | None = None,
         on_prepare_retry: Any | None = None,
         on_regenerate: Any | None = None,
+        on_correct: Any | None = None,
+        on_correct_instruction: Any | None = None,
         on_manual_project: Any | None = None,
         on_manual_tz: Any | None = None,
     ) -> None:
@@ -329,6 +353,8 @@ class TelegramReviewBot:
                 if not parsed:
                     await callback.answer("Некорректный callback")
                     return
+                if callback.message:
+                    self.clear_correct_awaiting(str(callback.message.chat.id))
                 _, platform, source_key, project_id = parsed
                 await on_journal_confirm(platform, source_key, project_id, callback)
 
@@ -352,18 +378,32 @@ class TelegramReviewBot:
                 if not parsed:
                     await callback.answer("Некорректный callback")
                     return
+                if callback.message:
+                    self.clear_correct_awaiting(str(callback.message.chat.id))
                 _, platform, source_key, project_id = parsed
                 await callback.answer("Перегенерирую отклик…")
                 await on_regenerate(platform, source_key, project_id, callback)
 
+        if on_correct is not None:
+
+            @self._dp.callback_query(F.data.startswith(f"{CALLBACK_CORRECT}:"))
+            async def handle_correct(callback: CallbackQuery) -> None:
+                parsed = parse_callback_data(callback.data or "")
+                if not parsed:
+                    await callback.answer("Некорректный callback")
+                    return
+                _, platform, source_key, project_id = parsed
+                await on_correct(platform, source_key, project_id, callback)
+
         @self._dp.message(Command("start"))
         async def handle_start(message: Message) -> None:
             self._tz_awaiting_chats.discard(str(message.chat.id))
+            self.clear_correct_awaiting(str(message.chat.id))
             await message.answer(
                 "Freelance Auto-Responder\n"
                 "Kwork: карточка → автозаполнение формы (VPS).\n"
                 "Яндекс / FL.ru: карточка → текст в TG → копируй вручную.\n"
-                "Ручной: /project <ссылка> · /tz <текст ТЗ без ссылки>\n"
+                "Ручной: /project ссылка · /tz текст ТЗ без ссылки\n"
                 "Excel: /journal · отчёт сканов: /report"
             )
 
@@ -373,6 +413,7 @@ class TelegramReviewBot:
             async def handle_tz_command(message: Message) -> None:
                 if str(message.chat.id) != self.chat_id:
                     return
+                self.clear_correct_awaiting(str(message.chat.id))
                 parts = (message.text or "").split(maxsplit=1)
                 if len(parts) >= 2 and parts[1].strip():
                     await on_manual_tz(message, parts[1].strip())
@@ -380,7 +421,7 @@ class TelegramReviewBot:
                 self._tz_awaiting_chats.add(str(message.chat.id))
                 await message.answer(
                     "Пришли текст ТЗ следующим сообщением (без ссылки).\n"
-                    "Или сразу: /tz <полный текст заказа>"
+                    "Или сразу: /tz полный текст заказа"
                 )
 
         if on_manual_project is not None:
@@ -388,12 +429,13 @@ class TelegramReviewBot:
             @self._dp.message(Command("project"))
             async def handle_project_command(message: Message) -> None:
                 self._tz_awaiting_chats.discard(str(message.chat.id))
+                self.clear_correct_awaiting(str(message.chat.id))
                 parts = (message.text or "").split(maxsplit=1)
                 if len(parts) < 2:
                     await message.answer(
                         "Пришли ссылку:\n"
                         "/project https://kwork.ru/projects/123456/view\n"
-                        "/project https://uslugi.yandex.ru/order/<uuid>\n"
+                        "/project https://uslugi.yandex.ru/order/UUID\n"
                         "/project https://www.fl.ru/projects/5514790/..."
                     )
                     return
@@ -416,6 +458,7 @@ class TelegramReviewBot:
         @self._dp.message(Command("report"))
         async def handle_report(message: Message) -> None:
             self._tz_awaiting_chats.discard(str(message.chat.id))
+            self.clear_correct_awaiting(str(message.chat.id))
             if on_scan_report is None:
                 return
             await on_scan_report(message)
@@ -423,16 +466,30 @@ class TelegramReviewBot:
         @self._dp.message(Command("journal", "journal_sync"))
         async def handle_journal_sync(message: Message) -> None:
             self._tz_awaiting_chats.discard(str(message.chat.id))
+            self.clear_correct_awaiting(str(message.chat.id))
             if on_export_journal is None:
                 return
             await on_export_journal(message)
 
-        if on_response_text is not None:
+        if on_response_text is not None or on_correct_instruction is not None:
 
             @self._dp.message(F.text)
             async def handle_text_message(message: Message) -> None:
                 if message.text and message.text.startswith("/"):
                     return
+                if on_correct_instruction is not None and message.text:
+                    chat_key = str(message.chat.id)
+                    pending = self._corr_awaiting.get(chat_key)
+                    if pending is not None:
+                        platform, source_key, project_id = pending
+                        await on_correct_instruction(
+                            message,
+                            platform,
+                            source_key,
+                            project_id,
+                            message.text.strip(),
+                        )
+                        return
                 if on_manual_tz is not None and message.text:
                     chat_key = str(message.chat.id)
                     if chat_key in self._tz_awaiting_chats:
@@ -456,7 +513,8 @@ class TelegramReviewBot:
                     if project_id:
                         await on_manual_project(message, project_id, "kwork")
                         return
-                await on_response_text(message)
+                if on_response_text is not None:
+                    await on_response_text(message)
 
     async def send_review_card(self, offer: PendingOffer) -> int:
         text = format_review_card(offer)

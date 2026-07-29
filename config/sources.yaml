@@ -23,12 +23,13 @@ sources:
   - id: flru_orders
     platform: flru
     enabled: true
-    url: https://www.fl.ru/projects/?kind=1
+    url: https://www.fl.ru/projects/?kind=1&for_all=1
     scan_interval_minutes: 30
     bootstrap: true
     filters:
       skip_closed: true
       skip_vacancy: true
+      for_all: true
 
   - id: flru_ai
     platform: flru

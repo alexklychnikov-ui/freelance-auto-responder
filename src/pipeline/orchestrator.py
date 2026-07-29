@@ -55,6 +55,8 @@ from src.limits.daily import count_today_platform_prepared, is_daily_limit_reach
 from src.adapters.kwork_urls import kwork_project_view_url
 from src.models import PendingOffer, ProjectFull, ProjectPreview
 from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
+from src.pipeline.kwork_inbox_poller import poll_kwork_inbox
+from src.store.kwork_inbox_seen import KworkInboxSeenStore
 from src.store.repository import ProjectRepository
 from src.store.scan_reports import ScanCycleStats, ScanReportStore
 from src.telegram_bot.bot import TelegramReviewBot
@@ -116,11 +118,17 @@ class PipelineOrchestrator:
         self._adapter_factory = adapter_factory or self._default_adapter
         self._journal_sync_lock = asyncio.Lock()
         self.scan_reports = ScanReportStore(settings.database_path)
+        self.kwork_inbox_seen = KworkInboxSeenStore(
+            settings.kwork_inbox_seen_db or "data/kwork_inbox_seen.db"
+        )
         self.review_service.set_approve_handler(self.handle_approve_click)
         self.review_service.set_journal_confirm_handler(self.handle_journal_confirm)
         self.review_service.set_prepare_retry_handler(self.handle_prepare_retry)
         self.review_service.set_regenerate_handler(self.handle_regenerate_response)
         self.review_service.set_submit_text_handler(self.handle_user_response_text)
+        self.review_service.set_correct_instruction_handler(
+            self._handle_correct_instruction
+        )
         self.review_service.set_export_journal_handler(self.export_prepared_to_journal)
         self.review_service.set_scan_report_handler(self.send_scan_report)
         self.review_service.set_manual_project_handler(self.handle_manual_project)
@@ -246,10 +254,47 @@ class PipelineOrchestrator:
 
         return {"project_id": project_id, "outcome": outcome}
 
+    async def poll_kwork_inbox(self) -> dict[str, int]:
+        if not self.settings.kwork_inbox_mirror_enabled:
+            return {"bootstrapped": 0, "checked": 0, "fetched": 0, "notified": 0, "errors": 0}
+        creds = None
+        if pair := self.settings.kwork_credentials():
+            creds = KworkCredentials(login=pair[0], password=pair[1])
+        try:
+            return await poll_kwork_inbox(
+                settings=self.settings,
+                store=self.kwork_inbox_seen,
+                notify=self.review_service.tg_bot.notify,
+                credentials=creds,
+                auto_login=self.settings.kwork_auto_login,
+            )
+        except KworkAuthError as exc:
+            logger.error("kwork_inbox_auth_failed: %s", exc)
+            return {
+                "bootstrapped": 0,
+                "checked": 0,
+                "fetched": 0,
+                "notified": 0,
+                "errors": 1,
+            }
+        except Exception:
+            logger.exception("kwork_inbox_poll_failed")
+            return {
+                "bootstrapped": 0,
+                "checked": 0,
+                "fetched": 0,
+                "notified": 0,
+                "errors": 1,
+            }
+
     async def run_scan_cycle(self) -> dict[str, int]:
         totals = {"seen": 0, "new": 0, "skipped": 0, "scored": 0, "notified": 0}
         cycle_stats = ScanCycleStats()
         self.review_service.expire_stale_pending()
+
+        if self.settings.kwork_inbox_mirror_enabled:
+            inbox_stats = await self.poll_kwork_inbox()
+            logger.info("kwork_inbox_poll %s", inbox_stats)
 
         for source in get_enabled_sources(self.settings.sources_config_path):
             source_stats = ScanCycleStats()
@@ -853,6 +898,93 @@ class PipelineOrchestrator:
                 "Новый текст готов — открой форму на Kwork."
             )
 
+    async def _handle_correct_instruction(
+        self,
+        message: Any,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        text: str,
+    ) -> None:
+        _ = message
+        await self.handle_correct_response(platform, source_key, project_id, text)
+
+    async def handle_correct_response(
+        self,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        instruction: str,
+    ) -> None:
+        offer = self.review_service.store.load(platform, source_key, project_id)
+        if offer is None:
+            self.review_service.clear_correct_awaiting()
+            await self.review_service.tg_bot.notify(
+                f"⚠️ Заявка {project_id} не найдена в pending_offers"
+            )
+            return
+
+        current = (offer.response_text or "").strip()
+        if not current:
+            prepared = self.prepared_store.load(platform, source_key, project_id)
+            if prepared is not None:
+                current = (prepared.response_text or "").strip()
+                if current:
+                    offer.response_text = current
+                    self.review_service.store.save(offer)
+        if not current:
+            await self.review_service.tg_bot.notify(
+                "⚠️ Сначала сгенерируй отклик (Откликнуть / Перегенерировать)"
+            )
+            return
+
+        instruction = instruction.strip()
+        if not instruction:
+            await self.review_service.tg_bot.notify(
+                "⚠️ Пустая инструкция — пришли текст правки"
+            )
+            return
+
+        await self.review_service.tg_bot.notify(
+            f"✏️ Правирую отклик: {html.escape(offer.title)}"
+        )
+        try:
+            revised = await asyncio.to_thread(
+                self.response_generator.revise,
+                offer.project,
+                current,
+                instruction,
+            )
+        except Exception as exc:
+            logger.exception("correct_revise_failed project_id=%s", project_id)
+            await self.review_service.tg_bot.notify(
+                f"❌ Не удалось скорректировать: {html.escape(str(exc)[:500])}"
+            )
+            return
+
+        revised_raw = (revised or "").strip()
+        if not revised_raw:
+            await self.review_service.tg_bot.notify(
+                "❌ Модель вернула пустой текст — исходный отклик не изменён"
+            )
+            return
+
+        offer.response_text = finalize_response_text(revised_raw, offer.project)
+        self.review_service.store.save(offer)
+
+        if is_manual_copy_platform(platform):
+            await self._send_manual_copy(offer, skip_checklist_enrich=True)
+            return
+
+        if self.settings.prepare_only_no_submit:
+            await self._prepare_offer_on_site(offer, skip_checklist_enrich=True)
+            return
+
+        await self.review_service.tg_bot.notify(
+            f"🔗 {kwork_offer_form_url(offer.project_id)}\n"
+            "Текст обновлён — открой форму на Kwork."
+        )
+
     async def handle_user_response_text(
         self, offer: PendingOffer, text: str
     ) -> None:
@@ -880,7 +1012,12 @@ class PipelineOrchestrator:
             offer,
         )
 
-    async def _send_manual_copy(self, offer: PendingOffer) -> None:
+    async def _send_manual_copy(
+        self,
+        offer: PendingOffer,
+        *,
+        skip_checklist_enrich: bool = False,
+    ) -> None:
         """Manual-copy platforms: text + estimate to TG, no site prepare/submit."""
         platform = offer.platform
         response_text = await self._ensure_response_text(offer)
@@ -945,12 +1082,13 @@ class PipelineOrchestrator:
                 delivery_days, self.settings.quick_win_max_delivery_days
             )
 
-        response_text = append_missing_checklist_answers(
-            response_text,
-            offer.project,
-            price_rub=gap_fair if gap else price_rub,
-            delivery_days=delivery_days,
-        )
+        if not skip_checklist_enrich:
+            response_text = append_missing_checklist_answers(
+                response_text,
+                offer.project,
+                price_rub=gap_fair if gap else price_rub,
+                delivery_days=delivery_days,
+            )
         response_text = ensure_budget_mismatch_note(response_text, gap)
         if response_text != (offer.response_text or ""):
             offer.response_text = response_text
@@ -975,7 +1113,12 @@ class PipelineOrchestrator:
             soft_limit=soft_limit,
         )
 
-    async def _prepare_offer_on_site(self, offer: PendingOffer) -> None:
+    async def _prepare_offer_on_site(
+        self,
+        offer: PendingOffer,
+        *,
+        skip_checklist_enrich: bool = False,
+    ) -> None:
         source = self._resolve_source_config(offer.source_key)
         if source is None:
             await self.review_service.tg_bot.notify(
@@ -1026,12 +1169,13 @@ class PipelineOrchestrator:
             delivery_days = min(
                 delivery_days, self.settings.quick_win_max_delivery_days
             )
-        response_text = append_missing_checklist_answers(
-            response_text,
-            offer.project,
-            price_rub=gap_fair if gap else fill_price,
-            delivery_days=delivery_days,
-        )
+        if not skip_checklist_enrich:
+            response_text = append_missing_checklist_answers(
+                response_text,
+                offer.project,
+                price_rub=gap_fair if gap else fill_price,
+                delivery_days=delivery_days,
+            )
         response_text = ensure_budget_mismatch_note(response_text, gap)
         if response_text != (offer.response_text or ""):
             offer.response_text = response_text
@@ -1141,12 +1285,13 @@ class PipelineOrchestrator:
                         fill_price = clamp_price_to_budget(fill_price, offer.project)
                         price = str(fill_price)
                         delivery_days = terms.delivery_days
-                        response_text = append_missing_checklist_answers(
-                            response_text,
-                            offer.project,
-                            price_rub=gap_fair if gap else fill_price,
-                            delivery_days=delivery_days,
-                        )
+                        if not skip_checklist_enrich:
+                            response_text = append_missing_checklist_answers(
+                                response_text,
+                                offer.project,
+                                price_rub=gap_fair if gap else fill_price,
+                                delivery_days=delivery_days,
+                            )
                         response_text = ensure_budget_mismatch_note(response_text, gap)
                         offer.response_text = response_text
                         self.review_service.store.save(offer)
@@ -1295,6 +1440,40 @@ class PipelineOrchestrator:
                     project_id,
                     snap.error,
                 )
+        elif platform == "yandex_uslugi":
+            try:
+                ysnap = await asyncio.to_thread(
+                    self._fetch_yandex_submitted_offer, project_id
+                )
+            except Exception as exc:
+                logger.warning(
+                    "journal_confirm_yandex_read_failed project_id=%s err=%s",
+                    project_id,
+                    exc,
+                )
+                from src.adapters.yandex_uslugi import YandexSubmittedOffer
+
+                ysnap = YandexSubmittedOffer(
+                    ok=False, error=f"read_exception: {exc}"
+                )
+            if ysnap.ok and (ysnap.description or "").strip():
+                response_text = ysnap.description.strip()
+                if ysnap.price:
+                    price = ysnap.price
+                item.response_text = response_text
+                item.price = price
+                self.prepared_store.save(item)
+                logger.info(
+                    "journal_confirm_used_yandex_text project_id=%s len=%d",
+                    project_id,
+                    len(response_text),
+                )
+            elif ysnap.error:
+                logger.warning(
+                    "journal_confirm_yandex_fallback_prepared project_id=%s err=%s",
+                    project_id,
+                    ysnap.error,
+                )
 
         journal_status, journal_result = journal_status_for_confirm(platform)
         try:
@@ -1342,6 +1521,18 @@ class PipelineOrchestrator:
                     browser, KworkCredentials(login=pair[0], password=pair[1])
                 )
             return read_submitted_offer_text(browser, project_id)
+        finally:
+            close_browser_client(browser)
+
+    def _fetch_yandex_submitted_offer(self, order_id: str):
+        from src.adapters.yandex_uslugi import (
+            read_submitted_offer_text as read_yandex_submitted_offer,
+        )
+
+        storage = (self.settings.yandex_storage_state or "").strip() or None
+        browser = get_browser_client(self.settings, storage_state_path=storage)
+        try:
+            return read_yandex_submitted_offer(browser, order_id)
         finally:
             close_browser_client(browser)
 
@@ -1562,7 +1753,7 @@ class PipelineOrchestrator:
         return {"project_id": pid, "outcome": outcome}
 
     async def handle_manual_project(
-        self, message: Any, project_id: str, *, platform: str | None = None
+        self, message: Any, project_id: str, platform: str | None = None
     ) -> None:
         pid = (project_id or "").strip()
         if platform is None:
@@ -1600,7 +1791,7 @@ class PipelineOrchestrator:
         if len(body) < TZ_MIN_CHARS:
             await message.answer(
                 f"Слишком короткий текст (минимум {TZ_MIN_CHARS} символов). "
-                "Пришли полное ТЗ: /tz <текст>"
+                "Пришли полное ТЗ: /tz текст_заказа"
             )
             return
         preview_title = body.splitlines()[0][:80] if body else "ТЗ"

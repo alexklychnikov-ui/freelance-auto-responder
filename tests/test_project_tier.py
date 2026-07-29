@@ -4,6 +4,7 @@ import pytest
 
 from src.analyzer.project_tier import (
     is_experience_win_candidate,
+    is_out_of_stack,
     is_quick_win_candidate,
     max_listed_budget_rub,
     passes_experience_win_gate,
@@ -111,6 +112,24 @@ def test_standard_wins_over_quick_win(settings: Settings) -> None:
     )
     good = _score(value=8, fit=True)
     assert resolve_acceptance_tier(project, good, settings) == "standard"
+
+
+def test_ocr_email_docs_not_out_of_stack(settings: Settings) -> None:
+    project = ProjectFull(
+        platform="yandex_uslugi",
+        source_key="yandex_uslugi_it",
+        project_id="1a49402e",
+        url="https://uslugi.yandex.ru/order/1a49402e",
+        title="Создать программу распознования текста с документов на почте",
+        full_description=(
+            "Нужен OCR распознавание текста с PDF и сканов из вложений почты, "
+            "автоматизация Gmail/IMAP на Python"
+        ),
+        max_budget="до 8 000 ₽",
+        offers_count=5,
+    )
+    assert not is_out_of_stack(project)
+    assert is_quick_win_candidate(project, settings)
 
 
 def test_quick_win_candidate_landing(settings: Settings) -> None:

@@ -107,8 +107,28 @@ _BUYER_NOISE = frozenset(
     }
 )
 
+# Self / account chrome mistaken for buyer (Yandex cab menu, etc.)
+_BUYER_SELF_OR_UI_RE = re.compile(
+    r"клычников|уведомлен|выйти\s+из\s+аккаунт|написать\s+письмо|"
+    r"@yandex\.|@gmail\.|почта\d|alexander\.klichnikov",
+    re.I,
+)
+
+
+def sanitize_buyer_field(buyer: str | None) -> str | None:
+    """Drop garbled UI dumps and own account name mistaken for заказчик."""
+    if not buyer:
+        return None
+    raw = buyer.strip()
+    if not raw:
+        return None
+    if len(raw) > 48 or _BUYER_SELF_OR_UI_RE.search(raw):
+        return None
+    return raw
+
 
 def buyer_first_name(buyer: str | None) -> str | None:
+    buyer = sanitize_buyer_field(buyer)
     if not buyer:
         return None
     name = buyer.strip()
@@ -134,37 +154,64 @@ def strip_hallucinated_greeting(text: str, buyer_name: str | None) -> str:
     if not buyer_name:
         return body[m.end() :].lstrip()
     if used.casefold() != buyer_name.casefold():
-        return f"{buyer_name}, здравствуйте! {body[m.end() :].lstrip()}"
+        return f"{buyer_name}, здравствуйте!\n{body[m.end() :].lstrip()}"
     return body
 
 
+_PARAGRAPH_INDENT = "    "  # красная строка
+
+
+def _with_red_line(paragraph: str) -> str:
+    body = (paragraph or "").strip()
+    if not body:
+        return ""
+    return _PARAGRAPH_INDENT + body
+
+
+def unescape_literal_newlines(text: str) -> str:
+    """GPT sometimes dumps literal \\n / \\r\\n into the body instead of real breaks."""
+    raw = text or ""
+    # Collapse double-escaped sequences first (\\\\n → \\n), then to real newlines.
+    while "\\\\n" in raw:
+        raw = raw.replace("\\\\n", "\\n")
+    while "\\\\r\\\\n" in raw:
+        raw = raw.replace("\\\\r\\\\n", "\\r\\n")
+    raw = raw.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "\n")
+    return raw
+
+
 def ensure_response_paragraphs(text: str) -> str:
-    raw = (text or "").strip()
+    """Paragraphs: single \\n between blocks, each starts with 4-space red line."""
+    raw = unescape_literal_newlines(text or "").strip()
     if not raw:
         return raw
-    if "\n\n" in raw:
-        return re.sub(r"\n{3,}", "\n\n", raw).strip()
+    raw = re.sub(r"\n{2,}", "\n", raw).strip()
 
-    parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", raw) if p.strip()]
-    if len(parts) <= 2:
-        return "\n\n".join(parts)
-
-    blocks: list[str] = [parts[0]]
-    mid = parts[1:-2] if len(parts) >= 4 else parts[1:-1]
-    if mid:
-        if len(mid) <= 2:
-            blocks.append(" ".join(mid))
+    if "\n" in raw:
+        blocks = [ln.strip() for ln in raw.split("\n") if ln.strip()]
+    else:
+        parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", raw) if p.strip()]
+        if len(parts) <= 2:
+            blocks = parts
         else:
-            half = max(1, len(mid) // 2)
-            blocks.append(" ".join(mid[:half]))
-            blocks.append(" ".join(mid[half:]))
-    tail = parts[-2:] if len(parts) >= 4 else parts[-1:]
-    blocks.append(" ".join(tail))
-    return "\n\n".join(b for b in blocks if b)
+            blocks = [parts[0]]
+            mid = parts[1:-2] if len(parts) >= 4 else parts[1:-1]
+            if mid:
+                if len(mid) <= 2:
+                    blocks.append(" ".join(mid))
+                else:
+                    half = max(1, len(mid) // 2)
+                    blocks.append(" ".join(mid[:half]))
+                    blocks.append(" ".join(mid[half:]))
+            tail = parts[-2:] if len(parts) >= 4 else parts[-1:]
+            blocks.append(" ".join(tail))
+
+    return "\n".join(_with_red_line(b) for b in blocks if b)
 
 
 def finalize_response_text(text: str, project: ProjectFull | None = None) -> str:
-    cleaned = strip_response_markdown(text)
+    cleaned = unescape_literal_newlines(text)
+    cleaned = strip_response_markdown(cleaned)
     cleaned = strip_github_links(cleaned)
     cleaned = strip_portfolio_footer(cleaned)
     if project is not None:
@@ -172,8 +219,8 @@ def finalize_response_text(text: str, project: ProjectFull | None = None) -> str
             cleaned, buyer_first_name(project.buyer)
         )
         cleaned = ensure_response_paragraphs(cleaned)
-    return cleaned.strip()
-
+    # Keep leading indent (красная строка) on the first paragraph.
+    return cleaned.rstrip()
 
 def kwork_compliance_issues(text: str) -> list[str]:
     issues: list[str] = []
@@ -211,4 +258,5 @@ def append_missing_checklist_answers(
         )
     if not extras:
         return text
-    return text.rstrip() + "\n\n" + "\n".join(extras)
+    indented = "\n".join(_with_red_line(x) for x in extras)
+    return text.rstrip() + "\n" + indented

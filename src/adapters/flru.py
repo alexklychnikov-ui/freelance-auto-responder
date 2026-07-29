@@ -5,9 +5,7 @@ import logging
 import re
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlparse
-
-from src.adapters.flru_urls import FLRU_ORIGIN, flru_project_url
+from src.adapters.flru_urls import FLRU_ORIGIN, ensure_flru_for_all, flru_project_url
 from src.browser.factory import close_browser_client, get_browser_client
 from src.config import Settings
 from src.models import ProjectFull, ProjectPreview, ReplyEvent, SubmitResult
@@ -16,9 +14,21 @@ logger = logging.getLogger(__name__)
 
 _PROJECT_ID_RE = re.compile(r"^\d{5,9}$")
 
+# FL.ru: баннер «Заказчик выбрал исполнителя» ≠ старое «Исполнитель определён»
+_CLOSED_RE = re.compile(
+    r"(?:исполнитель\s+определ|выбрал\s+исполнител|исполнитель\s+выбран)",
+    re.I,
+)
+
+
+def is_flru_project_closed(text: str) -> bool:
+    return bool(_CLOSED_RE.search(text or ""))
+
+
 LISTING_EXTRACTOR_JS = """
 () => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const isClosed = (t) => /(?:исполнитель\\s+определ|выбрал\\s+исполнител|исполнитель\\s+выбран)/i.test(t || '');
   const seen = new Set();
   const cards = [];
   const links = [...document.querySelectorAll('a[href*="/projects/"]')];
@@ -34,7 +44,7 @@ LISTING_EXTRACTOR_JS = """
       link.parentElement;
     const cardText = norm(card?.innerText || '');
     const low = cardText.toLowerCase();
-    if (low.includes('исполнитель определ')) continue;
+    if (isClosed(cardText)) continue;
     if (low.includes('вакансия')) continue;
     seen.add(id);
     const titleEl =
@@ -72,7 +82,9 @@ PROJECT_EXTRACTOR_JS = """
     norm(document.querySelector('[class*="title"]')?.textContent) ||
     norm(document.title).replace(/\\s*[|·—-].*$/i, '');
 
-  const closed = /исполнитель определ/i.test(document.body?.innerText || '');
+  const closed = /(?:исполнитель\\s+определ|выбрал\\s+исполнител|исполнитель\\s+выбран)/i.test(
+    document.body?.innerText || ''
+  );
   const descCandidates = [
     ...document.querySelectorAll(
       '[class*="description"], [class*="text-qa"], article p, .b-layout__txt p, main p'
@@ -144,6 +156,21 @@ def _is_login_url(url: str) -> bool:
     return False
 
 
+ENSURE_FOR_ALL_FILTER_JS = """
+() => {
+  const el = document.querySelector('#ui-checkbox-check-for-all');
+  if (!el) {
+    return { ok: false, reason: 'checkbox_missing' };
+  }
+  if (el.checked) {
+    return { ok: true, already: true };
+  }
+  el.click();
+  return { ok: true, clicked: true };
+}
+"""
+
+
 def parse_listing_from_html(html: str, *, skip_closed: bool = True) -> list[dict[str, Any]]:
     seen: set[str] = set()
     cards: list[dict[str, Any]] = []
@@ -157,7 +184,7 @@ def parse_listing_from_html(html: str, *, skip_closed: bool = True) -> list[dict
             continue
         window = html[max(0, m.start() - 300) : m.end() + 800]
         low = window.lower()
-        if skip_closed and "исполнитель определ" in low:
+        if skip_closed and is_flru_project_closed(window):
             continue
         if "вакансия" in low:
             continue
@@ -242,7 +269,7 @@ def parse_project_from_html(html: str, project_id: str | None = None) -> dict[st
     if om:
         offers = int(om.group(1))
 
-    closed = bool(re.search(r"исполнитель определ", html, flags=re.I))
+    closed = is_flru_project_closed(html)
 
     return {
         "project_id": pid,
@@ -280,13 +307,12 @@ class FlruAdapter:
         filters: dict[str, Any] | None = None,
         browser: Any | None = None,
     ) -> None:
-        _ = browser
         self.source_key = source_key
         self.listing_url = listing_url
         self.settings = settings
         self.filters = filters or {}
-        self._browser: Any | None = None
-        self._owns_browser = True
+        self._browser = browser
+        self._owns_browser = browser is None
 
     def _storage_path(self) -> str | None:
         path = (self.settings.flru_storage_state or "").strip()
@@ -320,14 +346,36 @@ class FlruAdapter:
                 "запусти deploy/flru_login_interactive.py"
             )
 
+    def _listing_url(self) -> str:
+        url = self.listing_url
+        if bool(self.filters.get("for_all", True)):
+            url = ensure_flru_for_all(url)
+        return url
+
+    def _ensure_for_all_filter(self, browser: Any) -> None:
+        if not bool(self.filters.get("for_all", True)):
+            return
+        try:
+            result = browser.evaluate(ENSURE_FOR_ALL_FILTER_JS)
+        except Exception:
+            logger.warning(
+                "flru_for_all_filter_failed source=%s", self.source_key, exc_info=True
+            )
+            return
+        if isinstance(result, dict) and result.get("clicked"):
+            if hasattr(browser, "wait_ms"):
+                browser.wait_ms(2000)
+            logger.info("flru_for_all_filter_applied source=%s", self.source_key)
+
     def scan_new(self) -> list[ProjectPreview]:
         browser = self._get_browser()
         skip_closed = bool(self.filters.get("skip_closed", True))
         try:
-            browser.navigate(self.listing_url)
+            browser.navigate(self._listing_url())
             if hasattr(browser, "wait_ms"):
                 browser.wait_ms(2500)
             self._ensure_logged_in(browser)
+            self._ensure_for_all_filter(browser)
             raw_cards = browser.evaluate(LISTING_EXTRACTOR_JS)
             if not isinstance(raw_cards, list) or not raw_cards:
                 snapshot = browser.snapshot()

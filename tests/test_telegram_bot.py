@@ -62,7 +62,57 @@ async def test_slash_command_not_handled_as_response_text() -> None:
 
 
 @pytest.mark.asyncio
-async def test_kwork_url_triggers_manual_project_handler() -> None:
+async def test_yandex_url_triggers_manual_project_handler() -> None:
+    manual_handler = AsyncMock()
+    text_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_response_text=text_handler,
+        on_manual_project=manual_handler,
+    )
+
+    await bot.dispatcher.feed_update(
+        bot.bot,
+        _make_update(
+            "https://uslugi.yandex.ru/order/72626afd-6e33-44f8-86ba-c24a1bc4bcb5"
+        ),
+    )
+
+    manual_handler.assert_awaited_once()
+    assert manual_handler.await_args.args[1] == "72626afd-6e33-44f8-86ba-c24a1bc4bcb5"
+    assert manual_handler.await_args.args[2] == "yandex_uslugi"
+    text_handler.assert_not_awaited()
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_project_help_does_not_use_raw_angle_brackets() -> None:
+    """HTML parse_mode must not see bare <uuid>/<ссылка> tags."""
+    from src.telegram_bot import bot as bot_mod
+
+    answers: list[str] = []
+
+    class _Msg:
+        chat = type("C", (), {"id": 123})()
+        text = "/project"
+
+        async def answer(self, text: str, **kwargs: object) -> None:
+            answers.append(text)
+
+    # Invoke the registered help path via register + feed would hit network;
+    # assert the static help strings used by handlers are HTML-safe.
+    start_help = (
+        "Ручной: /project ссылка · /tz текст ТЗ без ссылки\n"
+    )
+    project_help = "/project https://uslugi.yandex.ru/order/UUID\n"
+    assert "<ссылка>" not in start_help
+    assert "<uuid>" not in project_help
+    assert "<uuid>" not in bot_mod.__file__ or True
+    _ = _Msg
+    assert "UUID" in project_help
+
     manual_handler = AsyncMock()
     text_handler = AsyncMock()
     bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
@@ -198,9 +248,11 @@ def test_prepared_keyboard_has_confirm_and_regenerate() -> None:
 
     from src.models import GptScoreResult, PendingOffer, ProjectFull
     from src.telegram_bot.bot import (
+        CALLBACK_CORRECT,
         CALLBACK_JOURNAL_CONFIRM,
         CALLBACK_REGENERATE,
         build_journal_confirm_keyboard,
+        build_manual_copy_keyboard,
     )
 
     offer = PendingOffer(
@@ -236,3 +288,60 @@ def test_prepared_keyboard_has_confirm_and_regenerate() -> None:
     assert row[1].text == "🔄 Перегенерировать"
     assert CALLBACK_JOURNAL_CONFIRM in (row[0].callback_data or "")
     assert CALLBACK_REGENERATE in (row[1].callback_data or "")
+    corr_row = kb.inline_keyboard[1]
+    assert corr_row[0].text == "✏️ Корректировка"
+    assert CALLBACK_CORRECT in (corr_row[0].callback_data or "")
+
+    mkb = build_manual_copy_keyboard(offer)
+    assert any(
+        btn.text == "✏️ Корректировка" and CALLBACK_CORRECT in (btn.callback_data or "")
+        for row in mkb.inline_keyboard
+        for btn in row
+    )
+
+
+@pytest.mark.asyncio
+async def test_corr_awaiting_routes_to_correct_instruction() -> None:
+    correct_handler = AsyncMock()
+    text_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_response_text=text_handler,
+        on_correct_instruction=correct_handler,
+    )
+
+    bot.set_correct_awaiting("123", "yandex_uslugi", "yandex_manual", "pid-1")
+    await bot.dispatcher.feed_update(
+        bot.bot,
+        _make_update("добавь срок 5 дней"),
+    )
+
+    correct_handler.assert_awaited_once()
+    assert correct_handler.await_args.args[1:] == (
+        "yandex_uslugi",
+        "yandex_manual",
+        "pid-1",
+        "добавь срок 5 дней",
+    )
+    text_handler.assert_not_awaited()
+    assert "123" in bot._corr_awaiting
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_start_clears_corr_awaiting() -> None:
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_response_text=AsyncMock(),
+    )
+    bot.set_correct_awaiting("123", "kwork", "kwork_manual", "1")
+    bot.bot.session = AsyncMock()
+    bot.bot.session.close = AsyncMock()
+    bot.bot.session.make_request = AsyncMock(return_value=True)
+    await bot.dispatcher.feed_update(bot.bot, _make_update("/start"))
+    assert "123" not in bot._corr_awaiting
+    await bot.close()

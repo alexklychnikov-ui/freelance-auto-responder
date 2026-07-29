@@ -41,6 +41,12 @@ MSG_REVISE = "🔄 Доработка после рецензии (цикл {n}/
 MSG_DONE = "✅ Отклик готов (прошёл ExpertReview)"
 MSG_LIMIT = "⚠️ Отклик сдан после лимита циклов"
 
+REVISE_SYSTEM_PROMPT = """\
+Ты правишь готовый отклик по инструкциям фрилансера. \
+Абзацы разделяй РЕАЛЬНЫМИ переносами строк, никогда не пиши символы \\n или \\r как текст. \
+Красная строка = 4 пробела в начале абзаца (кроме первого, если так уже принято). \
+Не добавляй markdown. Верни ТОЛЬКО текст отклика."""
+
 MAX_REVISION_CYCLES = 2
 
 # Bare openers only — named «Ирина, здравствуйте!» is allowed (does not match ^).
@@ -150,8 +156,8 @@ DRAFT_SYSTEM_PROMPT = """\
 
 *** ЯЗЫК И ФОРМАТ ***
 - 5–7 предложений. Простой человеческий язык. Без воды, биографии, длинных вступлений.
-- Абзацы: разделяй смысловые блоки пустой строкой (\\n\\n): \
-(1) обращение+открытие, (2) как решишь, (3) срок+цена, (4) CTA. \
+- Абзацы: новый смысловой блок — с новой строки (реальный перенос, НЕ символы \\n в тексте), \
+БЕЗ пустой строки. Каждый абзац начинай с красной строки (4 пробела в начале). \
 Не сваливай весь текст в одну простыню.
 - Каждое предложение помогает получить заказ.
 - Используй слова заказчика из ТЗ (Telegram, WordPress, MAX, ChatGPT, amoCRM и т.д.).
@@ -618,6 +624,26 @@ class ResponsePipeline:
             "feedback": str(data.get("feedback") or ""),
             "must_fix": must_fix,
         }
+
+    def revise(
+        self,
+        project: ProjectFull,
+        current_text: str,
+        instruction: str,
+    ) -> str:
+        user = {
+            "task": "Исправь отклик по инструкции фрилансера.",
+            "current_text": current_text,
+            "instruction": instruction,
+            "title": project.title,
+            "tz_snippet": (project.full_description or "")[:800],
+        }
+        return self._openai_text(
+            system=REVISE_SYSTEM_PROMPT,
+            user=user,
+            project_id=project.project_id,
+            temperature=0.4,
+        ).strip()
 
     def generate(
         self,

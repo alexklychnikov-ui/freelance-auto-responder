@@ -183,3 +183,83 @@ async def test_yandex_regenerate_skips_prepare(
 
     mock_adapter.prepare_response.assert_not_called()
     orch.review_service.tg_bot.send_manual_copy.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_correct_empty_revise_keeps_text(
+    settings: Settings, yandex_full: ProjectFull, score: GptScoreResult
+) -> None:
+    orch, _ = _make_orch(settings, yandex_full, score)
+    orch.response_generator.revise = MagicMock(return_value="   ")
+    original = "Исходный отклик без правок."
+    offer = PendingOffer(
+        platform="yandex_uslugi",
+        source_key="yandex_uslugi_it",
+        project_id=UUID,
+        url=yandex_full.url,
+        title=yandex_full.title,
+        project=yandex_full,
+        score=score,
+        created_at=datetime.now(timezone.utc),
+        status="prepared",
+        response_text=original,
+    )
+    orch.review_service.store.save(offer)
+
+    await orch.handle_correct_response(
+        "yandex_uslugi", "yandex_uslugi_it", UUID, "убери цену"
+    )
+
+    saved = orch.review_service.store.load(
+        "yandex_uslugi", "yandex_uslugi_it", UUID
+    )
+    assert saved is not None
+    assert saved.response_text == original
+    orch.review_service.tg_bot.send_manual_copy.assert_not_awaited()
+    assert any(
+        "пустой" in str(c.args[0]).lower()
+        for c in orch.review_service.tg_bot.notify.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_correct_skips_checklist_enrich(
+    settings: Settings, yandex_full: ProjectFull, score: GptScoreResult, monkeypatch
+) -> None:
+    orch, _ = _make_orch(settings, yandex_full, score)
+    revised = "Правленый отклик без авто-checklist."
+    orch.response_generator.revise = MagicMock(return_value=revised)
+
+    called: list[bool] = []
+
+    def _spy(text, project, **kwargs):
+        called.append(True)
+        return text + "\nСтоимость: 1 ₽."
+
+    monkeypatch.setattr(
+        "src.pipeline.orchestrator.append_missing_checklist_answers", _spy
+    )
+
+    offer = PendingOffer(
+        platform="yandex_uslugi",
+        source_key="yandex_uslugi_it",
+        project_id=UUID,
+        url=yandex_full.url,
+        title=yandex_full.title,
+        project=yandex_full,
+        score=score,
+        created_at=datetime.now(timezone.utc),
+        status="prepared",
+        response_text="Старый текст.",
+    )
+    orch.review_service.store.save(offer)
+
+    await orch.handle_correct_response(
+        "yandex_uslugi", "yandex_uslugi_it", UUID, "убери стоимость"
+    )
+
+    assert called == []
+    orch.review_service.tg_bot.send_manual_copy.assert_awaited_once()
+    sent = orch.review_service.tg_bot.send_manual_copy.await_args.kwargs["response_text"]
+    assert "Стоимость: 1" not in sent
+    assert "Правленый отклик" in sent

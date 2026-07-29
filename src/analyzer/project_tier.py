@@ -11,6 +11,7 @@ from src.models import GptScoreResult, ProjectFull
 
 _QUICK_WIN_TASK_RE = re.compile(
     r"парс\w*|скрап\w*|скрин\w*|gmail|imap|почт\w*|выгруз\w*|"
+    r"ocr|распознан\w*|tesseract|вложен\w*|"
     r"скачать|скрипт|автоматиз|csv|excel|xlsx|"
     r"быстр\w*|прост\w*|небольш\w*|разово|настро\w*|"
     r"telegram[- ]?бот|бот на python|aiogram|"
@@ -20,7 +21,8 @@ _QUICK_WIN_TASK_RE = re.compile(
 
 _OUT_OF_STACK_RE = re.compile(
     r"android|ios|swift|kotlin|flutter|1с|wordpress|тильда|"
-    r"дизайн без|верстк[аи]\s+без|штатн|pdf|пдф|photoshop|figma\s+без",
+    r"дизайн без|верстк[аи]\s+без|штатн|"
+    r"только\s+(pdf|пдф)[- ]?макет|photoshop|figma\s+без",
     re.I,
 )
 

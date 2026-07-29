@@ -45,6 +45,9 @@ def test_load_scoring_system_prompt() -> None:
     assert "мобильн" in prompt.lower() or "android" in prompt.lower()
     assert len(prompt) > 500
     assert "risks" in prompt
+    lower = prompt.lower()
+    assert "ocr" in lower
+    assert "imap" in lower or "почт" in lower or "gmail" in lower or "email" in lower
 
 
 def test_score_guardrails_native_mobile() -> None:

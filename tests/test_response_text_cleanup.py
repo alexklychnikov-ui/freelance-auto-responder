@@ -36,6 +36,18 @@ def test_strip_stage_title_leakage_from_start() -> None:
     assert cleaned.startswith("Изучив")
 
 
+def test_unescape_literal_backslash_n() -> None:
+    text = (
+        "Умею создавать агентов.\\n Важно не только агента.\n"
+        "Я предлагаю систему.\\n Использую Python.\n"
+        "Сроки гибкие.\\n\\nПо объёму — от 24 000 ₽."
+    )
+    out = finalize_response_text(text, _project("агенты память"))
+    assert "\\n" not in out
+    assert "Важно не только" in out
+    assert "\n" in out
+
+
 def test_strip_github_and_portfolio_footer() -> None:
     text = (
         "Кейс по боту.\n"
@@ -76,8 +88,11 @@ def test_strip_hallucinated_irina_when_no_buyer() -> None:
         "Дайте знать, с чего удобнее начать."
     )
     out = finalize_response_text(text, project)
-    assert not out.lower().startswith("ирина")
-    assert "\n\n" in out
+    assert not out.lstrip().lower().startswith("ирина")
+    assert "\n\n" not in out
+    assert "\n" in out
+    assert out.startswith("    ")
+    assert all(line.startswith("    ") for line in out.split("\n") if line)
     assert "hh.ru" in out
 
 
@@ -85,7 +100,8 @@ def test_keep_real_buyer_greeting() -> None:
     project = _project("бот").model_copy(update={"buyer": "Ирина · 80%"})
     text = "Ирина, здравствуйте! Сделаю бота под заявки. Срок — 5 дней."
     out = finalize_response_text(text, project)
-    assert out.startswith("Ирина, здравствуйте!")
+    assert "Ирина, здравствуйте!" in out
+    assert out.startswith("    Ирина, здравствуйте!")
 
 
 def test_buyer_first_name_rejects_ui_noise() -> None:
@@ -93,3 +109,24 @@ def test_buyer_first_name_rejects_ui_noise() -> None:
 
     assert buyer_first_name("Чаты") is None
     assert buyer_first_name("Ирина · 80%") == "Ирина"
+
+
+def test_reject_self_account_dump_as_buyer() -> None:
+    from src.analyzer.response_text import buyer_first_name, finalize_response_text
+
+    dump = (
+        "Александр КлычниковУведомлений0Выйти из аккаунта"
+        "Александр Клычниковalexander.klichnikov@yandex.ru"
+    )
+    assert buyer_first_name(dump) is None
+    project = _project("AI картинки").model_copy(update={"buyer": dump})
+    text = (
+        "Александр, здравствуйте!\n\n"
+        "Для вашего проекта по генерации AI-картинок сделаю тестовый вариант. "
+        "Срок — 5–7 дней, стоимость от 199 ₽. Если ок — напишите."
+    )
+    out = finalize_response_text(text, project)
+    assert not out.lstrip().lower().startswith("александр")
+    assert "\n\n" not in out
+    assert out.startswith("    Для вашего")
+    assert all(line.startswith("    ") for line in out.split("\n") if line)

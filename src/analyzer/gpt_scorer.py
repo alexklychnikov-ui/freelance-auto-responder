@@ -26,6 +26,8 @@ SCORING_SYSTEM_PROMPT = """\
 Стек Александра (подходит):
 - Python, FastAPI, aiogram, Telegram-боты, парсинг, API-интеграции
 - AI/LLM, RAG, автоматизация, MVP
+- OCR / распознавание текста с документов (PDF, сканы, фото) — кейс TGRecordsOfExpenses
+- Email-автоматизация: IMAP / Gmail / почта, вложения, парсинг писем
 - Лендинг, одностраничный сайт, сайт-визитка на Next.js/React/Tailwind — кейс MyPortfolio (github.com/alexklychnikov-ui/MyPortfolio)
 
 Явно НЕ подходит / нет опыта (score <= 4, fit=false, recommendation=пропустить):
@@ -35,14 +37,20 @@ SCORING_SYSTEM_PROMPT = """\
 - WordPress/Тильда без кастомного кода
 - Штатная позиция, не разовый проект
 
+ВАЖНО про OCR и email:
+- OCR / распознавание текста + email/IMAP/Gmail на Python — это Автоматизация/интеграция, НЕ «чистый дизайн» и НЕ «нет опыта»
+- Если в github_stack/lightrag есть OCR (TGRecordsOfExpenses) и ТЗ про OCR/документы/почту —
+  ориентир score >= 7, fit=true при основной работе Python-автоматизация
+- matched_skills примеры: Python, OCR, IMAP/email (если подтверждены в стеке)
+
 ВАЖНО про лендинги:
 - «Создать одностраничный сайт / лендинг по ТЗ» на Next.js/React — это веб-MVP, НЕ «чистый дизайн»
 - Если в scoring_context есть кейс MyPortfolio — score >= 7, fit=true, suggested_project_type=Веб-MVP
 - matched_skills для лендинга: Next.js, TypeScript, Tailwind, React (если есть в github_stack/MyPortfolio)
 
 Критерии score >= 7:
-- Основная работа: Python / боты / AI / API / автоматизация / веб-MVP / лендинг на Next.js
-- Есть релевантный кейс в github_stack или lightrag_context (для лендинга — MyPortfolio)
+- Основная работа: Python / боты / AI / API / автоматизация / OCR / email / веб-MVP / лендинг на Next.js
+- Есть релевантный кейс в github_stack или lightrag_context (для лендинга — MyPortfolio; для OCR — TGRecordsOfExpenses)
 - Реализуемо одним разработчиком за разумный срок
 
 Микробюджет 500–1000 ₽:

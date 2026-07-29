@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head><title>Нужен парсер | Яндекс Услуги</title></head>
+<body>
+  <main>
+    <h1>Нужен парсер прайсов</h1>
+    <div class="client">Мария</div>
+    <div>8 откликов</div>
+
+    <!-- Structural chrome of «Ваш отклик» is the same for any order -->
+    <section class="my-offer">
+      <h2>Ваш отклик</h2>
+      <div>Просмотрен</div>
+      <div>Предложенная цена: 4500 ₽</div>
+      <div class="offer-body">
+Мария, здравствуйте!
+Соберу парсер прайсов с выгрузкой в Google Sheets и уведомлением в Telegram.
+Срок — 5–7 дней, стоимость от 4500 ₽. Если ок — напишите.
+      </div>
+      <div>3 часа назад</div>
+      <button type="button">Редактировать</button>
+    </section>
+
+    <!-- Whatever promo / recommendations follow — must not enter the offer text.
+         Cut happens at time-ago / Редактировать / «Другие заказы», not by promo copy. -->
+    <aside class="page-chrome">
+      <div>Безлимитные отклики</div>
+      <div>199 ₽ в неделю</div>
+      <button>Подключить</button>
+      <h3>Другие заказы</h3>
+      <div>Совсем другой заказ про логотип</div>
+      <div>до 10 000 ₽ · 1 отклик</div>
+    </aside>
+  </main>
+</body>
+</html>

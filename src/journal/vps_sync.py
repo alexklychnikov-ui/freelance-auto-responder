@@ -9,7 +9,6 @@ from src.adapters.kwork_offers import KworkOfferComment, fetch_my_offer_comment_
 from src.config import Settings
 from src.journal.kwork_status_sync import sync_journal_from_kwork_offers
 from src.journal.writer import JournalWriter, format_response_payload
-from src.pipeline.manual_copy import journal_status_for_confirm
 from src.responses.prepared_store import PreparedResponseStore
 
 if TYPE_CHECKING:
@@ -64,11 +63,53 @@ def _snap_for_project(
     browser: BrowserClient | None,
     project_id: str,
     comments: dict[str, KworkOfferComment],
+    *,
+    platform: str,
+    settings: Settings | None = None,
 ) -> OfferFormSnapshot | None:
+    if platform == "yandex_uslugi":
+        if settings is None:
+            return None
+        from src.adapters.yandex_uslugi import (
+            read_submitted_offer_text as read_yandex_submitted,
+        )
+
+        storage = (settings.yandex_storage_state or "").strip() or None
+        ybrowser = None
+        try:
+            from src.browser.factory import close_browser_client, get_browser_client
+
+            ybrowser = get_browser_client(settings, storage_state_path=storage)
+            ysnap = read_yandex_submitted(ybrowser, project_id)
+            if not ysnap.ok:
+                return OfferFormSnapshot(
+                    description="", ok=False, error=ysnap.error or "yandex_read_failed"
+                )
+            return OfferFormSnapshot(
+                description=ysnap.description,
+                price=ysnap.price,
+                ok=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "yandex_submitted_read_failed project_id=%s err=%s", project_id, exc
+            )
+            return OfferFormSnapshot(
+                description="", ok=False, error=f"read_exception: {exc}"
+            )
+        finally:
+            if ybrowser is not None:
+                try:
+                    from src.browser.factory import close_browser_client
+
+                    close_browser_client(ybrowser)
+                except Exception:
+                    pass
+
     snap = _snap_from_comments(comments, project_id)
     if snap is not None:
         return snap
-    if browser is None:
+    if browser is None or platform != "kwork":
         return None
     try:
         return _read_offer_text_from_new_offer_form(browser, project_id)
@@ -135,8 +176,14 @@ def sync_journal_on_vps(
 
             in_journal = item.project_id in existing_ids
             snap = (
-                _snap_for_project(browser, item.project_id, comments)
-                if item.platform == "kwork"
+                _snap_for_project(
+                    browser,
+                    item.project_id,
+                    comments,
+                    platform=item.platform,
+                    settings=settings,
+                )
+                if item.platform in ("kwork", "yandex_uslugi")
                 else None
             )
             text, price, days, used_platform = _platform_response_fields(
@@ -163,6 +210,8 @@ def sync_journal_on_vps(
                     item.journal_exported = True
                     prepared_store.save(item)
                 continue
+
+            from src.pipeline.manual_copy import journal_status_for_confirm
 
             journal_status, journal_result = journal_status_for_confirm(item.platform)
             writer.append_prepared(

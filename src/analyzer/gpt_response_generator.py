@@ -67,6 +67,14 @@ class GptResponseGenerator:
         """Compatibility shim used by legacy tests."""
         return self._pipeline._post_chat(body, project_id)
 
+    def revise(
+        self,
+        project: ProjectFull,
+        current_text: str,
+        instruction: str,
+    ) -> str:
+        return self._pipeline.revise(project, current_text, instruction)
+
     def generate(
         self,
         project: ProjectFull,

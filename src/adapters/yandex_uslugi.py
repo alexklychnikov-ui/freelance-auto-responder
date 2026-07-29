@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
 from src.adapters.yandex_urls import YANDEX_USLUGI_ORIGIN, yandex_order_url
+from src.analyzer.response_text import sanitize_buyer_field
+from src.browser.base import BrowserClient
 from src.browser.factory import close_browser_client, get_browser_client
 from src.config import Settings
 from src.models import ProjectFull, ProjectPreview, ReplyEvent, SubmitResult
@@ -108,10 +111,11 @@ ORDER_EXTRACTOR_JS = """
   const max_budget = moneyBits.length > 1 ? moneyBits[1] : desired_budget;
 
   let buyer = null;
+  // Do NOT use [class*="user"] — matches logged-in account menu (own name).
   const buyerEl = document.querySelector(
-    '[class*="client"], [class*="Client"], [class*="customer"], [class*="Customer"], [class*="user"]'
+    '[class*="clientName"], [class*="ClientName"], [class*="customerName"], [class*="CustomerName"], [data-qa*="customer"], [data-qa*="client"]'
   );
-  if (buyerEl) buyer = norm(buyerEl.textContent).slice(0, 120);
+  if (buyerEl) buyer = norm(buyerEl.textContent).slice(0, 80);
 
   return {
     project_id: pathId,
@@ -276,6 +280,195 @@ def _parse_published(value: str | None) -> datetime | None:
         return None
 
 
+@dataclass
+class YandexSubmittedOffer:
+    description: str = ""
+    price: str | None = None
+    ok: bool = False
+    error: str | None = None
+
+
+SUBMITTED_OFFER_EXTRACTOR_JS = """
+() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const isTimeAgo = (t) => /^\\d+\\s*(?:минут|минуту|час|часа|часов|день|дня|дней|недел)\\w*\\s+назад$/i.test(norm(t));
+  const isEdit = (t) => /^редактировать$/i.test(norm(t));
+  const isStatus = (t) => /^(?:не\\s+)?просмотрен$/i.test(norm(t));
+  const isPriceLine = (t) => /^предложенная\\s+цена\\s*:/i.test(norm(t));
+  const isHeading = (t) => /^ваш\\s+отклик$/i.test(norm(t));
+
+  const pickPrice = (t) => {
+    const m = norm(t).match(/предложенная\\s+цена\\s*:\\s*(.+)$/i);
+    if (!m) return null;
+    const digits = (m[1].match(/\\d[\\d\\s\\u00a0]*/) || [''])[0].replace(/[^\\d]/g, '');
+    return digits || null;
+  };
+
+  // Prefer DOM: heading «Ваш отклик» → siblings until time-ago / Редактировать.
+  const nodes = [...document.querySelectorAll('h1,h2,h3,h4,div,span,p,button,a,li')];
+  const heading = nodes.find((el) => isHeading(el.textContent || ''));
+  if (heading) {
+    const root = heading.closest('section,article,[class*="offer"],[class*="response"],[class*="Response"]')
+      || heading.parentElement;
+    let price = null;
+    const parts = [];
+    const walk = root ? [...root.querySelectorAll('*')] : [];
+    let passedHeading = false;
+    for (const el of walk) {
+      const t = (el.textContent || '').trim();
+      if (!t) continue;
+      if (isHeading(t)) { passedHeading = true; continue; }
+      if (!passedHeading) continue;
+      if (isTimeAgo(t) || isEdit(t)) break;
+      if (isStatus(t)) continue;
+      if (isPriceLine(t)) {
+        price = pickPrice(t) || price;
+        continue;
+      }
+      // Skip short chrome lines (price-only leftovers).
+      if (/^\\d[\\d\\s\\u00a0]*\\s*₽/.test(t) && t.length < 40) {
+        if (!price) {
+          const digits = t.replace(/[^\\d]/g, '');
+          if (digits) price = digits;
+        }
+        continue;
+      }
+      // Prefer leaf-ish text blocks (avoid duplicating parent containers).
+      if (el.children && el.children.length > 2 && t.length > 200) continue;
+      if (parts.length && parts[parts.length - 1].includes(t)) continue;
+      if (parts.some((p) => t.includes(p) && t.length > p.length + 20)) {
+        // parent swallowed previous — replace
+        while (parts.length && t.includes(parts[parts.length - 1])) parts.pop();
+      }
+      parts.push(t);
+    }
+    const description = parts.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+    if (description.length >= 20) {
+      return { ok: true, error: null, description, price, via: 'dom' };
+    }
+  }
+
+  // Fallback: page innerText + cut at first structural chrome line.
+  const full = document.body?.innerText || '';
+  const start = full.search(/ваш\\s+отклик/i);
+  if (start < 0) {
+    return { ok: false, error: 'block_missing', description: '', price: null };
+  }
+  let chunk = full.slice(start);
+  const cutRe = /\\n\\s*(?:\\d+\\s*(?:минут|минуту|час|часа|часов|день|дня|дней|недел)\\w*\\s+назад|редактировать|другие\\s+заказы|предложения\\s+исполнителей)/i;
+  const cut = chunk.search(cutRe);
+  if (cut > 40) chunk = chunk.slice(0, cut);
+
+  let price = null;
+  const pm = chunk.match(/предложенная\\s+цена\\s*:\\s*([^\\n]+)/i);
+  if (pm) {
+    const digits = (pm[1].match(/\\d[\\d\\s\\u00a0]*/) || [''])[0].replace(/[^\\d]/g, '');
+    if (digits) price = digits;
+  }
+
+  let body = chunk;
+  body = body.replace(/^ваш\\s+отклик\\s*/i, '');
+  body = body.replace(/^(?:не\\s+)?просмотрен\\s*/i, '');
+  body = body.replace(/^предложенная\\s+цена\\s*:[^\\n]*\\n?/i, '');
+  body = body.replace(/^\\s*\\d[\\d\\s\\u00a0]*\\s*₽[^\\n]*\\n?/i, '');
+  body = body.replace(/\\n{3,}/g, '\\n\\n').trim();
+  if (body.length < 20) {
+    return { ok: false, error: 'empty_body', description: '', price };
+  }
+  return { ok: true, error: null, description: body, price, via: 'text' };
+}
+"""
+
+
+# Structural page chrome after «Ваш отклик» — same on any order, not promo copy.
+_SUBMITTED_OFFER_TAIL_RE = re.compile(
+    r"\n\s*(?:"
+    r"\d+\s*(?:минут|минуту|час|часа|часов|день|дня|дней|недел)\w*\s+назад|"
+    r"редактировать|"
+    r"другие\s+заказы|"
+    r"предложения\s+исполнителей"
+    r")",
+    re.I,
+)
+
+
+def parse_submitted_offer_from_text(text: str) -> YandexSubmittedOffer:
+    """Parse «Ваш отклик» from page text; stop at first structural UI boundary."""
+    full = text or ""
+    start = re.search(r"ваш\s+отклик", full, flags=re.I)
+    if not start:
+        return YandexSubmittedOffer(ok=False, error="block_missing")
+    chunk = full[start.start() :]
+    cut = _SUBMITTED_OFFER_TAIL_RE.search(chunk)
+    if cut and cut.start() > 40:
+        chunk = chunk[: cut.start()]
+
+    price: str | None = None
+    pm = re.search(r"предложенная\s+цена\s*:\s*([^\n]+)", chunk, flags=re.I)
+    if pm:
+        digits = re.sub(r"[^\d]", "", pm.group(1))
+        if digits:
+            price = digits
+
+    body = chunk
+    body = re.sub(r"^ваш\s+отклик\s*", "", body, count=1, flags=re.I)
+    body = re.sub(r"^(?:не\s+)?просмотрен\s*", "", body, count=1, flags=re.I)
+    body = re.sub(r"^предложенная\s+цена\s*:[^\n]*\n?", "", body, count=1, flags=re.I)
+    body = re.sub(
+        r"^\s*\d[\d\s\u00a0]*\s*₽[^\n]*\n?",
+        "",
+        body,
+        count=1,
+        flags=re.I,
+    )
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    if len(body) < 20:
+        return YandexSubmittedOffer(ok=False, error="empty_body", price=price)
+    return YandexSubmittedOffer(description=body, price=price, ok=True)
+
+
+def read_submitted_offer_text(
+    browser: BrowserClient, order_id: str
+) -> YandexSubmittedOffer:
+    """Open /order/{uuid} and read the «Ваш отклик» block (post-submit)."""
+    oid = str(order_id or "").strip().lower()
+    if not _UUID_RE.fullmatch(oid):
+        return YandexSubmittedOffer(ok=False, error="bad_order_id")
+    url = yandex_order_url(oid)
+    try:
+        browser.navigate(url)
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(2500)
+    except Exception as exc:
+        return YandexSubmittedOffer(ok=False, error=f"navigate_failed: {exc}")
+
+    try:
+        raw = browser.evaluate(SUBMITTED_OFFER_EXTRACTOR_JS)
+    except Exception as exc:
+        logger.warning("yandex_submitted_js_failed order_id=%s err=%s", oid, exc)
+        raw = None
+
+    if isinstance(raw, dict) and raw.get("ok") and str(raw.get("description") or "").strip():
+        return YandexSubmittedOffer(
+            description=str(raw["description"]).strip(),
+            price=(str(raw["price"]) if raw.get("price") else None),
+            ok=True,
+        )
+
+    snap = browser.snapshot() or ""
+    parsed = parse_submitted_offer_from_text(snap)
+    if parsed.ok:
+        return parsed
+    err = None
+    if isinstance(raw, dict):
+        err = raw.get("error")
+    return YandexSubmittedOffer(
+        ok=False,
+        error=str(err or parsed.error or "read_failed"),
+        price=parsed.price,
+    )
+
+
 class YandexUslugiAdapter:
     """Scan cab/orders + read /order/{uuid}. No autofill/submit."""
 
@@ -415,7 +608,7 @@ class YandexUslugiAdapter:
             desired_budget=raw.get("desired_budget"),
             max_budget=raw.get("max_budget"),
             offers_count=raw.get("offers_count"),
-            buyer=raw.get("buyer"),
+            buyer=sanitize_buyer_field(raw.get("buyer")),
             time_left=raw.get("time_left"),
         )
 

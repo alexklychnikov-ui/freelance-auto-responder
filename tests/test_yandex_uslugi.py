@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -11,6 +12,7 @@ from src.adapters.yandex_uslugi import (
     _is_login_url,
     parse_listing_from_html,
     parse_order_from_html,
+    parse_submitted_offer_from_text,
 )
 from src.config import Settings
 
@@ -72,3 +74,44 @@ def test_submit_response_manual_only() -> None:
     result = adapter.submit_response(UUID1, "text", "5000")
     assert result.success is False
     assert "manual_only" in (result.message or "")
+
+
+def test_parse_submitted_offer_from_fixture_text() -> None:
+    html = (FIXTURES / "yandex_submitted_offer.html").read_text(encoding="utf-8")
+    text = re.sub(r"<[^>]+>", "\n", html)
+    text = re.sub(r"\n{2,}", "\n", text)
+    snap = parse_submitted_offer_from_text(text)
+    assert snap.ok
+    assert snap.price == "4500"
+    assert snap.description.startswith("Мария, здравствуйте!")
+    assert "парсер прайсов" in snap.description
+    # Structural chrome after the offer body — never part of description.
+    assert "Редактировать" not in snap.description
+    assert "назад" not in snap.description
+    assert "Другие заказы" not in snap.description
+    assert "логотип" not in snap.description
+    assert "Безлимитные" not in snap.description
+
+
+def test_parse_submitted_offer_cuts_at_time_ago_not_promo_copy() -> None:
+    """Any order: cut at «N … назад», independent of promo / other-order titles."""
+    text = (
+        "Ваш отклик\nНе просмотрен\nПредложенная цена: 800 ₽\n"
+        "Анна, здравствуйте! Сделаю лендинг за 3 дня.\n"
+        "2 дня назад\nРедактировать\n"
+        "Случайный промо-блок с любым текстом\n"
+        "Другие заказы\nЗаказ про космос и единорогов\n"
+    )
+    snap = parse_submitted_offer_from_text(text)
+    assert snap.ok
+    assert snap.price == "800"
+    assert snap.description.startswith("Анна, здравствуйте!")
+    assert "лендинг" in snap.description
+    assert "промо-блок" not in snap.description
+    assert "единорогов" not in snap.description
+
+
+def test_parse_submitted_offer_missing_block() -> None:
+    snap = parse_submitted_offer_from_text("Нужен бот без секции отклика")
+    assert not snap.ok
+    assert snap.error == "block_missing"

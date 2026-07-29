@@ -25,6 +25,11 @@ ScanReportHandler = Callable[[Message], Awaitable[None]]
 JournalConfirmHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 PrepareRetryHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 RegenerateHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
+CorrectHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
+CorrectInstructionHandler = Callable[
+    [Message, str, str, str, str],
+    Awaitable[None],
+]
 ManualProjectHandler = Callable[[Message, str, str | None], Awaitable[None]]
 ManualTzHandler = Callable[[Message, str], Awaitable[None]]
 
@@ -44,6 +49,8 @@ class ReviewService:
         on_journal_confirm: JournalConfirmHandler | None = None,
         on_prepare_retry: PrepareRetryHandler | None = None,
         on_regenerate: RegenerateHandler | None = None,
+        on_correct: CorrectHandler | None = None,
+        on_correct_instruction: CorrectInstructionHandler | None = None,
         on_manual_project: ManualProjectHandler | None = None,
         on_manual_tz: ManualTzHandler | None = None,
     ) -> None:
@@ -58,6 +65,8 @@ class ReviewService:
         self._on_journal_confirm = on_journal_confirm
         self._on_prepare_retry = on_prepare_retry
         self._on_regenerate = on_regenerate
+        self._on_correct = on_correct
+        self._on_correct_instruction = on_correct_instruction
         self._on_manual_project = on_manual_project
         self._on_manual_tz = on_manual_tz
         self.tg_bot.register_handlers(
@@ -69,6 +78,8 @@ class ReviewService:
             on_journal_confirm=self._handle_journal_confirm,
             on_prepare_retry=self._handle_prepare_retry,
             on_regenerate=self._handle_regenerate,
+            on_correct=self._handle_correct,
+            on_correct_instruction=self._handle_correct_instruction,
             on_manual_project=self._handle_manual_project,
             on_manual_tz=self._handle_manual_tz,
         )
@@ -94,11 +105,23 @@ class ReviewService:
     def set_regenerate_handler(self, handler: RegenerateHandler) -> None:
         self._on_regenerate = handler
 
+    def set_correct_handler(self, handler: CorrectHandler) -> None:
+        self._on_correct = handler
+
+    def set_correct_instruction_handler(
+        self, handler: CorrectInstructionHandler
+    ) -> None:
+        self._on_correct_instruction = handler
+
     def set_manual_project_handler(self, handler: ManualProjectHandler) -> None:
         self._on_manual_project = handler
 
     def set_manual_tz_handler(self, handler: ManualTzHandler) -> None:
         self._on_manual_tz = handler
+
+    def clear_correct_awaiting(self, chat_id: str | None = None) -> None:
+        key = str(chat_id or self.tg_bot.chat_id)
+        self.tg_bot.clear_correct_awaiting(key)
 
     async def request_review(
         self,
@@ -226,6 +249,7 @@ class ReviewService:
         if callback.message and str(callback.message.chat.id) != chat_id:
             await callback.answer("Недоступно", show_alert=True)
             return
+        self.clear_correct_awaiting(chat_id)
         await self._on_journal_confirm(platform, source_key, project_id, callback)
 
     async def _handle_prepare_retry(
@@ -272,7 +296,56 @@ class ReviewService:
         if callback.message and str(callback.message.chat.id) != chat_id:
             await callback.answer("Недоступно", show_alert=True)
             return
+        self.clear_correct_awaiting(chat_id)
         await self._on_regenerate(platform, source_key, project_id, callback)
+
+    async def _handle_correct(
+        self,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        callback: CallbackQuery,
+    ) -> None:
+        offer = self.store.load(platform, source_key, project_id)
+        if offer is None:
+            await callback.answer("Заявка не найдена", show_alert=True)
+            return
+        if offer.status not in ("approved", "pending", "prepared"):
+            await callback.answer(f"Статус: {offer.status}", show_alert=True)
+            return
+        chat_id = str(self.settings.telegram_chat_id)
+        if callback.message and str(callback.message.chat.id) != chat_id:
+            await callback.answer("Недоступно", show_alert=True)
+            return
+        self.tg_bot.set_correct_awaiting(chat_id, platform, source_key, project_id)
+        await callback.answer("Пришли инструкцию следующим сообщением")
+        await self.tg_bot.notify(
+            f"✏️ Корректировка: {offer.title}\n"
+            "Пришли инструкцию следующим сообщением."
+        )
+        if self._on_correct is not None:
+            await self._on_correct(platform, source_key, project_id, callback)
+
+    async def _handle_correct_instruction(
+        self,
+        message: Message,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        text: str,
+    ) -> None:
+        if self._on_correct_instruction is None:
+            return
+        if str(message.chat.id) != str(self.tg_bot.chat_id):
+            return
+        offer = self.store.load(platform, source_key, project_id)
+        if offer is None:
+            self.clear_correct_awaiting(str(message.chat.id))
+            await self.tg_bot.notify(f"⚠️ Заявка {project_id} не найдена")
+            return
+        await self._on_correct_instruction(
+            message, platform, source_key, project_id, text
+        )
 
     async def _handle_manual_project(
         self, message: Message, project_id: str, platform: str | None = None
@@ -282,7 +355,7 @@ class ReviewService:
             return
         if str(message.chat.id) != str(self.tg_bot.chat_id):
             return
-        await self._on_manual_project(message, project_id, platform)
+        await self._on_manual_project(message, project_id, platform=platform)
 
     async def _handle_manual_tz(self, message: Message, text: str) -> None:
         if self._on_manual_tz is None:

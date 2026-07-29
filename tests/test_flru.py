@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 from src.adapters.flru import (
     FlruAdapter,
+    is_flru_project_closed,
     parse_listing_from_html,
     parse_project_from_html,
 )
@@ -12,6 +13,13 @@ from src.config import Settings
 
 FIXTURES = Path(__file__).parent / "fixtures"
 PID = "5514795"
+
+
+def test_is_flru_project_closed_phrases() -> None:
+    assert is_flru_project_closed("Заказчик выбрал исполнителя: Никита Петров")
+    assert is_flru_project_closed("Исполнитель определён")
+    assert is_flru_project_closed("Исполнитель определен")
+    assert not is_flru_project_closed("Откликнуться на проект")
 
 
 def test_parse_listing_from_html_fixture() -> None:
@@ -29,7 +37,7 @@ def test_parse_project_from_html_fixture() -> None:
     assert "озон" in (raw["full_description"] or "").lower()
 
 
-def test_submit_response_manual_only() -> None:
+def _make_adapter(**kwargs) -> FlruAdapter:
     settings = Settings(
         openai_api_key="k",
         telegram_bot_token="t",
@@ -38,12 +46,41 @@ def test_submit_response_manual_only() -> None:
         flru_storage_state="data/flru_storage.json",
         _env_file=None,
     )
-    adapter = FlruAdapter(
-        source_key="flru_orders",
-        listing_url="https://www.fl.ru/projects/?kind=1",
-        settings=settings,
-        browser=MagicMock(),
-    )
+    defaults = {
+        "source_key": "flru_orders",
+        "listing_url": "https://www.fl.ru/projects/?kind=1",
+        "settings": settings,
+        "browser": MagicMock(),
+        "filters": {"for_all": True, "skip_closed": True},
+    }
+    defaults.update(kwargs)
+    return FlruAdapter(**defaults)
+
+
+def test_submit_response_manual_only() -> None:
+    adapter = _make_adapter()
     result = adapter.submit_response(PID, "text", "500")
     assert result.success is False
     assert "manual_only" in (result.message or "")
+
+
+def test_listing_url_appends_for_all() -> None:
+    adapter = _make_adapter()
+    assert adapter._listing_url() == "https://www.fl.ru/projects/?kind=1&for_all=1"
+
+
+def test_scan_new_ensures_for_all_checkbox() -> None:
+    browser = MagicMock()
+    browser.evaluate.side_effect = [
+        "https://www.fl.ru/projects/?kind=1&for_all=1",  # _ensure_logged_in
+        {"ok": True, "clicked": True},  # _ensure_for_all_filter
+        [{"project_id": PID, "url": f"https://www.fl.ru/projects/{PID}/", "title": "t"}],
+    ]
+    adapter = _make_adapter(browser=browser)
+    cards = adapter.scan_new()
+    assert len(cards) == 1
+    assert cards[0].project_id == PID
+    browser.navigate.assert_called_once_with(
+        "https://www.fl.ru/projects/?kind=1&for_all=1"
+    )
+    assert browser.evaluate.call_count == 3

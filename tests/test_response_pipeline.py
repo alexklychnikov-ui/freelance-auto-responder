@@ -398,3 +398,27 @@ def test_critique_force_fail_short_draft_many_questions(
     assert result["verdict"] == "fail"
     assert "too_short_for_all_questions" in result["missing"]
 
+
+def test_revise_parses_openai_response() -> None:
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {
+        "choices": [{"message": {"content": "  Исправленный отклик с сроком 5 дней.  "}}]
+    }
+    mock_client.post.return_value = mock_resp
+
+    pipe = ResponsePipeline(_settings(), http_client=mock_client)
+    out = pipe.revise(
+        _project(),
+        "Старый отклик без срока.",
+        "добавь срок 5 дней",
+    )
+    assert out == "Исправленный отклик с сроком 5 дней."
+    body = mock_client.post.call_args.kwargs["json"]
+    assert body["messages"][0]["role"] == "system"
+    user = json.loads(body["messages"][1]["content"])
+    assert user["instruction"] == "добавь срок 5 дней"
+    assert user["current_text"] == "Старый отклик без срока."
+

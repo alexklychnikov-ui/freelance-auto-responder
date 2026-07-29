@@ -27,6 +27,8 @@ def settings(tmp_path: Path) -> Settings:
         require_telegram_approval=True,
         min_gpt_score=7,
         max_daily_responses=5,
+        kwork_inbox_mirror_enabled=False,
+        kwork_inbox_seen_db=str(tmp_path / "kwork_inbox_seen.db"),
         _env_file=None,
     )
 
