@@ -290,6 +290,7 @@ class PipelineOrchestrator:
     async def run_scan_cycle(self) -> dict[str, int]:
         totals = {"seen": 0, "new": 0, "skipped": 0, "scored": 0, "notified": 0}
         cycle_stats = ScanCycleStats()
+        by_platform: dict[str, ScanCycleStats] = {}
         self.review_service.expire_stale_pending()
 
         if self.settings.kwork_inbox_mirror_enabled:
@@ -425,9 +426,13 @@ class PipelineOrchestrator:
                 source_stats.rejected_budget,
                 source_stats.notified,
             )
+            plat = source.platform
+            if plat not in by_platform:
+                by_platform[plat] = ScanCycleStats()
+            by_platform[plat].merge(source_stats)
             cycle_stats.merge(source_stats)
 
-        self.scan_reports.save(cycle_stats)
+        self.scan_reports.save(cycle_stats, by_platform=by_platform)
         return totals
 
     def _scan_listings(self, source: SourceConfig) -> list[Any]:
@@ -1474,6 +1479,43 @@ class PipelineOrchestrator:
                     project_id,
                     ysnap.error,
                 )
+        elif platform == "flru":
+            try:
+                fsnap = await asyncio.to_thread(
+                    self._fetch_flru_submitted_offer, project_id
+                )
+            except Exception as exc:
+                logger.warning(
+                    "journal_confirm_flru_read_failed project_id=%s err=%s",
+                    project_id,
+                    exc,
+                )
+                from src.adapters.flru import FlruSubmittedOffer
+
+                fsnap = FlruSubmittedOffer(
+                    ok=False, error=f"read_exception: {exc}"
+                )
+            if fsnap.ok and (fsnap.description or "").strip():
+                response_text = fsnap.description.strip()
+                if fsnap.price:
+                    price = fsnap.price
+                if fsnap.delivery_days is not None:
+                    delivery_days = fsnap.delivery_days
+                item.response_text = response_text
+                item.price = price
+                item.delivery_days = delivery_days
+                self.prepared_store.save(item)
+                logger.info(
+                    "journal_confirm_used_flru_text project_id=%s len=%d",
+                    project_id,
+                    len(response_text),
+                )
+            elif fsnap.error:
+                logger.warning(
+                    "journal_confirm_flru_fallback_prepared project_id=%s err=%s",
+                    project_id,
+                    fsnap.error,
+                )
 
         journal_status, journal_result = journal_status_for_confirm(platform)
         try:
@@ -1533,6 +1575,18 @@ class PipelineOrchestrator:
         browser = get_browser_client(self.settings, storage_state_path=storage)
         try:
             return read_yandex_submitted_offer(browser, order_id)
+        finally:
+            close_browser_client(browser)
+
+    def _fetch_flru_submitted_offer(self, project_id: str):
+        from src.adapters.flru import (
+            read_submitted_offer_text as read_flru_submitted_offer,
+        )
+
+        storage = (self.settings.flru_storage_state or "").strip() or None
+        browser = get_browser_client(self.settings, storage_state_path=storage)
+        try:
+            return read_flru_submitted_offer(browser, project_id)
         finally:
             close_browser_client(browser)
 

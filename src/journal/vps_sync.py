@@ -106,6 +106,46 @@ def _snap_for_project(
                 except Exception:
                     pass
 
+    if platform == "flru":
+        if settings is None:
+            return None
+        from src.adapters.flru import (
+            read_submitted_offer_text as read_flru_submitted,
+        )
+
+        storage = (settings.flru_storage_state or "").strip() or None
+        fbrowser = None
+        try:
+            from src.browser.factory import close_browser_client, get_browser_client
+
+            fbrowser = get_browser_client(settings, storage_state_path=storage)
+            fsnap = read_flru_submitted(fbrowser, project_id)
+            if not fsnap.ok:
+                return OfferFormSnapshot(
+                    description="", ok=False, error=fsnap.error or "flru_read_failed"
+                )
+            return OfferFormSnapshot(
+                description=fsnap.description,
+                price=fsnap.price,
+                delivery_days=fsnap.delivery_days,
+                ok=True,
+            )
+        except Exception as exc:
+            logger.warning(
+                "flru_submitted_read_failed project_id=%s err=%s", project_id, exc
+            )
+            return OfferFormSnapshot(
+                description="", ok=False, error=f"read_exception: {exc}"
+            )
+        finally:
+            if fbrowser is not None:
+                try:
+                    from src.browser.factory import close_browser_client
+
+                    close_browser_client(fbrowser)
+                except Exception:
+                    pass
+
     snap = _snap_from_comments(comments, project_id)
     if snap is not None:
         return snap
@@ -183,7 +223,7 @@ def sync_journal_on_vps(
                     platform=item.platform,
                     settings=settings,
                 )
-                if item.platform in ("kwork", "yandex_uslugi")
+                if item.platform in ("kwork", "yandex_uslugi", "flru")
                 else None
             )
             text, price, days, used_platform = _platform_response_fields(

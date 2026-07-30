@@ -3,9 +3,12 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
+
 from src.adapters.flru_urls import FLRU_ORIGIN, ensure_flru_for_all, flru_project_url
+from src.browser.base import BrowserClient
 from src.browser.factory import close_browser_client, get_browser_client
 from src.config import Settings
 from src.models import ProjectFull, ProjectPreview, ReplyEvent, SubmitResult
@@ -466,3 +469,367 @@ class FlruAdapter:
 
     def monitor_replies(self) -> list[ReplyEvent]:
         return []
+
+
+@dataclass
+class FlruSubmittedOffer:
+    description: str = ""
+    price: str | None = None
+    delivery_days: int | None = None
+    ok: bool = False
+    error: str | None = None
+
+
+SUBMITTED_OFFER_EXTRACTOR_JS = """
+() => {
+  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+  const isHeading = (t) => /^ваш\\s+отклик$/i.test(norm(t));
+  const isEdit = (t) => /^редактировать$/i.test(norm(t));
+  const isRefuse = (t) => /^отказаться/i.test(norm(t));
+  const isDate = (t) => /^\\d{2}\\.\\d{2}\\.\\d{4}\\s+в\\s+\\d{1,2}:\\d{2}/.test(norm(t));
+  const isTerm = (t) => /^срок\\s*:/i.test(norm(t));
+  const isPrice = (t) => /^стоимость\\s+работ\\s*:/i.test(norm(t));
+  const isChat = (t) => /^чат$/i.test(norm(t));
+  const isOther = (t) => /^другие\\s+заказы/i.test(norm(t));
+  const isStats = (t) => /^статистика\\s+откликов/i.test(norm(t));
+  const isTail = (t) => isChat(t) || isOther(t) || isStats(t);
+
+  const pickDays = (t) => {
+    const m = norm(t).match(/срок\\s*:\\s*(\\d+)\\s*дн/i);
+    return m ? parseInt(m[1], 10) : null;
+  };
+  const pickPrice = (t) => {
+    const m = norm(t).match(/стоимость\\s+работ\\s*:\\s*([\\d\\s\\u00a0]+)/i);
+    if (!m) return null;
+    const digits = m[1].replace(/[^\\d]/g, '');
+    return digits || null;
+  };
+
+  const nodes = [...document.querySelectorAll('h1,h2,h3,h4,div,span,p,button,a,li')];
+  const heading = nodes.find((el) => isHeading(el.textContent || ''));
+  if (heading) {
+    const root = heading.closest(
+      'section,article,[class*="proposal"],[class*="offer"],[class*="response"],[class*="Response"]'
+    ) || heading.parentElement;
+    let price = null;
+    let delivery_days = null;
+    const parts = [];
+    const walk = root ? [...root.querySelectorAll('*')] : [];
+    let passedHeading = false;
+    let pendingAuthor = null;
+    for (const el of walk) {
+      const raw = (el.textContent || '').trim();
+      if (!raw) continue;
+      const t = norm(raw);
+      if (isHeading(t)) { passedHeading = true; continue; }
+      if (!passedHeading) continue;
+      if (isTail(t)) break;
+      if (isEdit(t) || isRefuse(t)) continue;
+      if (isDate(t)) { pendingAuthor = null; continue; }
+      if (isTerm(t)) {
+        delivery_days = pickDays(t) ?? delivery_days;
+        continue;
+      }
+      if (isPrice(t)) {
+        price = pickPrice(t) || price;
+        continue;
+      }
+      if (el.children && el.children.length > 2 && t.length > 200) continue;
+      if (parts.length && parts[parts.length - 1].includes(t)) continue;
+      if (parts.some((p) => t.includes(p) && t.length > p.length + 20)) {
+        while (parts.length && t.includes(parts[parts.length - 1])) parts.pop();
+      }
+      // Short name line before date — hold, drop if next is date.
+      if (t.length < 60 && !/[.!?…]$/.test(t) && !isTerm(t) && !isPrice(t)) {
+        if (pendingAuthor) parts.push(pendingAuthor);
+        pendingAuthor = raw.includes('\\n') ? t : raw;
+        continue;
+      }
+      if (pendingAuthor) { parts.push(pendingAuthor); pendingAuthor = null; }
+      parts.push(raw.includes('\\n') ? t : raw);
+    }
+    if (pendingAuthor) parts.push(pendingAuthor);
+    const description = parts.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+    if (description.length >= 20) {
+      return { ok: true, error: null, description, price, delivery_days, via: 'dom' };
+    }
+  }
+
+  const full = document.body?.innerText || '';
+  const start = full.search(/ваш\\s+отклик/i);
+  if (start < 0) {
+    return { ok: false, error: 'block_missing', description: '', price: null, delivery_days: null };
+  }
+  let chunk = full.slice(start);
+  const cutRe = /\\n\\s*(?:чат|другие\\s+заказы|статистика\\s+откликов)/i;
+  const cut = chunk.search(cutRe);
+  if (cut > 40) chunk = chunk.slice(0, cut);
+
+  let price = null;
+  let delivery_days = null;
+  const dm = chunk.match(/срок\\s*:\\s*(\\d+)\\s*дн/i);
+  if (dm) delivery_days = parseInt(dm[1], 10);
+  const pm = chunk.match(/стоимость\\s+работ\\s*:\\s*([\\d\\s\\u00a0]+)/i);
+  if (pm) {
+    const digits = pm[1].replace(/[^\\d]/g, '');
+    if (digits) price = digits;
+  }
+
+  const lines = chunk.split(/\\n/);
+  const body = [];
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i].trim();
+    if (!raw) continue;
+    const t = norm(raw);
+    if (isHeading(t) || isEdit(t) || isRefuse(t) || isDate(t) || isTerm(t) || isPrice(t)) continue;
+    if (isTail(t)) break;
+    let j = i + 1;
+    while (j < lines.length && !lines[j].trim()) j++;
+    if (t.length < 60 && !/[.!?…]$/.test(t) && j < lines.length && isDate(norm(lines[j]))) {
+      continue;
+    }
+    body.push(raw);
+  }
+  const description = body.join('\\n').replace(/\\n{3,}/g, '\\n\\n').trim();
+  if (description.length < 20) {
+    return { ok: false, error: 'empty_body', description: '', price, delivery_days };
+  }
+  return { ok: true, error: null, description, price, delivery_days, via: 'text' };
+}
+"""
+
+
+_SUBMITTED_OFFER_TAIL_RE = re.compile(
+    r"\n\s*(?:"
+    r"чат|"
+    r"другие\s+заказы|"
+    r"статистика\s+откликов"
+    r")",
+    re.I,
+)
+_SUBMITTED_DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}\s+в\s+\d{1,2}:\d{2}")
+_SUBMITTED_DATE_INLINE_RE = re.compile(
+    r"^.+?\d{2}\.\d{2}\.\d{4}\s+в\s+\d{1,2}:\d{2}\s+"
+)
+_SUBMITTED_TERM_RE = re.compile(r"срок\s*:\s*(\d+)\s*дн", re.I)
+_SUBMITTED_PRICE_RE = re.compile(r"стоимость\s+работ\s*:\s*([\d\s\u00a0]+)", re.I)
+_SUBMITTED_CHROME_LINE_RE = re.compile(
+    r"^(?:"
+    r"ваш\s+отклик|"
+    r"редактировать(?:\s+отказаться.*)?"
+    r"|отказаться.*"
+    r")$",
+    re.I,
+)
+_SUBMITTED_META_CUT_RE = re.compile(
+    r"\s*(?:срок\s*:\s*\d+\s*дн\w*|стоимость\s+работ\s*:|чат)\b.*$",
+    re.I | re.S,
+)
+
+
+def _clean_submitted_description(body: str) -> str:
+    """Strip FL.ru chrome that DOM/text extractors sometimes leave in."""
+    text = (body or "").strip()
+    if not text:
+        return text
+    # Drop mashed leading chrome / author+date prefix on first line(s).
+    lines: list[str] = []
+    for i, line in enumerate(text.splitlines()):
+        raw = line.strip()
+        if not raw:
+            continue
+        if _SUBMITTED_CHROME_LINE_RE.match(raw):
+            continue
+        if _SUBMITTED_DATE_RE.match(raw):
+            continue
+        if i < 3:
+            raw2 = _SUBMITTED_DATE_INLINE_RE.sub("", raw).strip()
+            if raw2 != raw:
+                raw = raw2
+            if re.match(r"^редактировать\b", raw, flags=re.I):
+                continue
+        if re.match(r"^срок\s*:", raw, flags=re.I):
+            break
+        if re.match(r"^стоимость\s+работ\s*:", raw, flags=re.I):
+            break
+        if re.match(r"^чат$", raw, flags=re.I):
+            break
+        lines.append(raw)
+    cleaned = "\n".join(lines).strip()
+    cleaned = _SUBMITTED_META_CUT_RE.sub("", cleaned).strip()
+    return cleaned
+
+
+def parse_submitted_offer_from_text(text: str) -> FlruSubmittedOffer:
+    """Parse «Ваш отклик» from FL.ru page text; stop at Чат / Другие заказы."""
+    full = text or ""
+    start = re.search(r"ваш\s+отклик", full, flags=re.I)
+    if not start:
+        return FlruSubmittedOffer(ok=False, error="block_missing")
+    chunk = full[start.start() :]
+    cut = _SUBMITTED_OFFER_TAIL_RE.search(chunk)
+    if cut and cut.start() > 40:
+        chunk = chunk[: cut.start()]
+
+    delivery_days: int | None = None
+    dm = _SUBMITTED_TERM_RE.search(chunk)
+    if dm:
+        try:
+            delivery_days = int(dm.group(1))
+        except ValueError:
+            delivery_days = None
+
+    price: str | None = None
+    pm = _SUBMITTED_PRICE_RE.search(chunk)
+    if pm:
+        digits = re.sub(r"[^\d]", "", pm.group(1))
+        if digits:
+            price = digits
+
+    body_lines: list[str] = []
+    lines = chunk.splitlines()
+    for i, line in enumerate(lines):
+        raw = line.strip()
+        if not raw:
+            continue
+        if _SUBMITTED_CHROME_LINE_RE.match(raw):
+            continue
+        if _SUBMITTED_DATE_RE.match(raw):
+            continue
+        if re.match(r"^срок\s*:", raw, flags=re.I):
+            continue
+        if re.match(r"^стоимость\s+работ\s*:", raw, flags=re.I):
+            continue
+        if re.match(r"^чат$", raw, flags=re.I):
+            break
+        if re.match(r"^другие\s+заказы", raw, flags=re.I):
+            break
+        if re.match(r"^статистика\s+откликов", raw, flags=re.I):
+            break
+        if len(raw) < 60 and not re.search(r"[.!?…]$", raw):
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and _SUBMITTED_DATE_RE.match(lines[j].strip()):
+                continue
+        # Author+date mashed into first body line.
+        raw = _SUBMITTED_DATE_INLINE_RE.sub("", raw).strip()
+        if not raw or _SUBMITTED_CHROME_LINE_RE.match(raw):
+            continue
+        body_lines.append(raw)
+
+    body = _clean_submitted_description(
+        re.sub(r"\n{3,}", "\n\n", "\n".join(body_lines)).strip()
+    )
+    if len(body) < 20:
+        return FlruSubmittedOffer(
+            ok=False, error="empty_body", price=price, delivery_days=delivery_days
+        )
+    return FlruSubmittedOffer(
+        description=body, price=price, delivery_days=delivery_days, ok=True
+    )
+
+
+def _submitted_looks_dirty(description: str) -> bool:
+    low = (description or "").lower()
+    return bool(
+        re.search(r"редактировать|отказаться от заказа|стоимость работ\s*:", low)
+        or re.search(r"\bчат\b", low)
+    )
+
+
+def read_submitted_offer_text(
+    browser: BrowserClient, project_id: str
+) -> FlruSubmittedOffer:
+    """Open /projects/{id}/ and read the submitted «Ваш отклик» block."""
+    pid = str(project_id or "").strip()
+    if not _PROJECT_ID_RE.fullmatch(pid):
+        return FlruSubmittedOffer(ok=False, error="bad_project_id")
+    url = flru_project_url(pid)
+    try:
+        browser.navigate(url)
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(3500)
+    except Exception as exc:
+        return FlruSubmittedOffer(ok=False, error=f"navigate_failed: {exc}")
+
+    # Prefer line-oriented innerText — DOM walk often swallows chrome into parents.
+    inner = ""
+    try:
+        inner = str(browser.evaluate("() => document.body?.innerText || ''") or "")
+    except Exception:
+        inner = ""
+    parsed = parse_submitted_offer_from_text(inner)
+    if parsed.ok and not _submitted_looks_dirty(parsed.description):
+        return parsed
+
+    try:
+        raw = browser.evaluate(SUBMITTED_OFFER_EXTRACTOR_JS)
+    except Exception as exc:
+        logger.warning("flru_submitted_js_failed project_id=%s err=%s", pid, exc)
+        raw = None
+
+    if isinstance(raw, dict) and raw.get("ok") and str(raw.get("description") or "").strip():
+        days = raw.get("delivery_days")
+        try:
+            delivery_days = int(days) if days is not None else None
+        except (TypeError, ValueError):
+            delivery_days = None
+        desc = _clean_submitted_description(str(raw["description"]))
+        if desc and not _submitted_looks_dirty(desc):
+            return FlruSubmittedOffer(
+                description=desc,
+                price=(str(raw["price"]) if raw.get("price") else None),
+                delivery_days=delivery_days,
+                ok=True,
+            )
+        # Dirty DOM → re-parse cleaned blob / innerText.
+        reparsed = parse_submitted_offer_from_text(
+            "Ваш отклик\n" + str(raw.get("description") or "")
+        )
+        if reparsed.ok and not _submitted_looks_dirty(reparsed.description):
+            if not reparsed.price and raw.get("price"):
+                reparsed = FlruSubmittedOffer(
+                    description=reparsed.description,
+                    price=str(raw["price"]),
+                    delivery_days=reparsed.delivery_days or delivery_days,
+                    ok=True,
+                )
+            elif reparsed.delivery_days is None and delivery_days is not None:
+                reparsed = FlruSubmittedOffer(
+                    description=reparsed.description,
+                    price=reparsed.price,
+                    delivery_days=delivery_days,
+                    ok=True,
+                )
+            return reparsed
+
+    if parsed.ok:
+        cleaned = _clean_submitted_description(parsed.description)
+        if cleaned:
+            return FlruSubmittedOffer(
+                description=cleaned,
+                price=parsed.price,
+                delivery_days=parsed.delivery_days,
+                ok=True,
+            )
+
+    snap = ""
+    try:
+        snap = browser.snapshot() or ""
+    except Exception:
+        snap = ""
+    if snap:
+        html_parsed = parse_submitted_offer_from_text(snap)
+        if html_parsed.ok:
+            return html_parsed
+
+    err = None
+    if isinstance(raw, dict):
+        err = raw.get("error")
+    return FlruSubmittedOffer(
+        ok=False,
+        error=str(err or parsed.error or "read_failed"),
+        price=parsed.price,
+        delivery_days=parsed.delivery_days,
+    )
