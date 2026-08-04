@@ -29,6 +29,7 @@ KWORK_OFFERS_PARSE_JS = """
 """
 
 # Submitted offer bodies live in window.stateData.offers[].comment (HTML entities).
+# Price/days often live under o.order (duration in seconds, e.g. 604800 = 7d).
 KWORK_OFFERS_STATEDATA_JS = """
 () => {
   const offers = window.stateData && window.stateData.offers;
@@ -36,15 +37,18 @@ KWORK_OFFERS_STATEDATA_JS = """
   const items = offers.map((o) => {
     const wantId = o && o.wantId != null ? String(o.wantId) : '';
     const comment = o && o.comment != null ? String(o.comment) : '';
+    const order = (o && o.order) || {};
     let price = null;
-    if (o && o.price != null && o.price !== '') price = String(o.price);
-    else if (o && o.kworkPrice != null && o.kworkPrice !== '') price = String(o.kworkPrice);
-    else if (o && o.offerPrice != null && o.offerPrice !== '') price = String(o.offerPrice);
+    const rawPrice = o && (o.price ?? o.kworkPrice ?? o.offerPrice ?? order.price ?? order.initialOfferPrice);
+    if (rawPrice != null && rawPrice !== '') price = String(rawPrice);
     let days = null;
-    const rawDays = o && (o.duration ?? o.days ?? o.workTime ?? o.kworkDuration);
+    const rawDays = o && (o.duration ?? o.days ?? o.workTime ?? o.kworkDuration ?? order.duration ?? order.initialDuration);
     if (rawDays != null && rawDays !== '') {
-      const n = parseInt(String(rawDays).replace(/[^0-9]/g, ''), 10);
-      if (!Number.isNaN(n) && n > 0) days = n;
+      let n = Number(String(rawDays).replace(/[^0-9.]/g, ''));
+      if (!Number.isNaN(n) && n > 0) {
+        if (n >= 86400 || n > 60) n = Math.round(n / 86400);
+        if (n > 0) days = n;
+      }
     }
     return { wantId, comment, price, days };
   }).filter((x) => x.wantId);
@@ -58,6 +62,10 @@ _P_CLOSE_RE = re.compile(r"</p\s*>", re.I)
 
 _ORDER_RE = re.compile(r"покупатель сделал\s+(\d+)\s+заказ", re.I)
 _WAITING_RE = re.compile(r"покупатель пока не сделал заказ", re.I)
+_DAYS_FROM_COMMENT_RE = re.compile(
+    r"около\s+(\d+)\s*дн|срок[^\d]{0,20}(\d+)\s*дн",
+    re.I,
+)
 
 
 @dataclass(frozen=True)
@@ -172,6 +180,48 @@ class KworkOfferComment:
     delivery_days: int | None = None
 
 
+def _normalize_offer_price(price_raw: Any) -> str | None:
+    if price_raw in (None, ""):
+        return None
+    text = str(price_raw).strip()
+    if not text:
+        return None
+    try:
+        value = float(text.replace(" ", "").replace(",", "."))
+    except ValueError:
+        return text
+    if value == int(value):
+        return str(int(value))
+    return text
+
+
+def _normalize_offer_days(days_raw: Any) -> int | None:
+    if days_raw is None or not str(days_raw).strip():
+        return None
+    try:
+        days = int(float(str(days_raw).strip().replace(",", ".")))
+    except (TypeError, ValueError):
+        return None
+    if days <= 0:
+        return None
+    # Defense in depth: Kwork order.duration is seconds (604800 = 7d).
+    if days > 60 and (days >= 86400 or days % 86400 == 0):
+        days = max(1, round(days / 86400))
+    return days if days > 0 else None
+
+
+def _days_from_comment(comment: str) -> int | None:
+    match = _DAYS_FROM_COMMENT_RE.search(comment or "")
+    if not match:
+        return None
+    raw = match.group(1) or match.group(2)
+    try:
+        days = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return days if days > 0 else None
+
+
 def parse_state_data_offer_comments(raw: Any) -> dict[str, KworkOfferComment]:
     if not isinstance(raw, dict) or not raw.get("ok"):
         return {}
@@ -188,15 +238,10 @@ def parse_state_data_offer_comments(raw: Any) -> dict[str, KworkOfferComment]:
         comment = offer_comment_to_plaintext(str(item.get("comment") or ""))
         if not comment:
             continue
-        price_raw = item.get("price")
-        price = str(price_raw).strip() if price_raw not in (None, "") else None
-        days_raw = item.get("days")
-        delivery_days: int | None = None
-        if days_raw is not None and str(days_raw).strip():
-            try:
-                delivery_days = int(days_raw)
-            except (TypeError, ValueError):
-                delivery_days = None
+        price = _normalize_offer_price(item.get("price"))
+        delivery_days = _normalize_offer_days(item.get("days"))
+        if delivery_days is None:
+            delivery_days = _days_from_comment(comment)
         out[project_id] = KworkOfferComment(
             project_id=project_id,
             comment=comment,

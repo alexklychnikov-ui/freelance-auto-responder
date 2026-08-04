@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from src.adapters.kwork_offers import (
+    KWORK_OFFERS_STATEDATA_JS,
     journal_status_for_offer,
     parse_offers_html,
     parse_offers_items,
+    parse_state_data_offer_comments,
 )
 from src.journal.kwork_status_sync import sync_journal_from_kwork_offers
 from src.journal.writer import JournalWriter
@@ -58,6 +60,49 @@ def test_parse_offers_html_fixture() -> None:
     offers = parse_offers_html(html)
     assert offers["3204427"].buyer_orders == 1
     assert offers["3203948"].waiting_for_order is True
+
+
+def test_statedata_js_reads_nested_order_price_duration() -> None:
+    assert "o.order" in KWORK_OFFERS_STATEDATA_JS
+    assert "order.duration" in KWORK_OFFERS_STATEDATA_JS
+    assert "order.price" in KWORK_OFFERS_STATEDATA_JS
+    assert "/ 86400" in KWORK_OFFERS_STATEDATA_JS
+
+
+def test_parse_state_data_from_order_like_js_output() -> None:
+    """Simulates JS output after reading only order.{price,duration:'604800'}."""
+    parsed = parse_state_data_offer_comments(
+        {
+            "ok": True,
+            "items": [
+                {
+                    "wantId": "3229782",
+                    "comment": "Текст отклика около 7 дней",
+                    "price": "19200.00",
+                    "days": 7,
+                }
+            ],
+        }
+    )
+    assert parsed["3229782"].price == "19200"
+    assert parsed["3229782"].delivery_days == 7
+
+    # Defense: raw seconds still convert in Python if JS missed conversion.
+    parsed_sec = parse_state_data_offer_comments(
+        {
+            "ok": True,
+            "items": [
+                {
+                    "wantId": "3229782",
+                    "comment": "Текст",
+                    "price": "19200.00",
+                    "days": "604800",
+                }
+            ],
+        }
+    )
+    assert parsed_sec["3229782"].price == "19200"
+    assert parsed_sec["3229782"].delivery_days == 7
 
 
 def test_sync_journal_from_offers_updates_excel(tmp_path: Path) -> None:

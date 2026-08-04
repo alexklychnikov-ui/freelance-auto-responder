@@ -27,7 +27,12 @@ from src.adapters.kwork import (
     merge_preview_into_full,
     read_submitted_offer_text,
 )
-from src.adapters.kwork_auth import KworkAuthError, KworkCredentials, ensure_logged_in
+from src.adapters.kwork_auth import (
+    KworkAuthError,
+    KworkCredentials,
+    ensure_logged_in,
+    is_logged_in,
+)
 from src.adapters.flru import FlruAdapter, FlruAuthError
 from src.adapters.flru_urls import flru_project_url, extract_flru_project_id
 from src.adapters.yandex_urls import yandex_order_url
@@ -1556,12 +1561,14 @@ class PipelineOrchestrator:
         logger.info("journal_confirmed project_id=%s row=%s", project_id, row)
 
     def _fetch_submitted_offer_text(self, project_id: str) -> OfferFormSnapshot:
-        browser = get_browser_client(self.settings)
+        storage = (self.settings.kwork_storage_state or "").strip() or None
+        browser = get_browser_client(self.settings, storage_state_path=storage)
         try:
             if pair := self.settings.kwork_credentials():
-                ensure_logged_in(
-                    browser, KworkCredentials(login=pair[0], password=pair[1])
-                )
+                if not is_logged_in(browser):
+                    ensure_logged_in(
+                        browser, KworkCredentials(login=pair[0], password=pair[1])
+                    )
             return read_submitted_offer_text(browser, project_id)
         finally:
             close_browser_client(browser)

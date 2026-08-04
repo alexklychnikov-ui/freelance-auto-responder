@@ -107,6 +107,49 @@ def test_parse_state_data_offer_comments() -> None:
     assert parsed["3217871"].delivery_days == 14
 
 
+def test_parse_state_data_offer_comments_order_seconds_and_price() -> None:
+    """JS may pass order.price/duration; Python also normalizes seconds + .00."""
+    raw = {
+        "ok": True,
+        "items": [
+            {
+                "wantId": "3229782",
+                "comment": "Здравствуйте! Сделаю за около 7 дней.",
+                "price": "19200.00",
+                "days": "604800",
+            }
+        ],
+    }
+    parsed = parse_state_data_offer_comments(raw)
+    assert parsed["3229782"].price == "19200"
+    assert parsed["3229782"].delivery_days == 7
+
+
+def test_parse_state_data_offer_comments_days_from_comment_fallback() -> None:
+    raw = {
+        "ok": True,
+        "items": [
+            {
+                "wantId": "3229782",
+                "comment": "Готов выполнить за около 7 дней под ключ.",
+                "price": None,
+                "days": None,
+            }
+        ],
+    }
+    parsed = parse_state_data_offer_comments(raw)
+    assert parsed["3229782"].delivery_days == 7
+
+
+def test_kwork_offers_statedata_js_reads_order_fields() -> None:
+    from src.adapters.kwork_offers import KWORK_OFFERS_STATEDATA_JS
+
+    assert "order.duration" in KWORK_OFFERS_STATEDATA_JS
+    assert "order.price" in KWORK_OFFERS_STATEDATA_JS
+    assert "86400" in KWORK_OFFERS_STATEDATA_JS
+    assert "initialOfferPrice" in KWORK_OFFERS_STATEDATA_JS
+
+
 def test_read_submitted_offer_text_primary_statedata() -> None:
     browser = FakeOfferBrowser(
         state_data={
