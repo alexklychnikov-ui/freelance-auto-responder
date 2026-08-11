@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 from openpyxl import load_workbook
 
-from src.journal.writer import JOURNAL_COLUMNS, JournalWriter
+from src.journal.writer import JOURNAL_COLUMNS, JournalWriter, extract_journal_project_id
 from src.models import GptScoreResult, ProjectFull
 
 
@@ -139,6 +139,41 @@ def test_project_ids_in_journal(journal_path: Path, project: ProjectFull, score:
 
     writer.append_prepared(project, score, "text", price="1000")
     assert writer.project_ids_in_journal() == {"100"}
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("tz://tz_123", "tz_123"),
+        ("tz_123", "tz_123"),
+        ("prefix tz_1785490763952 suffix", "tz_1785490763952"),
+    ],
+)
+def test_extract_journal_project_id_tz(text: str, expected: str) -> None:
+    assert extract_journal_project_id(text) == expected
+
+
+def test_project_ids_in_journal_tz_url(journal_path: Path, score: GptScoreResult) -> None:
+    project = ProjectFull(
+        platform="telegram",
+        source_key="tz_manual",
+        project_id="tz_1785490763952",
+        url="tz://tz_1785490763952",
+        title="TZ project",
+        full_description="desc",
+    )
+    writer = JournalWriter(journal_path)
+    writer.append_prepared(project, score, "tz text", price="1000")
+    assert writer.project_ids_in_journal() == {"tz_1785490763952"}
+
+
+def test_set_url_cell_empty_has_no_hyperlink(journal_path: Path) -> None:
+    wb = load_workbook(journal_path)
+    ws = wb.active
+    JournalWriter._set_url_cell(ws, 2, "")
+    assert ws.cell(row=2, column=4).value is None
+    assert ws.cell(row=2, column=4).hyperlink is None
+    wb.close()
 
 
 def test_project_ids_in_journal_yandex_and_flru(tmp_path: Path) -> None:

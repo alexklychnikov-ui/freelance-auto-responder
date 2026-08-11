@@ -13,7 +13,7 @@ def test_build_tz_project_uses_first_line_as_title() -> None:
     assert project.title == "Нужен Telegram-бот"
     assert project.full_description == text
     assert project.project_id.startswith("tz_")
-    assert project.url == ""
+    assert project.url == f"tz://{project.project_id}"
 
 
 def test_build_tz_project_short_title_uses_body_prefix() -> None:

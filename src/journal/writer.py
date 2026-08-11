@@ -64,12 +64,18 @@ def infer_project_type(title: str) -> str:
     return "Другое"
 
 
+_TZ_PROJECT_ID_RE = re.compile(r"\btz_\d+\b")
+
+
 def extract_journal_project_id(text: str) -> str | None:
     """Extract canonical project/order id from a journal URL cell."""
     raw = (text or "").strip()
     if not raw:
         return None
     normalized = raw.replace("\\", "/")
+    tz_match = _TZ_PROJECT_ID_RE.search(normalized)
+    if tz_match:
+        return tz_match.group(0)
     for extractor in (
         extract_kwork_project_id,
         extract_flru_project_id,
@@ -109,8 +115,14 @@ class JournalWriter:
 
     @staticmethod
     def _set_url_cell(ws, row: int, url: str) -> None:
-        cell = ws.cell(row=row, column=4, value=url)
-        cell.hyperlink = url
+        url_text = (url or "").strip()
+        if not url_text:
+            cell = ws.cell(row=row, column=4, value=None)
+            cell.hyperlink = None
+            cell.font = Font()
+            return
+        cell = ws.cell(row=row, column=4, value=url_text)
+        cell.hyperlink = url_text
         cell.font = Font(color="0563C1", underline="single")
 
     def _ensure_workbook(self) -> None:
@@ -292,6 +304,52 @@ class JournalWriter:
         wb.save(self.journal_path)
         wb.close()
         logger.info("journal_response_updated project_id=%s row=%d", project_id, row)
+        return True
+
+    @staticmethod
+    def _response_cell_empty(value: object) -> bool:
+        return not str(value or "").strip()
+
+    def response_is_empty_by_project_id(self, project_id: str) -> bool:
+        if not self.journal_path.exists():
+            return True
+        wb = load_workbook(self.journal_path)
+        ws = wb.active
+        row = self._find_row_by_project_id(ws, project_id)
+        if row is None:
+            wb.close()
+            return True
+        empty = self._response_cell_empty(ws.cell(row=row, column=RESPONSE_COLUMN).value)
+        wb.close()
+        return empty
+
+    def update_response_by_project_id_if_empty(
+        self,
+        project_id: str,
+        response_payload: str,
+    ) -> bool:
+        """Fill column I only when the cell is missing/blank. Never overwrite."""
+        if not self.journal_path.exists():
+            return False
+        wb = load_workbook(self.journal_path)
+        ws = wb.active
+        self._apply_journal_layout(ws)
+        row = self._find_row_by_project_id(ws, project_id)
+        if row is None or not self._writable(ws, row, RESPONSE_COLUMN):
+            wb.close()
+            return False
+        if not self._response_cell_empty(ws.cell(row=row, column=RESPONSE_COLUMN).value):
+            wb.close()
+            return False
+        ws.cell(row=row, column=RESPONSE_COLUMN, value=response_payload)
+        ws.cell(row=row, column=RESPONSE_COLUMN).alignment = Alignment(
+            vertical="top", wrap_text=True
+        )
+        wb.save(self.journal_path)
+        wb.close()
+        logger.info(
+            "journal_response_filled_empty project_id=%s row=%d", project_id, row
+        )
         return True
 
     def update_notes_by_project_id(self, project_id: str, notes: str) -> bool:

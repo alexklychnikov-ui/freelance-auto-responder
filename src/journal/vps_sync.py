@@ -210,6 +210,23 @@ def sync_journal_on_vps(
                 logger.warning("journal_sync_comments_failed: %s", exc)
                 comments = {}
 
+        # Status-synced rows leave column I empty; backfill from /offers comments
+        # without touching non-empty responses or requiring journal_confirmed.
+        existing_ids = writer.project_ids_in_journal()
+        for project_id, comment in comments.items():
+            if project_id not in existing_ids:
+                continue
+            text = (comment.comment or "").strip()
+            if not text:
+                continue
+            payload = format_response_payload(
+                text,
+                price=comment.price,
+                delivery_days=comment.delivery_days,
+            )
+            if writer.update_response_by_project_id_if_empty(project_id, payload):
+                result.updated_notes += 1
+
         for item in prepared_store.list_all():
             if not item.journal_confirmed:
                 continue
@@ -249,6 +266,13 @@ def sync_journal_on_vps(
                 if not item.journal_exported:
                     item.journal_exported = True
                     prepared_store.save(item)
+                continue
+
+            if item.journal_exported:
+                logger.warning(
+                    "journal_skip_reappend_exported project_id=%s",
+                    item.project_id,
+                )
                 continue
 
             from src.pipeline.manual_copy import journal_status_for_confirm

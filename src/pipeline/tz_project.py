@@ -21,7 +21,7 @@ def build_tz_project(text: str) -> ProjectFull:
         platform=TZ_PLATFORM,
         source_key=TZ_MANUAL_SOURCE_KEY,
         project_id=project_id,
-        url="",
+        url=f"tz://{project_id}",
         title=title,
         full_description=body,
     )
