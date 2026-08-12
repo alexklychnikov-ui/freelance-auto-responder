@@ -40,6 +40,26 @@ class ProjectRepository:
             ).fetchone()
         return row is not None
 
+    def is_unprocessed_new(
+        self, platform: str, source_key: str, project_id: str
+    ) -> bool:
+        """True when row exists as unfinished new (status=new, no score/fit)."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT status, fit, score FROM projects
+                WHERE platform = ? AND source_key = ? AND project_id = ?
+                """,
+                (platform, source_key, project_id),
+            ).fetchone()
+        if row is None:
+            return False
+        return (
+            str(row["status"] or "") == "new"
+            and row["fit"] is None
+            and row["score"] is None
+        )
+
     def insert_new(
         self,
         *,

@@ -33,7 +33,7 @@ from src.adapters.kwork_auth import (
     ensure_logged_in,
     is_logged_in,
 )
-from src.adapters.flru import FlruAdapter, FlruAuthError
+from src.adapters.flru import FlruAdapter, FlruAuthError, FlruProjectClosed
 from src.adapters.flru_urls import flru_project_url, extract_flru_project_id
 from src.adapters.yandex_urls import yandex_order_url
 from src.adapters.yandex_uslugi import YandexAuthError, YandexUslugiAdapter
@@ -70,6 +70,13 @@ from src.telegram_bot.review_service import ReviewService
 from src.telegram_bot.scan_report import format_scan_reports_message
 
 logger = logging.getLogger(__name__)
+
+
+def _is_closed_project_error(exc: BaseException) -> bool:
+    if isinstance(exc, FlruProjectClosed):
+        return True
+    msg = str(exc).lower()
+    return "flru_project_closed" in msg or "project_closed" in msg
 
 
 def _normalize_compare_title(value: str) -> str:
@@ -340,7 +347,10 @@ class PipelineOrchestrator:
                 known = self.repository.is_known(
                     preview.platform, preview.source_key, preview.project_id
                 )
-                if known:
+                stuck_new = known and self.repository.is_unprocessed_new(
+                    preview.platform, preview.source_key, preview.project_id
+                )
+                if known and not stuck_new:
                     totals["skipped"] += 1
                     known_streak += 1
                     # Early-exit only on long listings (Kwork). Short cab pages
@@ -356,8 +366,24 @@ class PipelineOrchestrator:
 
                 known_streak = 0
 
-                if bootstrap and self.settings.scan_bootstrap_skip_pipeline:
-                    self.repository.bootstrap_skip(
+                if not known:
+                    if bootstrap and self.settings.scan_bootstrap_skip_pipeline:
+                        self.repository.bootstrap_skip(
+                            platform=preview.platform,
+                            source_key=preview.source_key,
+                            project_id=preview.project_id,
+                            title=preview.title,
+                            url=preview.url,
+                            published_at=(
+                                preview.published_at.isoformat()
+                                if preview.published_at
+                                else None
+                            ),
+                        )
+                        totals["skipped"] += 1
+                        continue
+
+                    self.repository.insert_new(
                         platform=preview.platform,
                         source_key=preview.source_key,
                         project_id=preview.project_id,
@@ -369,25 +395,39 @@ class PipelineOrchestrator:
                             else None
                         ),
                     )
-                    totals["skipped"] += 1
+                    totals["new"] += 1
+                    new_in_source += 1
+
+                try:
+                    outcome = await self._process_new_project(source, preview)
+                except Exception as exc:
+                    if _is_closed_project_error(exc):
+                        logger.info(
+                            "project_closed_skip platform=%s source=%s project_id=%s err=%s",
+                            preview.platform,
+                            preview.source_key,
+                            preview.project_id,
+                            exc,
+                        )
+                        self.repository.update_status(
+                            preview.platform,
+                            preview.source_key,
+                            preview.project_id,
+                            "skipped",
+                        )
+                        totals["skipped"] += 1
+                        source_stats.checked += 1
+                        continue
+                    logger.exception(
+                        "process_project_failed platform=%s source=%s project_id=%s "
+                        "(left status=new for retry)",
+                        preview.platform,
+                        preview.source_key,
+                        preview.project_id,
+                    )
+                    source_stats.checked += 1
                     continue
 
-                self.repository.insert_new(
-                    platform=preview.platform,
-                    source_key=preview.source_key,
-                    project_id=preview.project_id,
-                    title=preview.title,
-                    url=preview.url,
-                    published_at=(
-                        preview.published_at.isoformat()
-                        if preview.published_at
-                        else None
-                    ),
-                )
-                totals["new"] += 1
-                new_in_source += 1
-
-                outcome = await self._process_new_project(source, preview)
                 source_stats.checked += 1
                 if outcome == "extract_fail":
                     totals["skipped"] += 1

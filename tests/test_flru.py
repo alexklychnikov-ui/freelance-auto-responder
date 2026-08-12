@@ -25,6 +25,37 @@ def test_is_flru_project_closed_phrases() -> None:
     assert not is_flru_project_closed("Откликнуться на проект")
 
 
+def test_parse_project_closed_ignores_related_aside() -> None:
+    html = """
+    <html><body>
+    <h1>Нужен парсер</h1>
+    <div class="description">Сделать парсер каталога Озон под ключ</div>
+    <aside>
+      <a href="/projects/5517512/x.html">Похожий</a>
+      <span>Заказчик выбрал исполнителя: Иван Иванов</span>
+    </aside>
+    <h2>Другие заказы по специализации</h2>
+    <div>Заказчик выбрал исполнителя: Пётр Петров</div>
+    </body></html>
+    """
+    raw = parse_project_from_html(html, project_id="5516755")
+    assert raw["closed"] is False
+
+
+def test_parse_project_closed_when_banner_in_main() -> None:
+    html = """
+    <html><body>
+    <h1>Нужен парсер</h1>
+    <div class="notice">Заказчик выбрал исполнителя: Никита Петров</div>
+    <div class="description">Сделать парсер каталога Озон под ключ</div>
+    <h2>Другие заказы по специализации</h2>
+    <div>Открытый похожий заказ</div>
+    </body></html>
+    """
+    raw = parse_project_from_html(html, project_id="5516755")
+    assert raw["closed"] is True
+
+
 def test_parse_listing_from_html_fixture() -> None:
     html = (FIXTURES / "flru_listing.html").read_text(encoding="utf-8")
     cards = parse_listing_from_html(html)
@@ -38,6 +69,37 @@ def test_parse_project_from_html_fixture() -> None:
     raw = parse_project_from_html(html, project_id=PID)
     assert "озон" in raw["title"].lower() or "парсинг" in raw["title"].lower()
     assert "озон" in (raw["full_description"] or "").lower()
+
+
+def test_parse_project_offers_prefers_otkliknulis_over_related_otvet() -> None:
+    html = (FIXTURES / "flru_project_stats.html").read_text(encoding="utf-8")
+    raw = parse_project_from_html(html, project_id="5516755")
+    assert raw["offers_count"] == 36
+
+
+def test_parse_project_offers_otklik_only_inside_stats_not_related() -> None:
+    html = """
+    <html><body>
+    <h1>Заказ</h1>
+    <aside>
+      <a href="/projects/5517512/x.html">Похожий</a>
+      <span>3 отклика</span>
+      <span>35 ответов</span>
+    </aside>
+    <section>
+      <h3>Статистика откликов</h3>
+      <div>от 20 000 — до 80 000 · 12 откликов</div>
+    </section>
+    </body></html>
+    """
+    raw = parse_project_from_html(html, project_id="5516755")
+    assert raw["offers_count"] == 12
+
+
+def test_parse_listing_responses_count_from_card() -> None:
+    html = (FIXTURES / "flru_listing.html").read_text(encoding="utf-8")
+    cards = {c["project_id"]: c for c in parse_listing_from_html(html)}
+    assert cards[PID]["responses_count"] == 2
 
 
 def _make_adapter(**kwargs) -> FlruAdapter:

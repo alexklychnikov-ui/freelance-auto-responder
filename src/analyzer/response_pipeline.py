@@ -491,9 +491,10 @@ class ResponsePipeline:
             temperature=0.82,
         )
         text = finalize_response_text(text, project)
-        banned = soft_banned_issues(text) + [
-            f"kwork:{v}" for v in kwork_compliance_issues(text)
-        ] + [
+        banned = soft_banned_issues(text)
+        if project.platform == "kwork":
+            banned += [f"kwork:{v}" for v in kwork_compliance_issues(text)]
+        banned += [
             f"checklist:{v}" for v in buyer_checklist_issues(project, text)
         ] + [f"tz:{v}" for v in payment_mismatch_issues(project, text)]
         banned += budget_mismatch_issues(text, budget_mismatch)
@@ -536,9 +537,11 @@ class ResponsePipeline:
         budget_mismatch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         buyer_questions = extract_buyer_questions(project)
-        local_issues = soft_banned_issues(draft) + [
-            f"kwork:{v}" for v in kwork_compliance_issues(draft)
-        ]
+        local_issues = soft_banned_issues(draft)
+        if project.platform == "kwork":
+            local_issues += [
+                f"kwork:{v}" for v in kwork_compliance_issues(draft)
+            ]
         local_issues += budget_mismatch_issues(draft, budget_mismatch)
         payload: dict[str, Any] = {
             "project_brief": build_project_brief(project),

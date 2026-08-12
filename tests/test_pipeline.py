@@ -132,6 +132,191 @@ def _make_orchestrator(
 
 
 @pytest.mark.asyncio
+async def test_scan_cycle_continues_after_closed_project(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    from src.adapters.flru import FlruProjectClosed
+
+    closed_full = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="9001",
+        url="https://kwork.ru/projects/9001",
+        title="Closed project title long enough",
+        full_description="Need a Python bot that syncs deals to Sheets every hour.",
+    )
+    open_full = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="9002",
+        url="https://kwork.ru/projects/9002",
+        title="Open project title long enough",
+        full_description="Need a Python bot that monitors channels and syncs deals.",
+    )
+    previews = [
+        ProjectPreview(
+            platform="kwork",
+            source_key="kwork_dev_it",
+            project_id="9001",
+            url=closed_full.url,
+            title=closed_full.title,
+        ),
+        ProjectPreview(
+            platform="kwork",
+            source_key="kwork_dev_it",
+            project_id="9002",
+            url=open_full.url,
+            title=open_full.title,
+        ),
+    ]
+    orch, mock_adapter = _make_orchestrator(
+        settings, previews=previews, project_full=open_full, score=score
+    )
+
+    def _read_full(project_id: str):
+        if str(project_id) == "9001":
+            raise FlruProjectClosed(
+                "flru_project_closed: исполнитель уже определён"
+            )
+        return open_full
+
+    mock_adapter.read_full.side_effect = _read_full
+
+    totals = await orch.run_scan_cycle()
+
+    assert totals["new"] >= 2
+    orch.scorer.score.assert_called()
+    scored_ids = {
+        call.args[0].project_id for call in orch.scorer.score.call_args_list
+    }
+    assert "9002" in scored_ids
+    assert "9001" not in scored_ids
+
+    repo = ProjectRepository(settings.database_path)
+    with repo._conn() as conn:
+        row_closed = conn.execute(
+            "SELECT status FROM projects WHERE project_id = ?",
+            ("9001",),
+        ).fetchone()
+        row_open = conn.execute(
+            "SELECT status, score FROM projects WHERE project_id = ?",
+            ("9002",),
+        ).fetchone()
+    assert row_closed is not None
+    assert row_closed["status"] == "skipped"
+    assert row_open is not None
+    assert row_open["status"] != "new"
+    assert row_open["score"] is not None
+
+
+@pytest.mark.asyncio
+async def test_stuck_new_null_score_is_reprocessed(
+    settings: Settings, project_full: ProjectFull, score: GptScoreResult
+) -> None:
+    repo = ProjectRepository(settings.database_path)
+    repo.insert_new(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="999",
+        title=project_full.title,
+        url=project_full.url,
+        status="new",
+    )
+    assert repo.is_unprocessed_new("kwork", "kwork_dev_it", "999")
+
+    preview = ProjectPreview(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="999",
+        url=project_full.url,
+        title=project_full.title,
+    )
+    orch, mock_adapter = _make_orchestrator(
+        settings, previews=[preview], project_full=project_full, score=score
+    )
+    totals = await orch.run_scan_cycle()
+
+    assert totals["new"] == 0
+    orch.scorer.score.assert_called()
+    mock_adapter.read_full.assert_called()
+    assert not repo.is_unprocessed_new("kwork", "kwork_dev_it", "999")
+    with repo._conn() as conn:
+        row = conn.execute(
+            "SELECT status, score FROM projects WHERE project_id = ?",
+            ("999",),
+        ).fetchone()
+    assert row is not None
+    assert row["status"] != "new"
+    assert row["score"] is not None
+
+
+@pytest.mark.asyncio
+async def test_scan_cycle_transient_error_leaves_new_for_retry(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    bad = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="9101",
+        url="https://kwork.ru/projects/9101",
+        title="Transient fail project title",
+        full_description="Need a Python bot that syncs deals to Sheets every hour.",
+    )
+    good = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="9102",
+        url="https://kwork.ru/projects/9102",
+        title="Ok project title long enough",
+        full_description="Need a Python bot that monitors channels and syncs deals.",
+    )
+    previews = [
+        ProjectPreview(
+            platform="kwork",
+            source_key="kwork_dev_it",
+            project_id="9101",
+            url=bad.url,
+            title=bad.title,
+        ),
+        ProjectPreview(
+            platform="kwork",
+            source_key="kwork_dev_it",
+            project_id="9102",
+            url=good.url,
+            title=good.title,
+        ),
+    ]
+    orch, mock_adapter = _make_orchestrator(
+        settings, previews=previews, project_full=good, score=score
+    )
+
+    def _read_full(project_id: str):
+        if str(project_id) == "9101":
+            raise RuntimeError("flru_read_failed: timeout")
+        return good
+
+    mock_adapter.read_full.side_effect = _read_full
+    await orch.run_scan_cycle()
+
+    repo = ProjectRepository(settings.database_path)
+    with repo._conn() as conn:
+        row_bad = conn.execute(
+            "SELECT status, score FROM projects WHERE project_id = ?",
+            ("9101",),
+        ).fetchone()
+        row_good = conn.execute(
+            "SELECT status, score FROM projects WHERE project_id = ?",
+            ("9102",),
+        ).fetchone()
+    assert row_bad is not None
+    assert row_bad["status"] == "new"
+    assert row_bad["score"] is None
+    assert row_good is not None
+    assert row_good["status"] != "new"
+    assert row_good["score"] is not None
+
+
+@pytest.mark.asyncio
 async def test_pipeline_scan_score_submit(
     settings: Settings, project_full: ProjectFull, score: GptScoreResult
 ) -> None:

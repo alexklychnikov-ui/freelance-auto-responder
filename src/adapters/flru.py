@@ -28,6 +28,67 @@ def is_flru_project_closed(text: str) -> bool:
     return bool(_CLOSED_RE.search(text or ""))
 
 
+class FlruProjectClosed(RuntimeError):
+    """Project page shows performer already chosen / order closed."""
+
+
+def flru_project_closed_scope(html_or_text: str) -> str:
+    """Main-project text for closed checks — exclude related feed / aside.
+
+    Whole ``document.body.innerText`` false-positives when related cards say
+    «Заказчик выбрал исполнителя». Scope to head before «Другие заказы» and
+    drop ``<aside>`` blocks in HTML.
+    """
+    raw = html_or_text or ""
+    if "<" in raw and ">" in raw:
+        cleaned = re.sub(
+            r"<aside\b[^>]*>.*?</aside>", " ", raw, flags=re.I | re.DOTALL
+        )
+        cleaned = re.sub(
+            r"<script\b[^>]*>.*?</script>", " ", cleaned, flags=re.I | re.DOTALL
+        )
+        text = re.sub(r"<[^>]+>", " ", cleaned)
+        text = re.sub(r"\s+", " ", text).strip()
+    else:
+        text = re.sub(r"\s+", " ", raw).strip()
+    cut = re.search(
+        r"другие\s+заказ|похожие\s+(?:заказ|проект)|рекоменд",
+        text,
+        flags=re.I,
+    )
+    if cut:
+        return text[: cut.start()].strip()
+    return text
+
+
+def is_flru_project_page_closed(html_or_text: str) -> bool:
+    return is_flru_project_closed(flru_project_closed_scope(html_or_text))
+
+
+def extract_project_offers_count(text: str) -> int | None:
+    """Project-page offers: prefer «Откликнулись: N».
+
+    «N отклик*» / «N ответ*» only inside a «Статистика» window —
+    related feed cards must not steal the first whole-body match.
+    """
+    if not text:
+        return None
+    m = re.search(r"Откликнулись:\s*(\d+)", text, flags=re.I)
+    if m:
+        return int(m.group(1))
+    stats = re.search(r"Статистика.{0,400}", text, flags=re.I | re.DOTALL)
+    if not stats:
+        return None
+    region = stats.group(0)
+    m = re.search(r"(\d+)\s+отклик\w*", region, flags=re.I)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)\s+ответ\w*", region, flags=re.I)
+    if m:
+        return int(m.group(1))
+    return None
+
+
 LISTING_EXTRACTOR_JS = """
 () => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
@@ -58,7 +119,9 @@ LISTING_EXTRACTOR_JS = """
       /(?:^|\\s)(по договоренности|\\d[\\d\\s]*\\s*руб)/i
     );
     const budget_text = budgetMatch ? norm(budgetMatch[1]) : null;
-    const respMatch = cardText.match(/(\\d+)\\s+ответ/i);
+    const respMatch =
+      cardText.match(/(\\d+)\\s+ответ/i) ||
+      cardText.match(/(\\d+)\\s+отклик/i);
     const responses_count = respMatch ? parseInt(respMatch[1], 10) : null;
     const url = href.startsWith('http')
       ? href.split('?')[0]
@@ -85,9 +148,17 @@ PROJECT_EXTRACTOR_JS = """
     norm(document.querySelector('[class*="title"]')?.textContent) ||
     norm(document.title).replace(/\\s*[|·—-].*$/i, '');
 
-  const closed = /(?:исполнитель\\s+определ|выбрал\\s+исполнител|исполнитель\\s+выбран)/i.test(
-    document.body?.innerText || ''
-  );
+  const closedRe = /(?:исполнитель\\s+определ|выбрал\\s+исполнител|исполнитель\\s+выбран)/i;
+  const scopeRoot = document.body ? document.body.cloneNode(true) : null;
+  if (scopeRoot) {
+    scopeRoot.querySelectorAll(
+      'aside, [class*="related"], [class*="similar"], [class*="recommend"]'
+    ).forEach((el) => el.remove());
+  }
+  let closedScope = (scopeRoot?.innerText || document.body?.innerText || '');
+  const relatedCut = closedScope.search(/другие\\s+заказ|похожие\\s+(?:заказ|проект)|рекоменд/i);
+  if (relatedCut > 0) closedScope = closedScope.slice(0, relatedCut);
+  const closed = closedRe.test(closedScope);
   const descCandidates = [
     ...document.querySelectorAll(
       '[class*="description"], [class*="text-qa"], article p, .b-layout__txt p, main p'
@@ -114,8 +185,22 @@ PROJECT_EXTRACTOR_JS = """
   const max_budget = moneyBits.length > 1 ? moneyBits[1] : desired_budget;
 
   let offers_count = null;
-  const offM = bodyText.match(/(\\d+)\\s+ответ/i);
-  if (offM) offers_count = parseInt(offM[1], 10);
+  const otkliknulis = bodyText.match(/Откликнулись:\\s*(\\d+)/i);
+  if (otkliknulis) {
+    offers_count = parseInt(otkliknulis[1], 10);
+  } else {
+    const statsWin = bodyText.match(/Статистика[\\s\\S]{0,400}/i);
+    if (statsWin) {
+      const region = statsWin[0];
+      const otklik = region.match(/(\\d+)\\s+отклик\\w*/i);
+      if (otklik) {
+        offers_count = parseInt(otklik[1], 10);
+      } else {
+        const otvet = region.match(/(\\d+)\\s+ответ\\w*/i);
+        if (otvet) offers_count = parseInt(otvet[1], 10);
+      }
+    }
+  }
 
   let buyer = null;
   const buyerCandidates = [
@@ -205,7 +290,7 @@ def parse_listing_from_html(html: str, *, skip_closed: bool = True) -> list[dict
         if bm:
             budget = re.sub(r"\s+", " ", bm.group(1)).strip()
         responses = None
-        rm = re.search(r"(\d+)\s+ответ", window, flags=re.I)
+        rm = re.search(r"(\d+)\s+(?:ответ|отклик)", window, flags=re.I)
         if rm:
             responses = int(rm.group(1))
         url = href if href.startswith("http") else f"{FLRU_ORIGIN}{href}"
@@ -267,12 +352,9 @@ def parse_project_from_html(html: str, project_id: str | None = None) -> dict[st
     desired = money[0] if money else None
     max_b = money[1] if len(money) > 1 else desired
 
-    offers = None
-    om = re.search(r"(\d+)\s+ответ", html, flags=re.I)
-    if om:
-        offers = int(om.group(1))
+    offers = extract_project_offers_count(html)
 
-    closed = is_flru_project_closed(html)
+    closed = is_flru_project_page_closed(html)
 
     return {
         "project_id": pid,
@@ -432,7 +514,9 @@ class FlruAdapter:
             raise RuntimeError(f"flru_read_failed: {exc}") from exc
 
         if raw.get("closed"):
-            raise RuntimeError("flru_project_closed: исполнитель уже определён")
+            raise FlruProjectClosed(
+                "flru_project_closed: исполнитель уже определён"
+            )
 
         title = str(raw.get("title") or "").strip()
         desc = str(raw.get("full_description") or "").strip()

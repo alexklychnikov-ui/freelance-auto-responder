@@ -73,3 +73,27 @@ def test_consecutive_known_count(repo: ProjectRepository) -> None:
         ["3201950", "3201949", "3201947"],
     )
     assert count == 2
+
+
+def test_is_unprocessed_new(repo: ProjectRepository) -> None:
+    assert (
+        repo.is_unprocessed_new("kwork", "kwork_dev_it", "3201949") is False
+    )
+    repo.insert_new(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3201949",
+        status="new",
+    )
+    assert repo.is_unprocessed_new("kwork", "kwork_dev_it", "3201949") is True
+    repo.update_status(
+        "kwork", "kwork_dev_it", "3201949", "scored", fit=True, score=8.0
+    )
+    assert repo.is_unprocessed_new("kwork", "kwork_dev_it", "3201949") is False
+    repo.insert_new(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3201950",
+        status="skipped",
+    )
+    assert repo.is_unprocessed_new("kwork", "kwork_dev_it", "3201950") is False
