@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from src.adapters.kwork import _strip_stage_title_leakage
 from src.analyzer.response_text import (
+    ensure_hello_greeting,
     finalize_response_text,
     payment_mismatch_issues,
     strip_github_links,
@@ -88,7 +89,8 @@ def test_strip_hallucinated_irina_when_no_buyer() -> None:
         "Дайте знать, с чего удобнее начать."
     )
     out = finalize_response_text(text, project)
-    assert not out.lstrip().lower().startswith("ирина")
+    assert out.lstrip().startswith("Здравствуйте!")
+    assert "ирина" not in out.lower().split("здравствуйте", 1)[0]
     assert "\n\n" not in out
     assert "\n" in out
     assert out.startswith("    ")
@@ -100,8 +102,9 @@ def test_keep_real_buyer_greeting() -> None:
     project = _project("бот").model_copy(update={"buyer": "Ирина · 80%"})
     text = "Ирина, здравствуйте! Сделаю бота под заявки. Срок — 5 дней."
     out = finalize_response_text(text, project)
-    assert "Ирина, здравствуйте!" in out
-    assert out.startswith("    Ирина, здравствуйте!")
+    assert out.lstrip().startswith("Здравствуйте!")
+    assert "Ирина, здравствуйте!" not in out
+    assert out.startswith("    Здравствуйте!")
 
 
 def test_buyer_first_name_rejects_ui_noise() -> None:
@@ -126,7 +129,13 @@ def test_reject_self_account_dump_as_buyer() -> None:
         "Срок — 5–7 дней, стоимость от 199 ₽. Если ок — напишите."
     )
     out = finalize_response_text(text, project)
-    assert not out.lstrip().lower().startswith("александр")
+    assert out.lstrip().startswith("Здравствуйте!")
     assert "\n\n" not in out
-    assert out.startswith("    Для вашего")
+    assert out.startswith("    Здравствуйте!")
     assert all(line.startswith("    ") for line in out.split("\n") if line)
+
+
+def test_ensure_hello_greeting_idempotent() -> None:
+    assert ensure_hello_greeting("Сделаю бота.") == "Здравствуйте! Сделаю бота."
+    assert ensure_hello_greeting("Здравствуйте! Уже есть.") == "Здравствуйте! Уже есть."
+    assert ensure_hello_greeting("Ирина, здравствуйте! Текст.") == "Здравствуйте! Текст."

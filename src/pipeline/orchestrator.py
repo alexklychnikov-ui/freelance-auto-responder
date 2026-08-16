@@ -1455,6 +1455,7 @@ class PipelineOrchestrator:
         response_text = item.response_text
         price = item.price
         delivery_days = item.delivery_days
+        flru_guest_fallback = False
         if platform == "kwork":
             try:
                 snap = await asyncio.to_thread(
@@ -1556,11 +1557,19 @@ class PipelineOrchestrator:
                     len(response_text),
                 )
             elif fsnap.error:
+                err = str(fsnap.error)
                 logger.warning(
                     "journal_confirm_flru_fallback_prepared project_id=%s err=%s",
                     project_id,
-                    fsnap.error,
+                    err,
                 )
+                if "not_logged_in" in err:
+                    flru_guest_fallback = True
+                    logger.warning(
+                        "journal_confirm_flru_not_logged_in project_id=%s "
+                        "hint=deploy/flru_login_interactive.py",
+                        project_id,
+                    )
 
         journal_status, journal_result = journal_status_for_confirm(platform)
         try:
@@ -1594,10 +1603,16 @@ class PipelineOrchestrator:
 
         await self.review_service.tg_bot.mark_journal_confirmed(callback)
         await callback.answer("Записано в журнал")
-        await self.review_service.tg_bot.notify(
+        journal_note = (
             f"📒 Журнал: строка {row} · {html.escape(item.title)}\n"
             "На ПК: /journal в TG — пришлёт актуальный journal.xlsx с VPS."
         )
+        if flru_guest_fallback:
+            journal_note += (
+                "\n⚠️ FL.ru guest/not_logged_in — записан prepared-черновик. "
+                "Обнови сессию: deploy/flru_login_interactive.py"
+            )
+        await self.review_service.tg_bot.notify(journal_note)
         logger.info("journal_confirmed project_id=%s row=%s", project_id, row)
 
     def _fetch_submitted_offer_text(self, project_id: str) -> OfferFormSnapshot:

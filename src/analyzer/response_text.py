@@ -81,6 +81,32 @@ _NAMED_HELLO_RE = re.compile(
     re.I,
 )
 
+_OTHER_GREETING_RE = re.compile(
+    r"^(?:здравствуйте|добрый день|доброго времени|приветствую)\s*[!.,]?\s*",
+    re.I,
+)
+
+
+def strip_hallucinated_greeting(text: str, buyer_name: str | None) -> str:
+    """Legacy hook — greeting is normalized in ensure_hello_greeting."""
+    _ = buyer_name
+    return (text or "").strip()
+
+
+def ensure_hello_greeting(text: str) -> str:
+    """Every response must start with «Здравствуйте!» (no buyer name prefix)."""
+    body = (text or "").strip()
+    if not body:
+        return "Здравствуйте!"
+    named = _NAMED_HELLO_RE.match(body)
+    if named:
+        body = body[named.end() :].lstrip()
+    body = _OTHER_GREETING_RE.sub("", body, count=1).lstrip()
+    if not body:
+        return "Здравствуйте!"
+    return f"Здравствуйте! {body}"
+
+
 _BUYER_NOISE = frozenset(
     {
         "войти",
@@ -145,19 +171,6 @@ def buyer_first_name(buyer: str | None) -> str | None:
     return token
 
 
-def strip_hallucinated_greeting(text: str, buyer_name: str | None) -> str:
-    body = (text or "").strip()
-    m = _NAMED_HELLO_RE.match(body)
-    if not m:
-        return body
-    used = m.group(1).strip()
-    if not buyer_name:
-        return body[m.end() :].lstrip()
-    if used.casefold() != buyer_name.casefold():
-        return f"{buyer_name}, здравствуйте!\n{body[m.end() :].lstrip()}"
-    return body
-
-
 _PARAGRAPH_INDENT = "    "  # красная строка
 
 
@@ -214,10 +227,8 @@ def finalize_response_text(text: str, project: ProjectFull | None = None) -> str
     cleaned = strip_response_markdown(cleaned)
     cleaned = strip_github_links(cleaned)
     cleaned = strip_portfolio_footer(cleaned)
+    cleaned = ensure_hello_greeting(cleaned)
     if project is not None:
-        cleaned = strip_hallucinated_greeting(
-            cleaned, buyer_first_name(project.buyer)
-        )
         cleaned = ensure_response_paragraphs(cleaned)
     # Keep leading indent (красная строка) on the first paragraph.
     return cleaned.rstrip()

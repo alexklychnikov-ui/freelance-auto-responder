@@ -47,18 +47,19 @@ def _project(*, buyer: str | None = None) -> ProjectFull:
 
 
 SAMPLE_DRAFT = (
-    "Сделаю Telegram-бота под заявки менеджеру: каталог, форма и уведомление.\n"
+    "Здравствуйте! Сделаю Telegram-бота под заявки менеджеру: каталог, форма и уведомление.\n"
     "Сделаю на aiogram + SQLite, сценарий: заявка уходит менеджеру.\n"
     "Срок — 5–7 дней. Стоимость — от 20 000 ₽.\n"
     "Если подход ок — напишите, согласуем старт."
 )
 
 
-def test_named_hello_allowed_bare_banned() -> None:
-    assert soft_banned_issues("Здравствуйте! Готов помочь.")
-    assert any("opener" in i for i in soft_banned_issues("Здравствуйте! Готов помочь."))
+def test_bare_hello_required_named_banned() -> None:
+    assert "opener:missing_hello" in soft_banned_issues("Сделаю бота под ваши заявки за 5 дней.")
+    bare = "Здравствуйте! Сделаю бота под ваши заявки за 5 дней."
+    assert not any(i.startswith("opener:missing") for i in soft_banned_issues(bare))
     named = "Ирина, здравствуйте! Сделаю бота под ваши заявки за 5 дней."
-    assert not any(i.startswith("opener:") for i in soft_banned_issues(named))
+    assert "opener:named_hello_instead_of_bare" in soft_banned_issues(named)
     assert _buyer_first_name("Ирина · 80%") == "Ирина"
     assert _buyer_first_name(None) is None
 
@@ -67,16 +68,16 @@ def test_soft_banned_sobery_opener_and_cta() -> None:
     sobery = soft_banned_issues("Соберу бота под ваши заявки за 5 дней.")
     assert any(i == "opener:^соберу" for i in sobery)
     named_sobery = soft_banned_issues(
-        "Ирина, здравствуйте! Соберу бота под ваши заявки за 5 дней."
+        "Здравствуйте! Соберу бота под ваши заявки за 5 дней."
     )
     assert any(i == "opener:^соберу" for i in named_sobery)
     cta = soft_banned_issues(
-        "Сделаю бота. Срок — 5 дней. Стоимость — от 20 000 ₽. "
+        "Здравствуйте! Сделаю бота. Срок — 5 дней. Стоимость — от 20 000 ₽. "
         "Предлагаю обсудить детали и приступить."
     )
     assert any("предлагаю обсудить детали и приступить" in i for i in cta)
     clean = soft_banned_issues(
-        "Ирина, здравствуйте! Сделаю бота под ваши заявки. "
+        "Здравствуйте! Сделаю бота под ваши заявки. "
         "Если подход ок — напишите, согласуем старт."
     )
     assert clean == []
@@ -95,11 +96,11 @@ def test_soft_banned_docx_prompt_phrases() -> None:
 
 
 def test_soft_banned_ponimayu_template_opener() -> None:
-    template = "Ирина, здравствуйте! Понимаю, что вам требуется бот."
+    template = "Здравствуйте! Понимаю, что вам требуется бот."
     issues = soft_banned_issues(template)
     assert any("понимаю, что вам" in i for i in issues)
     assert not soft_banned_issues(
-        "Ирина, здравствуйте! Сделаю Telegram-бота под заявки менеджеру."
+        "Здравствуйте! Сделаю Telegram-бота под заявки менеджеру."
     )
 
 
@@ -358,7 +359,7 @@ def test_build_draft_payload_includes_budget_mismatch() -> None:
 
 
 def test_soft_banned_still_flags_ponimayu_with_budget_gap() -> None:
-    template = "Ирина, здравствуйте! Понимаю, что вам требуется бот."
+    template = "Здравствуйте! Понимаю, что вам требуется бот."
     assert any("понимаю, что вам" in i for i in soft_banned_issues(template))
 
 
@@ -375,7 +376,9 @@ def test_critique_force_fail_short_draft_many_questions(
         full_description=f"Нужен бот.\n{questions_block}",
         desired_budget="от 20000",
     )
-    short = "Сделаю бота. Срок 5 дней. Стоимость от 20 000. Обсудим."
+    short = (
+        "Здравствуйте! Сделаю бота. Срок 5 дней. Стоимость от 20 000. Обсудим."
+    )
     assert force_logic_fail_for_questions(
         short, project, verdict="pass", missing=[]
     ) == ["too_short_for_all_questions"]
@@ -397,6 +400,38 @@ def test_critique_force_fail_short_draft_many_questions(
     result = pipe._critique_logic(short, project)
     assert result["verdict"] == "fail"
     assert "too_short_for_all_questions" in result["missing"]
+
+
+def test_critique_logic_passes_buyer_questions_colon_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3234444",
+        url="https://kwork.ru/projects/3234444/view",
+        title="Telegram-бот",
+        full_description=(
+            "Нужен бот. При отклике прошу указать: "
+            "Какие технологии будете использовать. Срок выполнения. Стоимость."
+        ),
+    )
+    bad = "Сделаю бота. Срок 10 дней. Стоимость от 12 000 ₽."
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+
+    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+        assert len(user["buyer_questions"]) == 3
+        return {
+            "verdict": "pass",
+            "issues": [],
+            "missing": [],
+            "style_notes": "ok",
+        }
+
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
+    result = pipe._critique_logic(bad, project)
+    assert result["verdict"] == "fail"
+    assert "checklist:стек" in result["missing"]
 
 
 def test_revise_parses_openai_response() -> None:

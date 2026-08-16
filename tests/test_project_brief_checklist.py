@@ -94,3 +94,47 @@ def test_buyer_checklist_issues_ok() -> None:
         "Передача: исходники, база, инструкция по запуску."
     )
     assert not buyer_checklist_issues(_bots_project(), ok)
+
+
+def _kwork_3234444() -> ProjectFull:
+    desc = (
+        "Требуется разработка Telegram-ботаИщу специалиста для разработки Telegram-бота. "
+        "Что нужно: * Создать Telegram-бота с удобным интерфейсом. "
+        "При отклике прошу указать: Какие технологии будете использовать. "
+        "Срок выполнения. Стоимость."
+    )
+    return ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3234444",
+        url="https://kwork.ru/projects/3234444/view",
+        title="Разработка чат-бота в телеграмме",
+        full_description=desc,
+    )
+
+
+def test_extract_buyer_questions_kwork_colon_list() -> None:
+    items = extract_buyer_questions(_kwork_3234444())
+    assert len(items) == 3
+    assert "технолог" in items[0].lower()
+    assert "срок" in items[1].lower()
+    assert "стоимост" in items[2].lower()
+
+
+def test_buyer_checklist_issues_kwork_3234444_missing_stack() -> None:
+    bad = (
+        "Создам Telegram-бота с меню и кнопками. "
+        "Срок выполнения — 10 дней, стоимость — от 12 000 ₽."
+    )
+    issues = buyer_checklist_issues(_kwork_3234444(), bad)
+    assert "checklist:стек" in issues
+    assert "checklist:срок" not in issues
+    assert "checklist:стоимость" not in issues
+
+
+def test_buyer_checklist_issues_kwork_3234444_ok() -> None:
+    ok = (
+        "Технологии: Python, aiogram, PostgreSQL. "
+        "Срок — 10–14 дней. Стоимость — от 12 000 ₽."
+    )
+    assert not buyer_checklist_issues(_kwork_3234444(), ok)

@@ -6,6 +6,8 @@ from unittest.mock import MagicMock
 
 from src.adapters.flru import (
     FlruAdapter,
+    _clean_submitted_description,
+    flru_page_looks_logged_out,
     is_flru_project_closed,
     parse_listing_from_html,
     parse_project_from_html,
@@ -203,6 +205,57 @@ def test_parse_submitted_offer_missing_block() -> None:
     assert snap.error == "block_missing"
 
 
+def test_flru_page_looks_logged_out_guest_nav() -> None:
+    guest = (
+        "Регистрация / Вход / Откликнуться\n"
+        "Нужен парсер каталога\n"
+        "Бюджет: 5 000 ₽\n"
+        "Откликнуться\n"
+    )
+    assert flru_page_looks_logged_out(guest) is True
+    snap = parse_submitted_offer_from_text(guest)
+    assert not snap.ok
+    assert snap.error == "not_logged_in"
+
+
+def test_flru_page_looks_logged_out_logged_in_no_offer() -> None:
+    logged_in = (
+        "Личный кабинет\nВыйти\n"
+        "Нужен парсер каталога\n"
+        "Бюджет: 5 000 ₽\n"
+        "Откликнуться\n"
+    )
+    assert flru_page_looks_logged_out(logged_in) is False
+    snap = parse_submitted_offer_from_text(logged_in)
+    assert not snap.ok
+    assert snap.error == "block_missing"
+
+
+def test_flru_page_looks_logged_out_false_when_offer_present() -> None:
+    text = (
+        "Регистрация\nВход\n"  # noise elsewhere should not matter
+        "Ваш отклик\nРедактировать\n"
+        "Иван, здравствуйте! Сделаю парсер за неделю, от 40 000 ₽.\n"
+        "Срок: 7 дней\nСтоимость работ: 40 000 ₽\n"
+    )
+    assert flru_page_looks_logged_out(text) is False
+
+
+def test_read_submitted_offer_text_guest_not_logged_in() -> None:
+    browser = MagicMock()
+    browser.evaluate.side_effect = [
+        (
+            "Регистрация / Вход / Откликнуться\n"
+            "Нужен бот для Telegram\n"
+            "Откликнуться на проект\n"
+        ),
+    ]
+    snap = read_submitted_offer_text(browser, "5516239")
+    assert not snap.ok
+    assert snap.error == "not_logged_in"
+    browser.navigate.assert_called_once()
+
+
 def test_read_submitted_offer_text_prefers_inner_text() -> None:
     browser = MagicMock()
     browser.evaluate.side_effect = [
@@ -240,6 +293,39 @@ def test_parse_submitted_offer_strips_mashed_chrome() -> None:
     assert "Редактировать" not in snap.description
     assert "Стоимость работ" not in snap.description
     assert "Чат" not in snap.description
+
+
+def test_parse_submitted_offer_keeps_chat_agents_compound() -> None:
+    """Regression 5518223: «чат» in «чат-агенты» must not truncate the body."""
+    body = (
+        "Александр, здравствуйте! Сделаю RAG на гибридный поиск), чат-агенты. "
+        "Логика маршрутизации и этапы внедрения ниже."
+    )
+    text = (
+        "Ваш отклик\nРедактировать\nОтказаться от заказа\n"
+        "Иван Тестов\n16.08.2026 в 13:19\n"
+        f"{body}\n"
+        "Срок: 10 дней\nСтоимость работ: 80 000 ₽\n"
+        "Чат\nДругие заказы по специализации\nЗаказ про логотип\n"
+    )
+    cleaned = _clean_submitted_description(
+        f"{body}\nСрок: 10 дней\nСтоимость работ: 80 000 ₽\nЧат"
+    )
+    assert "чат-агенты" in cleaned
+    assert "Логика маршрутизации" in cleaned
+    assert not cleaned.rstrip().endswith("поиск),")
+    assert "Чат" not in cleaned
+    assert "Стоимость работ" not in cleaned
+
+    snap = parse_submitted_offer_from_text(text)
+    assert snap.ok
+    assert "чат-агенты" in snap.description
+    assert "Логика маршрутизации" in snap.description
+    assert "гибридный поиск), чат-агенты. Логика" in snap.description
+    assert not snap.description.rstrip().endswith("поиск),")
+    assert "Чат" not in snap.description
+    assert "Другие заказы" not in snap.description
+    assert "логотип" not in snap.description
 
 
 def test_read_submitted_offer_text_bad_id() -> None:

@@ -564,6 +564,42 @@ class FlruSubmittedOffer:
     error: str | None = None
 
 
+_FLRU_LOGGED_IN_NAV_RE = re.compile(
+    r"(?:выйти|личный\s+кабинет|мо[йи]\s+профиль|настройки\s+аккаунта)",
+    re.I,
+)
+_FLRU_GUEST_VHOD_RE = re.compile(r"(?:^|[\s|/])вход(?:[\s|/]|$)", re.I)
+
+
+def flru_page_looks_logged_out(inner_text_or_html: str) -> bool:
+    """True when FL.ru project page looks like a guest session.
+
+    Guest pages show «Регистрация / Вход / Откликнуться» and no «Ваш отклик».
+    Logged-in pages without an offer still keep profile/logout chrome — those
+    must stay ``block_missing``, not ``not_logged_in``.
+    """
+    raw = inner_text_or_html or ""
+    if "<" in raw and ">" in raw:
+        cleaned = re.sub(
+            r"<script\b[^>]*>.*?</script>", " ", raw, flags=re.I | re.DOTALL
+        )
+        text = re.sub(r"<[^>]+>", "\n", cleaned)
+    else:
+        text = raw
+    low = text.lower()
+    if re.search(r"ваш\s+отклик", low):
+        return False
+    if _FLRU_LOGGED_IN_NAV_RE.search(low):
+        return False
+    has_vhod = bool(_FLRU_GUEST_VHOD_RE.search(low))
+    has_reg = "регистрация" in low
+    if has_vhod and has_reg:
+        return True
+    if (has_vhod or has_reg) and "откликнуться" in low:
+        return True
+    return False
+
+
 SUBMITTED_OFFER_EXTRACTOR_JS = """
 () => {
   const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
@@ -705,8 +741,10 @@ _SUBMITTED_CHROME_LINE_RE = re.compile(
     r")$",
     re.I,
 )
+# «чат» не режем здесь: \b срабатывает перед дефисом («чат-агенты») и
+# обрезает тело отклика. UI-кнопка «Чат» уже отсекается по ^чат$ в цикле строк.
 _SUBMITTED_META_CUT_RE = re.compile(
-    r"\s*(?:срок\s*:\s*\d+\s*дн\w*|стоимость\s+работ\s*:|чат)\b.*$",
+    r"\s*(?:срок\s*:\s*\d+\s*дн\w*|стоимость\s+работ\s*:)\b.*$",
     re.I | re.S,
 )
 
@@ -749,6 +787,8 @@ def parse_submitted_offer_from_text(text: str) -> FlruSubmittedOffer:
     full = text or ""
     start = re.search(r"ваш\s+отклик", full, flags=re.I)
     if not start:
+        if flru_page_looks_logged_out(full):
+            return FlruSubmittedOffer(ok=False, error="not_logged_in")
         return FlruSubmittedOffer(ok=False, error="block_missing")
     chunk = full[start.start() :]
     cut = _SUBMITTED_OFFER_TAIL_RE.search(chunk)
@@ -816,9 +856,9 @@ def parse_submitted_offer_from_text(text: str) -> FlruSubmittedOffer:
 
 def _submitted_looks_dirty(description: str) -> bool:
     low = (description or "").lower()
+    # Не флагаем «чат-агенты»/«чат-бот»: \bчат\b матчит префикс до дефиса.
     return bool(
         re.search(r"редактировать|отказаться от заказа|стоимость работ\s*:", low)
-        or re.search(r"\bчат\b", low)
     )
 
 
@@ -843,6 +883,12 @@ def read_submitted_offer_text(
         inner = str(browser.evaluate("() => document.body?.innerText || ''") or "")
     except Exception:
         inner = ""
+    if flru_page_looks_logged_out(inner):
+        logger.warning(
+            "flru_submitted_not_logged_in project_id=%s hint=deploy/flru_login_interactive.py",
+            pid,
+        )
+        return FlruSubmittedOffer(ok=False, error="not_logged_in")
     parsed = parse_submitted_offer_from_text(inner)
     if parsed.ok and not _submitted_looks_dirty(parsed.description):
         return parsed
@@ -904,16 +950,30 @@ def read_submitted_offer_text(
     except Exception:
         snap = ""
     if snap:
+        if flru_page_looks_logged_out(snap):
+            logger.warning(
+                "flru_submitted_not_logged_in project_id=%s via=snapshot "
+                "hint=deploy/flru_login_interactive.py",
+                pid,
+            )
+            return FlruSubmittedOffer(ok=False, error="not_logged_in")
         html_parsed = parse_submitted_offer_from_text(snap)
         if html_parsed.ok:
+            return html_parsed
+        if html_parsed.error == "not_logged_in":
             return html_parsed
 
     err = None
     if isinstance(raw, dict):
         err = raw.get("error")
+    final_err = str(err or parsed.error or "read_failed")
+    if final_err == "block_missing" and flru_page_looks_logged_out(
+        "\n".join(x for x in (inner, snap) if x)
+    ):
+        final_err = "not_logged_in"
     return FlruSubmittedOffer(
         ok=False,
-        error=str(err or parsed.error or "read_failed"),
+        error=final_err,
         price=parsed.price,
         delivery_days=parsed.delivery_days,
     )

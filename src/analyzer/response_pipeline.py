@@ -49,10 +49,9 @@ REVISE_SYSTEM_PROMPT = """\
 
 MAX_REVISION_CYCLES = 2
 
-# Bare openers only — named «Ирина, здравствуйте!» is allowed (does not match ^).
+# Bare openers — «Здравствуйте!» required; other greetings banned.
 _BANNED_OPENERS = (
     r"^добрый день",
-    r"^здравствуйте",
     r"^доброго времени",
     r"^приветствую",
     r"^изучив ваш проект",
@@ -117,10 +116,8 @@ DRAFT_SYSTEM_PROMPT = """\
 
 0. Ценность заказчика (см. выше) → база первой фразы.
 
-1. Обращение: ТОЛЬКО если buyer_name в payload задан — «{buyer_name}, здравствуйте!» \
-(ровно это имя, не другое). Если buyer_name пуст/null — БЕЗ обращения по имени: \
-сразу первое содержательное предложение. НЕ выдумывай имена (запрещены шаблонные \
-Ирина/Александр/Анна и любые имена не из buyer_name). НЕ пиши голое «Здравствуйте!».
+1. Обращение: ВСЕГДА начинай с «Здравствуйте!» — это первое слово отклика. \
+Без имени заказчика, без «Добрый день». Не выдумывай имена.
 
 2. Первое предложение — самое важное. Сразу: решение / результат / выгода / \
 экспертная мысль по ЭТОМУ заказу. Чередуй способы (не один шаблон):
@@ -172,7 +169,8 @@ DRAFT_SYSTEM_PROMPT = """\
 - готов выполнить / работаю более N лет / буду рад сотрудничеству / имею большой опыт
 - я занимаюсь… / я специализируюсь…
 - «Понимаю, что вам…» / любая «Понимаю, что…» после hello
-- голое «Здравствуйте!» / «Добрый день» без имени
+- голое «Добрый день» / «Приветствую» вместо «Здравствуйте!»
+- отклик без «Здравствуйте!» в начале
 - markdown-списки, URL / GitHub / портфолио-ссылки
 - созвоны, мессенджеры, контакты вне Kwork
 - «если интересно — пишите» / «когда удобно созвониться?»
@@ -196,9 +194,8 @@ LOGIC_CRITIC_PROMPT = """\
 Ты — LogicCritic: структура, стиль и полнота продающего отклика.
 
 Чеклист (fail → issues / missing):
-1) Приветствие по имени ТОЛЬКО если buyer_name задан и совпадает с именем в тексте. \
-Fail: любое «Имя, здравствуйте!» при пустом buyer_name; fail: имя ≠ buyer_name. \
-Нет голого «Здравствуйте!»
+1) Текст начинается с «Здравствуйте!» (после отступа абзаца, если есть). \
+Fail: другое приветствие или нет «Здравствуйте!» в начале. Fail: «Имя, здравствуйте!»
 2) Первое содержательное предложение цепляет: решение/результат/выгода/экспертная мысль; \
 НЕ парафраз ТЗ; НЕ «Понимаю, что…». \
 Fail если первый глагол «Соберу» (или снова «Соберу» при recent_openings с «Соберу»).
@@ -259,29 +256,50 @@ score: целое 1–10.
 """
 
 
-def _content_after_named_hello(text: str) -> str:
-    """Strip optional «Имя, здравствуйте!» so opener checks see the first content verb."""
-    stripped = text.strip()
+def _response_opener(text: str) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    return raw.split("\n", 1)[0].strip()
+
+
+def _content_after_greeting(text: str) -> str:
+    """Strip «Здравствуйте!» / «Имя, здравствуйте!» so opener checks see content verb."""
+    stripped = _response_opener(text)
     match = _NAMED_HELLO_RE.match(stripped)
-    if not match:
-        return stripped
-    return stripped[match.end() :].lstrip()
+    if match:
+        return stripped[match.end() :].lstrip()
+    if re.match(r"^здравствуйте", stripped, re.I):
+        return re.sub(r"^здравствуйте\s*[!.,]?\s*", "", stripped, count=1, flags=re.I)
+    return stripped
+
+
+def _missing_hello_issue(text: str) -> str | None:
+    body = _response_opener(text)
+    if re.match(r"^здравствуйте", body, re.I):
+        return None
+    if _NAMED_HELLO_RE.match(body):
+        return "opener:named_hello_instead_of_bare"
+    return "opener:missing_hello"
 
 
 def soft_banned_issues(text: str) -> list[str]:
-    """Named «Имя, здравствуйте!» allowed; bare «Здравствуйте!» and clichés banned."""
+    """«Здравствуйте!» required at start; clichés banned."""
     issues: list[str] = []
-    stripped = text.strip()
-    lower = stripped.lower()
-    if not _NAMED_HELLO_RE.match(stripped):
+    opener = _response_opener(text)
+    hello_issue = _missing_hello_issue(text)
+    if hello_issue:
+        issues.append(hello_issue)
+    if not _NAMED_HELLO_RE.match(opener):
         for pattern in _BANNED_OPENERS:
-            if re.search(pattern, lower):
+            if re.search(pattern, opener.lower()):
                 issues.append(f"opener:{pattern}")
-    body = _content_after_named_hello(stripped)
+    body = _content_after_greeting(text)
     if body.lower().startswith("соберу"):
         issues.append("opener:^соберу")
+    lower_full = (text or "").lower()
     for phrase in _BANNED_PHRASES:
-        if phrase in lower:
+        if phrase in lower_full:
             issues.append(f"phrase:{phrase}")
     return issues
 
@@ -508,8 +526,8 @@ class ResponsePipeline:
             retry["feedback"] = {
                 "banned_detected": banned,
                 "note": (
-                    "Перепиши: убери клише. Имя+здравствуйте — только если buyer_name есть; "
-                    "голое Здравствуйте запрещено. Не открывай с «Соберу». "
+                    "Перепиши: убери клише. Начни с «Здравствуйте!». "
+                    "Не открывай с «Соберу». "
                     "Не заканчивай «Предлагаю обсудить детали и приступить.» "
                     "Без URL/созвонов."
                     + (
