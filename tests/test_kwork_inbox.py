@@ -26,6 +26,8 @@ from src.store.kwork_inbox_seen import KworkInboxSeenStore
 SELF_ID = "100"
 OTHER_ID = "200"
 OTHER_USER = "client_alice"
+NEW_ID = "300"
+NEW_USER = "client_new"
 
 
 @pytest.fixture
@@ -327,6 +329,161 @@ async def test_poll_notifies_new_incoming_and_bumps_mid(
     assert "Kwork · входящее" in notified[0]
     assert OTHER_USER in notified[0]
     assert store.get_last_mid(OTHER_ID) == 12
+
+
+@pytest.mark.asyncio
+async def test_poll_new_interlocutor_after_bootstrap_notifies(
+    store: KworkInboxSeenStore,
+) -> None:
+    store.set_last_mid(OTHER_ID, OTHER_USER, 10)
+    store.mark_bootstrap_done()
+    assert store.get_last_mid(NEW_ID) is None
+
+    dialogs_payload = {
+        "ok": True,
+        "status": 200,
+        "json": {
+            "data": {
+                "rows": [
+                    {
+                        "username": OTHER_USER,
+                        "USERID": int(OTHER_ID),
+                        "unread_count": 0,
+                        "MID": 10,
+                        "message": "old",
+                        "is_support": False,
+                        "lastMessage": {
+                            "MID": 10,
+                            "MSGFROM": int(OTHER_ID),
+                            "MSGTO": int(SELF_ID),
+                            "message": "old",
+                        },
+                    },
+                    {
+                        "username": NEW_USER,
+                        "USERID": int(NEW_ID),
+                        "unread_count": 1,
+                        "MID": 50,
+                        "message": "first hello",
+                        "is_support": False,
+                        "lastMessage": {
+                            "MID": 50,
+                            "MSGFROM": int(NEW_ID),
+                            "MSGTO": int(SELF_ID),
+                            "message": "first hello",
+                        },
+                    },
+                ]
+            }
+        },
+    }
+    messages_payload = {
+        "ok": True,
+        "status": 200,
+        "json": {
+            "data": {
+                "messagesData": [
+                    {
+                        "MID": 50,
+                        "MSGFROM": int(NEW_ID),
+                        "MSGTO": int(SELF_ID),
+                        "message": "first hello",
+                    }
+                ]
+            }
+        },
+    }
+
+    browser = MagicMock()
+    browser.evaluate.side_effect = [dialogs_payload, SELF_ID, messages_payload]
+    notified: list[str] = []
+
+    async def notify(text: str) -> None:
+        notified.append(text)
+
+    result = await poll_kwork_inbox(
+        settings=MagicMock(),
+        browser=browser,
+        store=store,
+        notify=notify,
+        credentials=None,
+        auto_login=False,
+    )
+    assert result["notified"] == 1
+    assert result["checked"] == 2
+    assert len(notified) == 1
+    assert "first hello" in notified[0]
+    assert NEW_USER in notified[0]
+    assert store.get_last_mid(NEW_ID) == 50
+    assert store.get_last_mid(OTHER_ID) == 10
+
+
+@pytest.mark.asyncio
+async def test_poll_new_dialog_own_last_message_no_notify(
+    store: KworkInboxSeenStore,
+) -> None:
+    store.mark_bootstrap_done()
+    assert store.get_last_mid(NEW_ID) is None
+
+    dialogs_payload = {
+        "ok": True,
+        "status": 200,
+        "json": {
+            "data": {
+                "rows": [
+                    {
+                        "username": NEW_USER,
+                        "USERID": int(NEW_ID),
+                        "unread_count": 0,
+                        "MID": 77,
+                        "message": "i wrote first",
+                        "is_support": False,
+                        "lastMessage": {
+                            "MID": 77,
+                            "MSGFROM": int(SELF_ID),
+                            "MSGTO": int(NEW_ID),
+                            "message": "i wrote first",
+                        },
+                    }
+                ]
+            }
+        },
+    }
+    messages_payload = {
+        "ok": True,
+        "status": 200,
+        "json": {
+            "data": {
+                "messagesData": [
+                    {
+                        "MID": 77,
+                        "MSGFROM": int(SELF_ID),
+                        "MSGTO": int(NEW_ID),
+                        "message": "i wrote first",
+                    }
+                ]
+            }
+        },
+    }
+
+    browser = MagicMock()
+    browser.evaluate.side_effect = [dialogs_payload, SELF_ID, messages_payload]
+    notified: list[str] = []
+
+    async def notify(text: str) -> None:
+        notified.append(text)
+
+    result = await poll_kwork_inbox(
+        settings=MagicMock(),
+        browser=browser,
+        store=store,
+        notify=notify,
+        credentials=None,
+        auto_login=False,
+    )
+    assert result["notified"] == 0
+    assert notified == []
+    assert store.get_last_mid(NEW_ID) == 77
 
 
 def test_format_inbox_notify_escapes_html() -> None:

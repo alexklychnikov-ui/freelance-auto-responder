@@ -133,8 +133,7 @@ def _poll_kwork_inbox_with_browser(
         result["checked"] += 1
         stored = store.get_last_mid(dialog.interlocutor_id)
         if stored is None:
-            store.set_last_mid(dialog.interlocutor_id, dialog.username, dialog.mid)
-            continue
+            stored = 0
 
         if dialog.unread_count <= 0 and dialog.mid <= stored:
             continue

@@ -117,7 +117,8 @@ async def _daemon_async() -> int:
     settings = get_settings()
     orchestrator = build_orchestrator(settings)
     shutdown = asyncio.Event()
-    interval_sec = settings.scan_interval_minutes * 60
+    scan_interval_sec = max(1, settings.scan_interval_minutes * 60)
+    inbox_poll_sec = max(1, int(settings.kwork_inbox_poll_seconds))
 
     def _request_shutdown(*_args: object) -> None:
         logger.info("shutdown requested")
@@ -133,24 +134,43 @@ async def _daemon_async() -> int:
 
     bot_task = asyncio.create_task(orchestrator.review_service.run_bot())
 
-    try:
+    async def inbox_loop() -> None:
+        while not shutdown.is_set():
+            try:
+                inbox_stats = await orchestrator.poll_kwork_inbox()
+                logger.info("kwork_inbox_poll %s", inbox_stats)
+            except Exception:
+                logger.exception("kwork inbox poll failed")
+            try:
+                await asyncio.wait_for(shutdown.wait(), timeout=inbox_poll_sec)
+            except asyncio.TimeoutError:
+                pass
+
+    async def scan_loop() -> None:
         while not shutdown.is_set():
             try:
                 totals = await orchestrator.run_scan_cycle()
                 logger.info("scan cycle: %s", totals)
             except Exception:
                 logger.exception("scan cycle failed")
-
             try:
-                await asyncio.wait_for(shutdown.wait(), timeout=interval_sec)
+                await asyncio.wait_for(shutdown.wait(), timeout=scan_interval_sec)
             except asyncio.TimeoutError:
                 pass
+
+    inbox_task = asyncio.create_task(inbox_loop())
+    scan_task = asyncio.create_task(scan_loop())
+    try:
+        await shutdown.wait()
     finally:
+        inbox_task.cancel()
+        scan_task.cancel()
         bot_task.cancel()
-        try:
-            await bot_task
-        except asyncio.CancelledError:
-            pass
+        for task in (inbox_task, scan_task, bot_task):
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         await orchestrator.review_service.tg_bot.close()
         orchestrator.scorer.close()
         orchestrator.response_generator.close()

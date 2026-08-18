@@ -87,6 +87,7 @@ class Settings(BaseSettings):
     kwork_storage_state: str = ""
     kwork_inbox_mirror_enabled: bool = True
     kwork_inbox_seen_db: str = "data/kwork_inbox_seen.db"
+    kwork_inbox_poll_seconds: int = 90
 
     yandex_storage_state: str = ""
     yandex_max_daily_responses: int = 7
