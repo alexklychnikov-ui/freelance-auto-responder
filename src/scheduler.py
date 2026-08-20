@@ -118,7 +118,12 @@ async def _daemon_async() -> int:
     orchestrator = build_orchestrator(settings)
     shutdown = asyncio.Event()
     scan_interval_sec = max(1, settings.scan_interval_minutes * 60)
-    inbox_poll_sec = max(1, int(settings.kwork_inbox_poll_seconds))
+    inbox_poll_secs: list[int] = []
+    if settings.kwork_inbox_mirror_enabled:
+        inbox_poll_secs.append(max(1, int(settings.kwork_inbox_poll_seconds)))
+    if settings.flru_inbox_mirror_enabled:
+        inbox_poll_secs.append(max(1, int(settings.flru_inbox_poll_seconds)))
+    inbox_poll_sec = max(1, min(inbox_poll_secs)) if inbox_poll_secs else 90
 
     def _request_shutdown(*_args: object) -> None:
         logger.info("shutdown requested")
@@ -136,11 +141,18 @@ async def _daemon_async() -> int:
 
     async def inbox_loop() -> None:
         while not shutdown.is_set():
-            try:
-                inbox_stats = await orchestrator.poll_kwork_inbox()
-                logger.info("kwork_inbox_poll %s", inbox_stats)
-            except Exception:
-                logger.exception("kwork inbox poll failed")
+            if settings.kwork_inbox_mirror_enabled:
+                try:
+                    inbox_stats = await orchestrator.poll_kwork_inbox()
+                    logger.info("kwork_inbox_poll %s", inbox_stats)
+                except Exception:
+                    logger.exception("kwork inbox poll failed")
+            if settings.flru_inbox_mirror_enabled:
+                try:
+                    flru_stats = await orchestrator.poll_flru_inbox()
+                    logger.info("flru_inbox_poll %s", flru_stats)
+                except Exception:
+                    logger.exception("flru inbox poll failed")
             try:
                 await asyncio.wait_for(shutdown.wait(), timeout=inbox_poll_sec)
             except asyncio.TimeoutError:

@@ -60,6 +60,7 @@ from src.limits.daily import count_today_platform_prepared, is_daily_limit_reach
 from src.adapters.kwork_urls import kwork_project_view_url
 from src.models import PendingOffer, ProjectFull, ProjectPreview
 from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
+from src.pipeline.flru_inbox_poller import poll_flru_inbox
 from src.pipeline.kwork_inbox_poller import poll_kwork_inbox
 from src.store.kwork_inbox_seen import KworkInboxSeenStore
 from src.store.repository import ProjectRepository
@@ -132,6 +133,9 @@ class PipelineOrchestrator:
         self.scan_reports = ScanReportStore(settings.database_path)
         self.kwork_inbox_seen = KworkInboxSeenStore(
             settings.kwork_inbox_seen_db or "data/kwork_inbox_seen.db"
+        )
+        self.flru_inbox_seen = KworkInboxSeenStore(
+            settings.flru_inbox_seen_db or "data/flru_inbox_seen.db"
         )
         self.review_service.set_approve_handler(self.handle_approve_click)
         self.review_service.set_journal_confirm_handler(self.handle_journal_confirm)
@@ -266,6 +270,34 @@ class PipelineOrchestrator:
 
         return {"project_id": project_id, "outcome": outcome}
 
+    async def poll_flru_inbox(self) -> dict[str, int]:
+        if not self.settings.flru_inbox_mirror_enabled:
+            return {"bootstrapped": 0, "checked": 0, "fetched": 0, "notified": 0, "errors": 0}
+        try:
+            return await poll_flru_inbox(
+                settings=self.settings,
+                store=self.flru_inbox_seen,
+                notify=self.review_service.tg_bot.notify,
+            )
+        except FlruAuthError as exc:
+            logger.error("flru_inbox_auth_failed: %s", exc)
+            return {
+                "bootstrapped": 0,
+                "checked": 0,
+                "fetched": 0,
+                "notified": 0,
+                "errors": 1,
+            }
+        except Exception:
+            logger.exception("flru_inbox_poll_failed")
+            return {
+                "bootstrapped": 0,
+                "checked": 0,
+                "fetched": 0,
+                "notified": 0,
+                "errors": 1,
+            }
+
     async def poll_kwork_inbox(self) -> dict[str, int]:
         if not self.settings.kwork_inbox_mirror_enabled:
             return {"bootstrapped": 0, "checked": 0, "fetched": 0, "notified": 0, "errors": 0}
@@ -308,6 +340,10 @@ class PipelineOrchestrator:
         if self.settings.kwork_inbox_mirror_enabled:
             inbox_stats = await self.poll_kwork_inbox()
             logger.info("kwork_inbox_poll %s", inbox_stats)
+
+        if self.settings.flru_inbox_mirror_enabled:
+            flru_inbox_stats = await self.poll_flru_inbox()
+            logger.info("flru_inbox_poll %s", flru_inbox_stats)
 
         for source in get_enabled_sources(self.settings.sources_config_path):
             source_stats = ScanCycleStats()

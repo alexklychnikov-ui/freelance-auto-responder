@@ -94,6 +94,9 @@ class Settings(BaseSettings):
 
     flru_storage_state: str = ""
     flru_max_daily_responses: int = 10
+    flru_inbox_mirror_enabled: bool = True
+    flru_inbox_seen_db: str = "data/flru_inbox_seen.db"
+    flru_inbox_poll_seconds: int = 90
 
     @model_validator(mode="before")
     @classmethod
