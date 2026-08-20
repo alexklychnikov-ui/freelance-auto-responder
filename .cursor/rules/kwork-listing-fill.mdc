@@ -1,0 +1,35 @@
+---
+description: Шаблон и процедура заполнения нового кворка Kwork (описание, опции, FAQ, Playwright).
+globs: deploy/*kwork*
+alwaysApply: false
+---
+
+# Kwork listing fill
+
+Источник текста: `deploy/kwork_listing_skel.py` (`NEW` → `assemble()` → `validate()`).
+
+## Порядок
+
+1. Заполнить `NEW` в скелете, прогнать `python deploy/kwork_listing_skel.py`.
+2. Описание по блокам: лид → Какие задачи закрывает → Что входит → Что не входит → Почему заказать здесь → Для старта.
+3. 5–7 опций = шаги развития, каждая со своей ценой и сроком. Не дублировать базу.
+4. FAQ: сначала 4 ядра (стоимость / сроки / старт / правки), затем до 8 уникальных. Вопрос ≤80, ответ ≤300.
+5. Цена кворка — то, что видит покупатель. В select опции `value = buyer * 5 // 4`.
+6. После заливки **перезайти на URL** и сверить FAQ/описание. DOM до reload не считается сохранённым.
+
+## Форма Kwork (Playwright)
+
+- Сессия: `data/kwork_storage.json`. Не сейвить пустую вкладку `/new?draft_id=` — затрёт `/edit?id=`.
+- Trumbowyg: не `html()`, только ввод в `.trumbowyg-editor` (клавиатура или `execCommand('insertText')` после focus). Иначе счётчик 0 и Save серый.
+- Опции: `a.js-extra-add-btn`. Не кликать скрытый `.js-add-extra-row__cat-checkbox`.
+- FAQ — Vue `#app-faq` / `window.appFaq.$refs.faq`: `updateQuestion(text, id)`, `updateAnswer`, `addNewQuestionTemplate`, `saveQuestion(id)`. Новые id не должны совпасть в один `Date.now()`.
+- `getData()` отбрасывает `isNew`. Перед сейвом все новые FAQ провести через `saveQuestion`.
+- `/new?draft_id=` → `KworkSaveModule.saveDraft()` → POST `/draft_save`, в тело кладётся `faq` из `getData()`.
+- `/edit?id=` уже существующего кворка: `draftId=null`, `saveDraft` либо новый черновик, либо `success:false`. Зелёная «Сохранить» — `De(false)` в jQuery, кнопка с классом `disabled` клик глотает.
+- Не жать `.js-save-portfolio`.
+
+## Проверка
+
+- Уникальные FAQ, без дубля вопроса.
+- Описание ≥100, инструкция ≥100.
+- Опции 5–7, пустую 8-ю строку не оставлять заполняемой.
