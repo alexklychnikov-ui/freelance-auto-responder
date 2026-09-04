@@ -79,11 +79,17 @@ SCORING_SYSTEM_PROMPT = """\
 }
 """
 
+_NATIVE_STACK_RE = re.compile(
+    r"(android|ios|iphone|ipad|swift|kotlin|objective-?c|flutter|"
+    r"react\s*native|xamarin)",
+    re.IGNORECASE,
+)
 _NATIVE_MOBILE_RE = re.compile(
     r"(android|ios|iphone|ipad|swift|kotlin|objective-?c|flutter|"
     r"react\s*native|xamarin|мобильн\w*\s+прилож)",
     re.IGNORECASE,
 )
+_MOBILE_APP_MENTION_RE = re.compile(r"мобильн\w*\s+прилож\w*", re.IGNORECASE)
 
 _GENERIC_RISK_PATTERNS = (
     r"отсутствие четкого описания",
@@ -164,6 +170,19 @@ def _filter_generic_risks(risks: list[str], project: ProjectFull) -> list[str]:
     return filtered
 
 
+def _only_negated_mobile_app(text: str) -> bool:
+    if _NATIVE_STACK_RE.search(text):
+        return False
+    mentions = list(_MOBILE_APP_MENTION_RE.finditer(text))
+    if not mentions:
+        return False
+    for match in mentions:
+        window = text[match.start() : match.end() + 40]
+        if not re.search(r"не\s+требуется", window, re.I):
+            return False
+    return True
+
+
 def _apply_score_guardrails(
     data: dict[str, Any],
     project: ProjectFull,
@@ -173,7 +192,7 @@ def _apply_score_guardrails(
     text = _project_text(project)
     risks = _filter_generic_risks(list(data.get("risks") or []), project)
 
-    if _NATIVE_MOBILE_RE.search(text):
+    if _NATIVE_MOBILE_RE.search(text) and not _only_negated_mobile_app(text):
         if int(data.get("score", 0)) > 4:
             data["score"] = min(int(data["score"]), 3)
         data["fit"] = False

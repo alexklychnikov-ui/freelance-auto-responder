@@ -6,7 +6,13 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 
-from src.analyzer.gpt_scorer import GptScorer, load_scoring_system_prompt
+from src.analyzer.gpt_scorer import (
+    GptScorer,
+    _apply_score_guardrails,
+    _normalize_score_payload,
+    load_scoring_system_prompt,
+)
+from tests.test_project_brief_checklist import _yandex_347bc2fc
 from src.config import Settings
 from src.models import GptScoreResult, ProjectFull
 
@@ -51,8 +57,6 @@ def test_load_scoring_system_prompt() -> None:
 
 
 def test_score_guardrails_native_mobile() -> None:
-    from src.analyzer.gpt_scorer import _normalize_score_payload
-
     project = ProjectFull(
         platform="kwork",
         source_key="kwork_dev_it",
@@ -144,3 +148,21 @@ def test_gpt_scorer_parses_json_codeblock(
 
     assert result.fit is False
     assert result.score == 5
+
+
+def test_score_guardrails_negated_mobile_app_not_native() -> None:
+    project = _yandex_347bc2fc()
+    data = {
+        "score": 7,
+        "fit": True,
+        "reason": "Внутренняя веб-система на Python/FastAPI",
+        "matched_skills": ["Python", "FastAPI"],
+        "risks": ["Деплой на сервер заказчика"],
+        "suggested_project_type": "Веб-MVP",
+        "competition_level": "medium",
+        "recommendation": "откликаться",
+    }
+    guarded = _apply_score_guardrails(data, project)
+    assert guarded["score"] == 7
+    assert guarded["fit"] is True
+    assert guarded["recommendation"] != "пропустить"

@@ -16,6 +16,7 @@ from src.analyzer.gpt_scorer import _extract_json
 from src.analyzer.project_brief import (
     build_project_brief,
     buyer_checklist_issues,
+    checklist_rule_for_question,
     extract_buyer_checklist,
     extract_buyer_questions,
     extract_tz_facts,
@@ -48,6 +49,94 @@ REVISE_SYSTEM_PROMPT = """\
 Не добавляй markdown. Верни ТОЛЬКО текст отклика."""
 
 MAX_REVISION_CYCLES = 2
+
+_PLATFORM_POLICIES: dict[str, dict[str, Any]] = {
+    "kwork": {
+        "policy_id": "kwork",
+        "required_rules": [
+            "Начало строго с «Здравствуйте!»",
+            "Kwork-only: без внешних контактов/ссылок/созвонов",
+            "Учитывать kwork-compliance проверки",
+        ],
+        "quality_rules": [
+            "Ясно и по делу",
+            "Срок и цена цифрами",
+            "Без воды и выдуманных технологий",
+            "Ответить на buyer_questions",
+        ],
+    },
+    "default": {
+        "policy_id": "default",
+        "required_rules": [
+            "Без platform-specific обязательств Kwork",
+        ],
+        "quality_rules": [
+            "Ясно и по делу",
+            "Срок и цена цифрами",
+            "Без воды и выдуманных технологий",
+            "Ответить на buyer_questions",
+        ],
+    },
+    "yandex_uslugi": {
+        "policy_id": "yandex_uslugi",
+        "max_chars": 1000,
+        "required_rules": [
+            "Жёсткий лимит 1000 символов включая пробелы и переносы",
+            "Не обрезать чеклист — укоротить воду",
+        ],
+        "quality_rules": [
+            "Ясно и по делу",
+            "Срок и цена цифрами",
+            "Что входит и расходы после запуска — явно",
+            "Без воды и выдуманных технологий",
+            "Ответить на buyer_questions",
+        ],
+    },
+}
+
+_QUESTION_TOKEN_STOPWORDS = {
+    "и",
+    "в",
+    "во",
+    "на",
+    "по",
+    "с",
+    "со",
+    "к",
+    "ко",
+    "о",
+    "об",
+    "от",
+    "до",
+    "из",
+    "за",
+    "для",
+    "ли",
+    "а",
+    "или",
+    "что",
+    "как",
+    "какой",
+    "какие",
+    "какая",
+    "каком",
+    "какую",
+    "когда",
+    "будет",
+    "будут",
+    "нужно",
+    "нужен",
+    "нужна",
+    "нужны",
+    "where",
+    "what",
+    "how",
+    "is",
+    "are",
+    "the",
+    "a",
+    "an",
+}
 
 # Bare openers — «Здравствуйте!» required; other greetings banned.
 _BANNED_OPENERS = (
@@ -96,6 +185,62 @@ _NAMED_HELLO_RE = re.compile(
     re.I | re.U,
 )
 
+
+def _normalize_platform(platform: str | None) -> str:
+    value = (platform or "").strip().lower()
+    return value if value in _PLATFORM_POLICIES else "default"
+
+
+def _platform_policy(platform: str | None) -> dict[str, Any]:
+    return _PLATFORM_POLICIES[_normalize_platform(platform)]
+
+
+def _normalize_match_text(value: str) -> str:
+    low = (value or "").lower()
+    low = re.sub(r"[^\w\s]", " ", low, flags=re.U)
+    return re.sub(r"\s+", " ", low, flags=re.U).strip()
+
+
+def _question_keywords(question: str) -> set[str]:
+    normalized = _normalize_match_text(question)
+    tokens = {
+        token
+        for token in normalized.split()
+        if len(token) >= 3 and token not in _QUESTION_TOKEN_STOPWORDS
+    }
+    return tokens
+
+
+def _question_numbers(text: str) -> set[str]:
+    return set(re.findall(r"\d+", text or ""))
+
+
+def _is_question_covered(question: str, response_text: str) -> bool:
+    q_norm = _normalize_match_text(question)
+    r_norm = _normalize_match_text(response_text)
+    if not q_norm:
+        return True
+    q_nums = _question_numbers(q_norm)
+    if q_nums and not q_nums.issubset(_question_numbers(r_norm)):
+        return False
+    q_tokens = _question_keywords(q_norm)
+    if not q_tokens:
+        return q_norm in r_norm
+    r_tokens = _question_keywords(r_norm)
+    overlap = q_tokens & r_tokens
+    required_overlap = 1 if len(q_tokens) <= 2 else 2
+    return len(overlap) >= required_overlap
+
+
+def _uncovered_buyer_questions(
+    draft: str, questions: list[str]
+) -> list[str]:
+    missing: list[str] = []
+    for idx, question in enumerate(questions, start=1):
+        if not _is_question_covered(question, draft):
+            missing.append(f"uncovered:{idx}")
+    return missing
+
 DRAFT_SYSTEM_PROMPT = """\
 Ты — DraftWriter: эксперт по продающим откликам на биржах фриланса. \
 Пишешь от имени Александра Клычникова (Python / AI / Telegram / MVP) для Kwork.
@@ -136,7 +281,8 @@ DRAFT_SYSTEM_PROMPT = """\
 5. Срок — всегда, хотя бы ориентир: «Срок — 5–7 дней.» (days_hint / default_days).
 
 6. Стоимость — всегда: «от … ₽» или диапазон. ЗАПРЕЩЕНО: «по договорённости», \
-«обсудим стоимость» без цифры. (price_hint / бюджет проекта.)
+«обсудим стоимость» без цифры. (price_hint / бюджет проекта.) Цена = price_hint \
+в коридоре заказа (желаемый), не рыночный fair и не допустимый максимум.
 
 7. CTA — мягкий следующий шаг. ЗАПРЕЩЕНО дословно: \
 «Предлагаю обсудить детали и приступить» (+ «…к работе»). Варианты (ротируй):
@@ -148,8 +294,10 @@ DRAFT_SYSTEM_PROMPT = """\
 
 8. Если buyer_questions не пуст — ответь на КАЖДЫЙ пункт явно.
 
-9. budget_mismatch (fair_price > ceiling): цена = «от {fair_price} ₽»; \
-мягко, что бюджет заказа занижен; CTA обсудить сумму; без «Понимаю…».
+9. budget_mismatch: цена = price_hint / коридор заказа. Одной короткой фразой — \
+что входит в эту сумму (MVP / основной сценарий). Полный объём — только как \
+опциональное расширение (ориентир fair_price), не как цена отклика. \
+ЗАПРЕЩЕНО: «бюджет занижен», «обсудить сумму» как главный CTA, цена = только fair.
 
 *** ЯЗЫК И ФОРМАТ ***
 - 5–7 предложений. Простой человеческий язык. Без воды, биографии, длинных вступлений.
@@ -174,7 +322,7 @@ DRAFT_SYSTEM_PROMPT = """\
 - markdown-списки, URL / GitHub / портфолио-ссылки
 - созвоны, мессенджеры, контакты вне Kwork
 - «если интересно — пишите» / «когда удобно созвониться?»
-- игнор buyer_questions; ceiling как «достаточная» цена при budget_mismatch
+- игнор buyer_questions; цена = только fair при budget_mismatch; «бюджет занижен»
 
 *** АНТИ-ШАБЛОН ***
 Смотри recent_responses / recent_openings / recent_closings. \
@@ -207,7 +355,9 @@ Fail если первый глагол «Соберу» (или снова «С
 7) Нет нарушений Kwork (ссылки, созвоны, markdown-списки)
 8) Длина ~5–7 предложений / ~700–1600 знаков, по делу
 9) buyer_questions: у каждого пункта явный ответ, иначе fail + missing
-10) budget_mismatch: fair_price в тексте + мягко про заниженный бюджет + CTA по сумме
+10) budget_mismatch: цена = price_hint / коридор заказа; коротко что входит в сумму \
+(основной сценарий); полный объём только как опция. Fail: «бюджет занижен»; \
+fail: только fair как цена отклика
 11) Используются ключевые слова из ТЗ (если в заказе Telegram/WordPress/… — они в тексте, \
 если уместно); нет выдуманных технологий вне заказа
 
@@ -237,7 +387,7 @@ EXPERT_REVIEWER_PROMPT = """\
 - цена без цифры («по договорённости»)
 - выдуманные технологии не из заказа
 - шаблонность vs recent_openings/closings
-- budget_mismatch без fair_price + обсуждения суммы
+- budget_mismatch без listed/price_hint; «бюджет занижен»; fair как единственная цена
 
 verdict:
 - "pass" — можно сдавать
@@ -254,6 +404,133 @@ score: целое 1–10.
   "must_fix": ["..."]
 }
 """
+
+DEFAULT_DRAFT_SYSTEM_PROMPT = """\
+Ты — DraftWriter: эксперт по продающим откликам на биржах фриланса. \
+Пишешь от имени Александра Клычникова (Python / AI / Telegram / MVP).
+
+Главная цель: за 10–15 секунд заказчик думает \
+«Этот человек уже понял задачу и знает, как её решить.» \
+Не продавай себя — продавай решение проблемы клиента.
+
+*** АЛГОРИТМ (СТРОГО) ***
+
+1. Обращение: ВСЕГДА начинай с «Здравствуйте!» — это первое слово отклика. \
+Без имени заказчика, без «Добрый день».
+
+2. Первое предложение — результат/решение словами из ТЗ. Сразу конкретные \
+сущности заказа (графики, QR, роли, табель — что есть в ТЗ). \
+ЗАПРЕЩЕНО: парафраз «Предлагаю разработать …, которая автоматизирует…»; \
+«Понимаю, что вам…»; вода без слов заказчика.
+
+3. Одно короткое КАК: этапы (этап 1 / этап 2), не пересказ всего ТЗ.
+
+4. Срок — всегда цифрой (дни). Стоимость — всегда цифрой (₽).
+
+5. Если buyer_questions не пуст — ответь на КАЖДЫЙ пункт явно: \
+стоимость, срок, что входит в стоимость, расходы после запуска.
+
+6. Что ВХОДИТ в цену — конкретно (этап, установка/деплой, инструкция, \
+исходники, блоки ТЗ). ЗАПРЕЩЕНО откупаться «основные функции».
+
+7. Обязательные расходы после запуска — с цифрами (хостинг/VPS/домен, ₽/мес). \
+ЗАПРЕЩЕНО: «хостинг можно обсудить» / «можно обсудить» без суммы.
+
+8. CTA — мягкий следующий шаг.
+
+*** ЯЗЫК И ФОРМАТ ***
+- 4–7 предложений. Живой деловой язык. Без воды, биографии, саморекламы.
+- Без markdown. Верни только текст отклика.
+- Не выдумывай технологии и факты вне заказа.
+- Используй слова заказчика из ТЗ.
+- Если platform_policy.max_chars задан (Яндекс Услуги = 1000) — весь текст \
+строго не длиннее этого лимита. Чеклист не режь, режь воду.
+
+*** ЗАПРЕЩЕНО ***
+- «основные функции» как единственное содержание цены
+- «можно обсудить» без цифр про хостинг/расходы после запуска
+- парафраз ТЗ вместо результата
+- игнор buyer_questions
+- цена или срок без цифры
+
+Если в feedback / critique / expert_notes есть замечания — учти и перепиши.
+Верни ТОЛЬКО текст отклика.
+"""
+
+DEFAULT_LOGIC_CRITIC_PROMPT = """\
+Ты — LogicCritic: структура, стиль и полнота продающего отклика.
+
+Чеклист (fail → issues / missing):
+1) Текст начинается с «Здравствуйте!». Fail: другое приветствие или нет hello.
+2) Первое содержательное предложение — результат/решение словами ТЗ; \
+НЕ парафраз «Предлагаю разработать … которая автоматизирует»; НЕ «Понимаю, что…».
+3) Короткое КАК через этапы, без пересказа ТЗ.
+4) Срок есть цифрой; цена есть цифрой. Fail: «по договорённости» без суммы.
+5) buyer_questions: у каждого пункта явный ответ (стоимость / срок / \
+что входит / расходы после запуска), иначе fail + missing.
+6) Что входит в цену — конкретно, не только «основные функции».
+7) Расходы после запуска — с цифрой (хостинг/VPS/домен, ₽/мес). \
+Fail: «хостинг обсудим» без числа.
+8) Нет воды, клише и выдуманных технологий. 4–7 предложений, без markdown.
+9) Если platform_policy.max_chars задан — fail при превышении (Яндекс: 1000).
+
+Верни СТРОГО JSON:
+{
+  "verdict": "pass" | "fail",
+  "issues": ["..."],
+  "missing": ["..."],
+  "style_notes": "..."
+}
+"""
+
+DEFAULT_EXPERT_REVIEWER_PROMPT = """\
+Ты — ExpertReviewer: финальный гейт. Текст должен читаться как живой пресейл, \
+не как шаблон GPT.
+
+Тест 10–15 секунд: заказчик думает \
+«Этот исполнитель уже знает, как решить мою задачу»? Если нет → revise_draft.
+
+Авто-revise_draft (must_fix):
+- «Предлагаю разработать … которая автоматизирует» / парафраз ТЗ вместо результата
+- нет «Здравствуйте!» в начале
+- нет срока или цены цифрами
+- buyer_questions не закрыты по пунктам (стоимость / срок / что входит / расходы)
+- «основные функции» без конкретного состава цены
+- «можно обсудить» про хостинг/расходы без цифры
+- выдуманные технологии не из заказа
+- длина > platform_policy.max_chars (Яндекс Услуги: 1000)
+- вода и шаблонность
+
+verdict:
+- "pass" — можно сдавать
+- "revise_draft" — вернуть DraftWriter с must_fix
+- "revise_logic" — редко: структура ок, LogicCritic пропустил важное
+
+score: целое 1–10.
+
+Верни СТРОГО JSON:
+{
+  "verdict": "pass" | "revise_draft" | "revise_logic",
+  "score": 8,
+  "feedback": "...",
+  "must_fix": ["..."]
+}
+"""
+
+
+def _prompts_for_platform(platform: str | None) -> dict[str, str]:
+    normalized = _normalize_platform(platform)
+    if normalized == "kwork":
+        return {
+            "draft": DRAFT_SYSTEM_PROMPT,
+            "logic": LOGIC_CRITIC_PROMPT,
+            "expert": EXPERT_REVIEWER_PROMPT,
+        }
+    return {
+        "draft": DEFAULT_DRAFT_SYSTEM_PROMPT,
+        "logic": DEFAULT_LOGIC_CRITIC_PROMPT,
+        "expert": DEFAULT_EXPERT_REVIEWER_PROMPT,
+    }
 
 
 def _response_opener(text: str) -> str:
@@ -326,6 +603,9 @@ def force_logic_fail_for_questions(
     """Local hard-fails when draft cannot cover buyer_questions."""
     questions = extract_buyer_questions(project)
     forced: list[str] = []
+    max_chars = _platform_policy(project.platform).get("max_chars")
+    if isinstance(max_chars, int) and len((draft or "").strip()) > max_chars:
+        forced.append("too_long")
     checklist_miss = buyer_checklist_issues(project, draft)
     for issue in checklist_miss:
         forced.append(issue)
@@ -336,6 +616,11 @@ def force_logic_fail_for_questions(
         and draft_too_short_for_questions(draft, questions)
     ):
         forced.append("too_short_for_all_questions")
+    for uncovered in _uncovered_buyer_questions(draft, questions):
+        idx = int(uncovered.split(":", 1)[1])
+        if 1 <= idx <= len(questions) and checklist_rule_for_question(questions[idx - 1]):
+            continue
+        forced.append(uncovered)
     return forced
 
 
@@ -457,9 +742,12 @@ class ResponsePipeline:
     ) -> dict[str, Any]:
         buyer_name = _buyer_first_name(project.buyer)
         budget_digits = _price_from_project(project)
+        platform = _normalize_platform(project.platform)
+        policy = _platform_policy(platform)
         payload: dict[str, Any] = {
             "task": "Напиши продающий отклик по алгоритму DraftWriter.",
-            "platform": project.platform,
+            "platform": platform,
+            "platform_policy": policy,
             "project": project.model_dump(mode="json"),
             "buyer_name": buyer_name,
             "project_brief": build_project_brief(project),
@@ -491,6 +779,8 @@ class ResponsePipeline:
         feedback: dict[str, Any] | str | None = None,
         budget_mismatch: dict[str, Any] | None = None,
     ) -> str:
+        platform = _normalize_platform(project.platform)
+        prompts = _prompts_for_platform(platform)
         payload = self._build_draft_payload(
             project,
             lightrag_context,
@@ -503,14 +793,15 @@ class ResponsePipeline:
         )
         logger.info("response_pipeline draft project_id=%s", project.project_id)
         text = self._openai_text(
-            system=DRAFT_SYSTEM_PROMPT,
+            system=prompts["draft"],
             user=payload,
             project_id=project.project_id,
             temperature=0.82,
         )
         text = finalize_response_text(text, project)
-        banned = soft_banned_issues(text)
-        if project.platform == "kwork":
+        banned: list[str] = []
+        if platform == "kwork":
+            banned += soft_banned_issues(text)
             banned += [f"kwork:{v}" for v in kwork_compliance_issues(text)]
         banned += [
             f"checklist:{v}" for v in buyer_checklist_issues(project, text)
@@ -531,15 +822,17 @@ class ResponsePipeline:
                     "Не заканчивай «Предлагаю обсудить детали и приступить.» "
                     "Без URL/созвонов."
                     + (
-                        " При budget_mismatch: цена = fair_price, мягко отметь заниженный "
-                        "бюджет заказа и предложи обсудить сумму."
+                        " При budget_mismatch: цена = price_hint / бюджет заказа; "
+                        "одной фразой что входит в сумму (основной сценарий). "
+                        "Полный объём — только как опция расширения. "
+                        "Не пиши «бюджет занижен» и не ставь рыночную цену как единственную."
                         if budget_mismatch
                         else ""
                     )
                 ),
             }
             text = self._openai_text(
-                system=DRAFT_SYSTEM_PROMPT,
+                system=prompts["draft"],
                 user=retry,
                 project_id=project.project_id,
                 temperature=0.9,
@@ -555,13 +848,18 @@ class ResponsePipeline:
         budget_mismatch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         buyer_questions = extract_buyer_questions(project)
-        local_issues = soft_banned_issues(draft)
-        if project.platform == "kwork":
+        platform = _normalize_platform(project.platform)
+        prompts = _prompts_for_platform(platform)
+        local_issues: list[str] = []
+        if platform == "kwork":
+            local_issues += soft_banned_issues(draft)
             local_issues += [
                 f"kwork:{v}" for v in kwork_compliance_issues(draft)
             ]
         local_issues += budget_mismatch_issues(draft, budget_mismatch)
         payload: dict[str, Any] = {
+            "platform": platform,
+            "platform_policy": _platform_policy(platform),
             "project_brief": build_project_brief(project),
             "buyer_name": _buyer_first_name(project.buyer),
             "buyer_questions": buyer_questions,
@@ -571,7 +869,7 @@ class ResponsePipeline:
         if budget_mismatch:
             payload["budget_mismatch"] = budget_mismatch
         data = self._openai_json(
-            system=LOGIC_CRITIC_PROMPT,
+            system=prompts["logic"],
             user=payload,
             project_id=project.project_id,
             temperature=0.1,
@@ -612,7 +910,11 @@ class ResponsePipeline:
         *,
         budget_mismatch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        platform = _normalize_platform(project.platform)
+        prompts = _prompts_for_platform(platform)
         payload: dict[str, Any] = {
+            "platform": platform,
+            "platform_policy": _platform_policy(platform),
             "project_brief": build_project_brief(project),
             "buyer_name": _buyer_first_name(project.buyer),
             "response_text": draft,
@@ -621,7 +923,7 @@ class ResponsePipeline:
         if budget_mismatch:
             payload["budget_mismatch"] = budget_mismatch
         data = self._openai_json(
-            system=EXPERT_REVIEWER_PROMPT,
+            system=prompts["expert"],
             user=payload,
             project_id=project.project_id,
         )
