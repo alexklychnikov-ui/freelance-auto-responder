@@ -9,6 +9,7 @@ LANDING: dict = {
     "category": "Разработка и IT → Создание сайта",
     "type": "Новый сайт",
     "kind": "Лендинг",
+    "github_url": "https://github.com/alexklychnikov-ui/MyPortfolio",
     "price_buyer": 500,
     "days": "5",
     "volume": "1",

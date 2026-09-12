@@ -15,6 +15,9 @@ LIMITS = {
 # Покупатель видит price; в select value = buyer * 5 // 4 (комиссия 20%).
 # Срок опции: "0" | "1" | "2" | ...
 
+GITHUB_CASE_MIN_BUYER = 500
+EXTRA_BUYER_GRID = (800, 1200, 1600, 2000, 2400)  # сетка extra, buyer 500 в extra нет
+
 
 def buyer_to_select_value(buyer_rub: int) -> str:
     return str(int(buyer_rub) * 5 // 4)
@@ -244,6 +247,7 @@ def assemble(listing: dict | None = None) -> dict:
         "instruction": instruction,
         "extras": extras,
         "faqs": faqs,
+        "github_url": src.get("github_url") or "",
     }
 
 
@@ -251,6 +255,37 @@ def _len_ok(text: str, bounds: tuple[int, int]) -> bool:
     n = len(text.strip())
     lo, hi = bounds
     return lo <= n <= hi
+
+
+def github_case_problems(built: dict) -> list[str]:
+    url = str(built.get("github_url") or "")
+    if "github.com/" not in url.lower():
+        return []
+    err: list[str] = []
+    buyer = int(built["price_buyer"])
+    if buyer != GITHUB_CASE_MIN_BUYER:
+        err.append(f"github case: price_buyer {buyer} != {GITHUB_CASE_MIN_BUYER}")
+    extras = built["extras"]
+    n_ex = len(extras)
+    if n_ex < 5 or n_ex > 7:
+        err.append(f"github case: extras {n_ex}, want 5–7")
+    extra_sum = 0
+    for i, extra in enumerate(extras):
+        price = int(extra["price"])
+        extra_sum += price
+        if price not in EXTRA_BUYER_GRID or price <= GITHUB_CASE_MIN_BUYER:
+            err.append(f"github case: extra[{i}].price {price} not in {EXTRA_BUYER_GRID}")
+    if extra_sum < 4000:
+        err.append(f"github case: extras sum {extra_sum} < 4000")
+    blob_parts = [str(built.get("description") or "")]
+    excluded = built.get("excluded")
+    if isinstance(excluded, list):
+        blob_parts.extend(str(x) for x in excluded)
+    elif excluded:
+        blob_parts.append(str(excluded))
+    if "опци" not in "\n".join(blob_parts).lower():
+        err.append("github case: description+excluded missing «опци»")
+    return err
 
 
 def validate(built: dict) -> list[str]:
@@ -279,6 +314,7 @@ def validate(built: dict) -> list[str]:
             err.append(f"faq[{i}].q {len(faq['q'])} not in {LIMITS['faq_q']}")
         if not _len_ok(faq["a"], LIMITS["faq_a"]):
             err.append(f"faq[{i}].a {len(faq['a'])} not in {LIMITS['faq_a']}")
+    err.extend(github_case_problems(built))
     return err
 
 

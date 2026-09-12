@@ -12,6 +12,7 @@ PRICE: dict = {
     "category": "Разработка и IT → Скрипты, боты и mini apps",
     "type": "Парсеры",
     "kind": "Написание и доработка",
+    "github_url": "https://github.com/alexklychnikov-ui/PriceMonitoring",
     "price_buyer": 500,
     "days": "5",
     "volume": "1",
