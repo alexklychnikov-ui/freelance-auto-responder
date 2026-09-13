@@ -4,6 +4,8 @@ import asyncio
 import html
 import logging
 import re
+import time
+from collections import Counter
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from typing import Any
@@ -12,11 +14,10 @@ import httpx
 
 from src.adapters.kwork_pricing import (
     budget_gap,
-    clamp_price_to_budget,
     ensure_budget_mismatch_note,
     format_rub_amount,
     parse_budget_ceiling_rub,
-    pick_commercial_price,
+    pick_listed_offer_price,
     price_exceeds_budget_ceiling,
 )
 from src.adapters.kwork import (
@@ -58,6 +59,9 @@ from src.pipeline.tz_project import (
 )
 from src.limits.daily import count_today_platform_prepared, is_daily_limit_reached
 from src.adapters.kwork_urls import kwork_project_view_url
+from src.evidence.collector import EvidenceService, project_content_hash
+from src.evidence.models import EvidenceBundle
+from src.evidence.summary import evidence_summary_html
 from src.models import PendingOffer, ProjectFull, ProjectPreview
 from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
 from src.pipeline.flru_inbox_poller import poll_flru_inbox
@@ -114,6 +118,7 @@ class PipelineOrchestrator:
         journal: JournalWriter,
         prepared_store: PreparedResponseStore,
         offer_estimator: GptOfferEstimator | None = None,
+        evidence_service: EvidenceService | None = None,
         *,
         adapter_factory: Any | None = None,
         browser: Any | None = None,
@@ -127,6 +132,7 @@ class PipelineOrchestrator:
         self.journal = journal
         self.prepared_store = prepared_store
         self.offer_estimator = offer_estimator or GptOfferEstimator(settings)
+        self.evidence_service = evidence_service or EvidenceService()
         self._browser = browser
         self._adapter_factory = adapter_factory or self._default_adapter
         self._journal_sync_lock = asyncio.Lock()
@@ -769,6 +775,93 @@ class PipelineOrchestrator:
             logger.exception("project_refresh_failed project_id=%s", offer.project_id)
             return offer.project
 
+    async def ensure_evidence(
+        self,
+        offer: PendingOffer,
+        *,
+        notify: Any | None = None,
+    ) -> EvidenceBundle:
+        """Collect or reuse EvidenceBundle before response generation. Fail-open."""
+        if not self.settings.evidence_research_enabled:
+            bundle = EvidenceBundle(
+                status="not_required",
+                required=False,
+                project_hash=project_content_hash(offer.project),
+            )
+            prior = offer.evidence
+            offer.evidence = bundle
+            # Clear stale prior evidence from pending so prepared saves stay clean.
+            if prior is not None and (
+                prior.status != "not_required"
+                or prior.required
+                or prior.facts
+                or prior.sources
+                or prior.insights
+                or prior.warnings
+            ):
+                self.review_service.store.save(offer)
+            return bundle
+
+        current_hash = project_content_hash(offer.project)
+        if (
+            offer.evidence is not None
+            and offer.evidence.project_hash == current_hash
+        ):
+            return offer.evidence
+
+        async def _notify(msg: str) -> None:
+            if notify is None:
+                return
+            try:
+                await notify(msg)
+            except Exception:
+                logger.warning("evidence_progress_notify_failed", exc_info=True)
+
+        await _notify("🔎 Проверяю ссылки…")
+        t0 = time.perf_counter()
+        try:
+            bundle = await asyncio.to_thread(
+                self.evidence_service.collect,
+                offer.project,
+                settings=self.settings,
+                timeout=float(self.settings.evidence_timeout_seconds),
+                max_urls=int(self.settings.evidence_max_urls),
+            )
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            logger.exception(
+                "evidence_collect_failed project_id=%s latency_ms=%s",
+                offer.project_id,
+                latency_ms,
+            )
+            bundle = EvidenceBundle(
+                status="failed",
+                required=True,
+                project_hash=current_hash,
+                warnings=[f"evidence_collect_error: {type(exc).__name__}"],
+            )
+        else:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            status_counts = Counter(s.status for s in bundle.sources)
+            err_codes = sorted(
+                {s.error_code for s in bundle.sources if s.error_code}
+            )
+            logger.info(
+                "evidence_ensure project_id=%s sources=%s statuses=%s "
+                "facts=%s latency_ms=%s errors=%s status=%s",
+                offer.project_id,
+                len(bundle.sources),
+                dict(status_counts),
+                len(bundle.facts),
+                latency_ms,
+                err_codes,
+                bundle.status,
+            )
+
+        offer.evidence = bundle
+        self.review_service.store.save(offer)
+        return bundle
+
     async def _generate_response_text(
         self,
         offer: PendingOffer,
@@ -776,6 +869,7 @@ class PipelineOrchestrator:
         notify: Any | None = None,
     ) -> str:
         await self._refresh_offer_project(offer)
+        evidence = await self.ensure_evidence(offer, notify=notify)
         context = await asyncio.to_thread(self.lightrag.get_full_context)
         examples = await asyncio.to_thread(
             load_response_examples, self.settings.response_examples_dir
@@ -797,7 +891,8 @@ class PipelineOrchestrator:
                 "fair_price_estimate_failed project_id=%s", offer.project_id
             )
         gap = budget_gap(fair_price, offer.project) if fair_price > 0 else None
-        price_hint: int | str | None = fair_price if fair_price > 0 else None
+        listed = pick_listed_offer_price(offer.project, fair=fair_price)
+        price_hint: int | str | None = listed if listed > 0 else None
         gen = self.response_generator
         gen_with = getattr(gen, "generate_with_progress", None)
         if (
@@ -813,6 +908,7 @@ class PipelineOrchestrator:
                 recent_responses=recent,
                 price_hint=price_hint,
                 budget_mismatch=gap,
+                evidence=evidence,
             )
         else:
             text = await asyncio.to_thread(
@@ -823,9 +919,20 @@ class PipelineOrchestrator:
                 recent_responses=recent,
                 price_hint=price_hint,
                 budget_mismatch=gap,
+                evidence=evidence,
             )
         text = finalize_response_text(text.strip(), offer.project)
-        return ensure_budget_mismatch_note(text, gap)
+        text = ensure_budget_mismatch_note(text, gap)
+        if notify is not None and evidence.status != "not_required":
+            try:
+                await notify(evidence_summary_html(evidence))
+            except Exception:
+                logger.warning(
+                    "evidence_summary_notify_failed project_id=%s",
+                    offer.project_id,
+                    exc_info=True,
+                )
+        return text
 
     async def _ensure_response_text(
         self,
@@ -1098,6 +1205,18 @@ class PipelineOrchestrator:
             offer,
         )
 
+    def _resolve_listed_fill(
+        self,
+        project: ProjectFull,
+        *,
+        fair_price: int = 0,
+        offer_price: int = 0,
+    ) -> tuple[int, dict | None, int]:
+        gap_fair = int(fair_price or 0) or int(offer_price or 0)
+        gap = budget_gap(gap_fair, project) if gap_fair > 0 else None
+        listed = pick_listed_offer_price(project, fair=int(fair_price or 0))
+        return listed, gap, gap_fair
+
     async def _send_manual_copy(
         self,
         offer: PendingOffer,
@@ -1150,15 +1269,9 @@ class PipelineOrchestrator:
                 platform,
             )
         offer_price = int(terms.price_rub or 0)
-        commercial = pick_commercial_price(fair_price, offer_price)
-        gap_fair = fair_price if fair_price > 0 else offer_price
-        gap = budget_gap(gap_fair, offer.project) if gap_fair > 0 else None
-        price_rub = (
-            int(gap["fill_price"])
-            if gap
-            else clamp_price_to_budget(commercial, offer.project)
+        price_rub, gap, _gap_fair = self._resolve_listed_fill(
+            offer.project, fair_price=fair_price, offer_price=offer_price
         )
-        price_rub = clamp_price_to_budget(price_rub, offer.project)
         delivery_days = terms.delivery_days
         tier = offer.acceptance_tier or resolve_acceptance_tier(
             offer.project, offer.score, self.settings
@@ -1172,7 +1285,7 @@ class PipelineOrchestrator:
             response_text = append_missing_checklist_answers(
                 response_text,
                 offer.project,
-                price_rub=gap_fair if gap else price_rub,
+                price_rub=price_rub,
                 delivery_days=delivery_days,
             )
         response_text = ensure_budget_mismatch_note(response_text, gap)
@@ -1234,18 +1347,10 @@ class PipelineOrchestrator:
             logger.exception(
                 "fair_price_estimate_failed project_id=%s", offer.project_id
             )
-        # commercial = min(market, offer) for TG/form when no gap; gap uses market fair.
         offer_price = int(terms.price_rub or 0)
-        commercial = pick_commercial_price(fair_price, offer_price)
-        gap_fair = fair_price if fair_price > 0 else offer_price
-        gap = budget_gap(gap_fair, offer.project) if gap_fair > 0 else None
-        fill_price = (
-            int(gap["fill_price"])
-            if gap
-            else clamp_price_to_budget(commercial, offer.project)
+        fill_price, gap, gap_fair = self._resolve_listed_fill(
+            offer.project, fair_price=fair_price, offer_price=offer_price
         )
-        # Always clamp form fill to ceiling / project budget (never put fair into form).
-        fill_price = clamp_price_to_budget(fill_price, offer.project)
         price = str(fill_price)
         delivery_days = terms.delivery_days
         tier = offer.acceptance_tier or resolve_acceptance_tier(
@@ -1259,7 +1364,7 @@ class PipelineOrchestrator:
             response_text = append_missing_checklist_answers(
                 response_text,
                 offer.project,
-                price_rub=gap_fair if gap else fill_price,
+                price_rub=fill_price,
                 delivery_days=delivery_days,
             )
         response_text = ensure_budget_mismatch_note(response_text, gap)
@@ -1293,13 +1398,11 @@ class PipelineOrchestrator:
                 if gap
                 else parse_budget_ceiling_rub(offer.project)
             )
-            # Gap: show market fair + потолок. No gap: same commercial for TG and form.
-            notify_price = gap_fair if gap else (
-                commercial if commercial > 0 else fill_price
-            )
+            # Gap: fair as полный объём; без gap — listed в коридоре заказа.
+            notify_price = gap_fair if gap else fill_price
             if gap and ceiling is not None:
                 estimate_line = (
-                    f"Оценка: {format_rub_amount(notify_price)} ₽ "
+                    f"Оценка полный объём: {format_rub_amount(notify_price)} ₽ "
                     f"(потолок {format_rub_amount(ceiling)}) · "
                     f"{delivery_days} дн."
                 )
@@ -1356,26 +1459,18 @@ class PipelineOrchestrator:
                                 offer.project_id,
                             )
                         offer_price = int(terms.price_rub or 0)
-                        commercial = pick_commercial_price(fair_price, offer_price)
-                        gap_fair = fair_price if fair_price > 0 else offer_price
-                        gap = (
-                            budget_gap(gap_fair, offer.project)
-                            if gap_fair > 0
-                            else None
+                        fill_price, gap, gap_fair = self._resolve_listed_fill(
+                            offer.project,
+                            fair_price=fair_price,
+                            offer_price=offer_price,
                         )
-                        fill_price = (
-                            int(gap["fill_price"])
-                            if gap
-                            else clamp_price_to_budget(commercial, offer.project)
-                        )
-                        fill_price = clamp_price_to_budget(fill_price, offer.project)
                         price = str(fill_price)
                         delivery_days = terms.delivery_days
                         if not skip_checklist_enrich:
                             response_text = append_missing_checklist_answers(
                                 response_text,
                                 offer.project,
-                                price_rub=gap_fair if gap else fill_price,
+                                price_rub=fill_price,
                                 delivery_days=delivery_days,
                             )
                         response_text = ensure_budget_mismatch_note(response_text, gap)
@@ -1709,6 +1804,7 @@ class PipelineOrchestrator:
             price=price,
             delivery_days=delivery_days,
             screenshot_path=None,
+            evidence=offer.evidence,
         )
         self.prepared_store.save(prepared)
         if lock_offer:
@@ -2003,6 +2099,7 @@ def build_orchestrator(settings: Settings | None = None) -> PipelineOrchestrator
     journal = JournalWriter(settings.response_journal)
     prepared_store = PreparedResponseStore(settings.prepared_responses_dir)
     offer_estimator = GptOfferEstimator(settings)
+    evidence_service = EvidenceService()
     return PipelineOrchestrator(
         settings=settings,
         repository=repository,
@@ -2013,4 +2110,5 @@ def build_orchestrator(settings: Settings | None = None) -> PipelineOrchestrator
         journal=journal,
         prepared_store=prepared_store,
         offer_estimator=offer_estimator,
+        evidence_service=evidence_service,
     )

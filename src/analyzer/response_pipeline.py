@@ -28,6 +28,7 @@ from src.analyzer.response_text import (
     payment_mismatch_issues,
 )
 from src.config import Settings
+from src.evidence.usage import compact_verified_evidence, evidence_usage_issues
 from src.models import ProjectFull
 
 logger = logging.getLogger(__name__)
@@ -331,6 +332,17 @@ DRAFT_SYSTEM_PROMPT = """\
 Не штампуй одно и то же «Сделаю…» / «Разработаю…» / «Для такого проекта важно…» \
 в каждом отклике. Живой текст, не шаблон нейросети.
 
+*** VERIFIED EVIDENCE (если verified_evidence в payload) ***
+Если есть verified_evidence:
+- первое содержательное предложение — наблюдение/отличие ЭТОГО заказа по фактам; \
+НЕ начинай с Реализую/Создам/Сделаю/Разработаю/Соберу
+- в первых 3 предложениях: ≥1 fact (claim), ≥1 insight.implementation_consequence, \
+≥2 разных anchors из verified_evidence
+- не утверждай, что открыл/проверил/изучил источник со status≠verified
+- не выдумывай API endpoints вне evidence
+- CTA — из реального пробела (missing param), если виден в evidence/ТЗ
+- без внешних http(s) URL в тексте
+
 *** KWORK ***
 Только чат площадки. ~700–1600 знаков ≈ 5–7 предложений. Русский. Без markdown.
 
@@ -360,6 +372,10 @@ Fail если первый глагол «Соберу» (или снова «С
 fail: только fair как цена отклика
 11) Используются ключевые слова из ТЗ (если в заказе Telegram/WordPress/… — они в тексте, \
 если уместно); нет выдуманных технологий вне заказа
+12) Если в payload есть verified_evidence: fail при generic opener \
+(Реализую/Создам/Сделаю/Разработаю/Соберу, в т.ч. «Я …»); fail без ≥2 anchors \
+(или всех, если их меньше); fail при «открыл/проверил …» для status≠verified; \
+fail при внешних http(s) URL. Учитывай local_issues с префиксом evidence:
 
 Верни СТРОГО JSON:
 {
@@ -388,6 +404,8 @@ EXPERT_REVIEWER_PROMPT = """\
 - выдуманные технологии не из заказа
 - шаблонность vs recent_openings/closings
 - budget_mismatch без listed/price_hint; «бюджет занижен»; fair как единственная цена
+- verified_evidence в payload, но opener Реализую/Создам/Сделаю/Разработаю/Соберу \
+(в т.ч. «Я …»); нет ≥2 anchors; осмотр источника status≠verified; внешний URL
 
 verdict:
 - "pass" — можно сдавать
@@ -453,6 +471,17 @@ DEFAULT_DRAFT_SYSTEM_PROMPT = """\
 - игнор buyer_questions
 - цена или срок без цифры
 
+*** VERIFIED EVIDENCE (если verified_evidence в payload) ***
+Если есть verified_evidence:
+- первое содержательное предложение — наблюдение/отличие ЭТОГО заказа по фактам; \
+НЕ начинай с Реализую/Создам/Сделаю/Разработаю/Соберу
+- в первых 3 предложениях: ≥1 fact (claim), ≥1 insight.implementation_consequence, \
+≥2 разных anchors из verified_evidence
+- не утверждай, что открыл/проверил/изучил источник со status≠verified
+- не выдумывай API endpoints вне evidence
+- CTA — из реального пробела (missing param), если виден в evidence/ТЗ
+- без внешних http(s) URL в тексте
+
 Если в feedback / critique / expert_notes есть замечания — учти и перепиши.
 Верни ТОЛЬКО текст отклика.
 """
@@ -473,6 +502,10 @@ DEFAULT_LOGIC_CRITIC_PROMPT = """\
 Fail: «хостинг обсудим» без числа.
 8) Нет воды, клише и выдуманных технологий. 4–7 предложений, без markdown.
 9) Если platform_policy.max_chars задан — fail при превышении (Яндекс: 1000).
+10) Если в payload есть verified_evidence: fail при generic opener \
+(Реализую/Создам/Сделаю/Разработаю/Соберу, в т.ч. «Я …»); fail без ≥2 anchors \
+(или всех, если их меньше); fail при осмотре источника status≠verified; \
+fail при внешних http(s) URL. Учитывай local_issues с префиксом evidence:
 
 Верни СТРОГО JSON:
 {
@@ -500,6 +533,8 @@ DEFAULT_EXPERT_REVIEWER_PROMPT = """\
 - выдуманные технологии не из заказа
 - длина > platform_policy.max_chars (Яндекс Услуги: 1000)
 - вода и шаблонность
+- verified_evidence в payload, но opener Реализую/Создам/Сделаю/Разработаю/Соберу \
+(в т.ч. «Я …»); нет ≥2 anchors; осмотр источника status≠verified; внешний URL
 
 verdict:
 - "pass" — можно сдавать
@@ -644,6 +679,7 @@ class ResponsePipeline:
         self.settings = settings
         self._client = http_client
         self._owns_client = http_client is None
+        self._last_evidence: Any | None = None
 
     def _get_client(self) -> httpx.Client:
         if self._client is None:
@@ -765,6 +801,9 @@ class ResponsePipeline:
         }
         if budget_mismatch:
             payload["budget_mismatch"] = budget_mismatch
+        verified = compact_verified_evidence(self._last_evidence)
+        if verified is not None:
+            payload["verified_evidence"] = verified
         return payload
 
     def _draft(
@@ -807,30 +846,41 @@ class ResponsePipeline:
             f"checklist:{v}" for v in buyer_checklist_issues(project, text)
         ] + [f"tz:{v}" for v in payment_mismatch_issues(project, text)]
         banned += budget_mismatch_issues(text, budget_mismatch)
-        if banned:
+        evidence_issues = evidence_usage_issues(text, self._last_evidence)
+        if banned or evidence_issues:
             logger.info(
-                "response_pipeline draft soft_retry project_id=%s issues=%s",
+                "response_pipeline draft soft_retry project_id=%s banned=%s evidence=%s",
                 project.project_id,
                 banned,
+                evidence_issues,
             )
             retry = dict(payload)
-            retry["feedback"] = {
-                "banned_detected": banned,
-                "note": (
-                    "Перепиши: убери клише. Начни с «Здравствуйте!». "
-                    "Не открывай с «Соберу». "
-                    "Не заканчивай «Предлагаю обсудить детали и приступить.» "
-                    "Без URL/созвонов."
-                    + (
-                        " При budget_mismatch: цена = price_hint / бюджет заказа; "
-                        "одной фразой что входит в сумму (основной сценарий). "
-                        "Полный объём — только как опция расширения. "
-                        "Не пиши «бюджет занижен» и не ставь рыночную цену как единственную."
-                        if budget_mismatch
-                        else ""
-                    )
-                ),
-            }
+            note = (
+                "Перепиши: убери клише. Начни с «Здравствуйте!». "
+                "Не открывай с «Соберу». "
+                "Не заканчивай «Предлагаю обсудить детали и приступить.» "
+                "Без URL/созвонов."
+            )
+            if budget_mismatch:
+                note += (
+                    " При budget_mismatch: цена = price_hint / бюджет заказа; "
+                    "одной фразой что входит в сумму (основной сценарий). "
+                    "Полный объём — только как опция расширения. "
+                    "Не пиши «бюджет занижен» и не ставь рыночную цену как единственную."
+                )
+            if evidence_issues:
+                note += (
+                    " Есть verified_evidence: первое содержательное предложение — "
+                    "наблюдение/отличие по фактам этого заказа (не Реализую/Создам/"
+                    "Сделаю/Разработаю/Соберу); вставь ≥2 anchors и следствие из insight; "
+                    "не утверждай осмотр источников со status≠verified."
+                )
+            feedback_payload: dict[str, Any] = {"note": note}
+            if banned:
+                feedback_payload["banned_detected"] = banned
+            if evidence_issues:
+                feedback_payload["evidence_usage_issues"] = evidence_issues
+            retry["feedback"] = feedback_payload
             text = self._openai_text(
                 system=prompts["draft"],
                 user=retry,
@@ -857,6 +907,7 @@ class ResponsePipeline:
                 f"kwork:{v}" for v in kwork_compliance_issues(draft)
             ]
         local_issues += budget_mismatch_issues(draft, budget_mismatch)
+        local_issues += evidence_usage_issues(draft, self._last_evidence)
         payload: dict[str, Any] = {
             "platform": platform,
             "platform_policy": _platform_policy(platform),
@@ -868,6 +919,9 @@ class ResponsePipeline:
         }
         if budget_mismatch:
             payload["budget_mismatch"] = budget_mismatch
+        verified = compact_verified_evidence(self._last_evidence)
+        if verified is not None:
+            payload["verified_evidence"] = verified
         data = self._openai_json(
             system=prompts["logic"],
             user=payload,
@@ -922,6 +976,9 @@ class ResponsePipeline:
         }
         if budget_mismatch:
             payload["budget_mismatch"] = budget_mismatch
+        verified = compact_verified_evidence(self._last_evidence)
+        if verified is not None:
+            payload["verified_evidence"] = verified
         data = self._openai_json(
             system=prompts["expert"],
             user=payload,
@@ -933,6 +990,9 @@ class ResponsePipeline:
         mismatch = budget_mismatch_issues(draft, budget_mismatch)
         if mismatch and verdict == "pass":
             verdict = "revise_draft"
+        evidence_issues = evidence_usage_issues(draft, self._last_evidence)
+        if evidence_issues and verdict == "pass":
+            verdict = "revise_draft"
         try:
             score = int(data.get("score") or 5)
         except (TypeError, ValueError):
@@ -941,6 +1001,8 @@ class ResponsePipeline:
         must_fix = list(data.get("must_fix") or [])
         if mismatch:
             must_fix = list(must_fix) + mismatch
+        if evidence_issues:
+            must_fix = list(must_fix) + evidence_issues
         return {
             "verdict": verdict,
             "score": score,
@@ -979,7 +1041,10 @@ class ResponsePipeline:
         price_hint: int | str | None = None,
         days_hint: int | None = None,
         budget_mismatch: dict[str, Any] | None = None,
+        evidence: Any | None = None,
     ) -> str:
+        self._last_evidence = evidence
+
         def _notify(msg: str) -> None:
             if progress is not None:
                 progress(msg)
@@ -997,6 +1062,7 @@ class ResponsePipeline:
                 price_hint=price_hint,
                 days_hint=days_hint,
                 budget_mismatch=budget_mismatch,
+                evidence=evidence,
                 threaded=False,
             )
 
@@ -1014,6 +1080,7 @@ class ResponsePipeline:
             price_hint=price_hint,
             days_hint=days_hint,
             budget_mismatch=budget_mismatch,
+            evidence=evidence,
         )
 
     @staticmethod
@@ -1043,7 +1110,10 @@ class ResponsePipeline:
         price_hint: int | str | None = None,
         days_hint: int | None = None,
         budget_mismatch: dict[str, Any] | None = None,
+        evidence: Any | None = None,
     ) -> str:
+        self._last_evidence = evidence
+
         def notify(msg: str) -> None:
             self._safe_progress(progress, msg)
 
@@ -1119,7 +1189,10 @@ class ResponsePipeline:
         days_hint: int | None = None,
         budget_mismatch: dict[str, Any] | None = None,
         threaded: bool = True,
+        evidence: Any | None = None,
     ) -> str:
+        self._last_evidence = evidence
+
         async def _call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
             if threaded:
                 return await asyncio.to_thread(fn, *args, **kwargs)

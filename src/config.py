@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     pending_timeout_hours: int = 24
     operator_timezone: str = "Asia/Irkutsk"
 
+    evidence_research_enabled: bool = False
+    evidence_max_urls: int = 3
+    evidence_timeout_seconds: float = 60.0
+
+
     kwork_login: str | None = None
     kwork_password: str | None = None
     kwork_auto_login: bool = True

@@ -5,6 +5,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from src.evidence.models import EvidenceBundle
+
+
 
 class ProjectPreview(BaseModel):
     platform: str
@@ -81,3 +84,5 @@ class PendingOffer(BaseModel):
     approved_at: datetime | None = None
     telegram_message_id: int | None = None
     draft_message_id: int | None = None
+    evidence: EvidenceBundle | None = None
+

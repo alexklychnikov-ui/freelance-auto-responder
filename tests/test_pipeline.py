@@ -916,7 +916,7 @@ async def test_prepare_uses_same_commercial_price_for_tg_and_form(
         url="https://kwork.ru/projects/dual_price",
         title="Dual price project",
         full_description="Python bot with integrations.",
-        desired_budget="до 20 000 ₽",
+        desired_budget="до 40 000 ₽",
         max_budget="до 100 000 ₽",
     )
     orch, mock_adapter = _make_orchestrator(
@@ -957,6 +957,60 @@ async def test_prepare_uses_same_commercial_price_for_tg_and_form(
     )
     assert "40 000" in notify_text
     assert "60 000" not in notify_text
+
+
+@pytest.mark.asyncio
+async def test_prepare_form_uses_listed_near_desired_not_fair(
+    settings: Settings, score: GptScoreResult
+) -> None:
+    """3229782-like: fair 19.2k / max 45k → form near желаемый 15k, not fair/max."""
+    settings.prepare_only_no_submit = True
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3229782",
+        url="https://kwork.ru/projects/3229782",
+        title="Parsing bot",
+        full_description="Парсер + бот.",
+        desired_budget="до 15 000 ₽",
+        max_budget="до 45 000 ₽",
+    )
+    orch, mock_adapter = _make_orchestrator(
+        settings,
+        previews=[],
+        project_full=project,
+        score=score,
+    )
+    orch.offer_estimator.estimate.return_value = OfferTerms(
+        price_rub=45_000, delivery_days=7, plan_summary=""
+    )
+    orch.offer_estimator.estimate_market_cost.return_value = 19_200
+    mock_adapter.prepare_response.return_value = MagicMock(
+        success=True,
+        project_id="3229782",
+        message="prepared",
+    )
+    offer = PendingOffer(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3229782",
+        url=project.url,
+        title=project.title,
+        project=project,
+        score=score,
+        created_at=datetime.now(timezone.utc),
+        status="approved",
+        approved_at=datetime.now(timezone.utc),
+        response_text="Срок — 7 дней. Стоимость — от 19 200 ₽.",
+    )
+    await orch._prepare_offer_on_site(offer)
+    prepared_price = int(mock_adapter.prepare_response.call_args.args[2])
+    prepared_text = mock_adapter.prepare_response.call_args.args[1]
+    assert 15_000 <= prepared_price <= 18_000
+    assert prepared_price != 19_200
+    assert prepared_price != 45_000
+    assert "основной сценарий" in prepared_text.lower()
+    assert "занижен" not in prepared_text.lower()
 
 
 @pytest.mark.asyncio
@@ -1012,8 +1066,9 @@ async def test_prepare_budget_gap_clamps_form_price_and_appends_note(
     prepared_text = args.args[1] if args.args else args.kwargs.get("text")
     prepared_price = args.args[2] if len(args.args) > 2 else args.kwargs.get("price")
     assert prepared_price == "1500"
-    assert "обсудить сумму" in prepared_text.lower()
-    assert "занижен" in prepared_text.lower()
+    assert "основной сценарий" in prepared_text.lower()
+    assert "занижен" not in prepared_text.lower()
+    assert "обсудить сумму" not in prepared_text.lower()
     notify_text = " ".join(
         str(c.args[0]) for c in orch.review_service.tg_bot.notify.await_args_list
     )
@@ -1070,7 +1125,8 @@ async def test_prepare_budget_gap_from_desired_only_shows_ceiling_in_tg(
     prepared_text = args.args[1] if args.args else args.kwargs.get("text")
     prepared_price = args.args[2] if len(args.args) > 2 else args.kwargs.get("price")
     assert prepared_price == "1500"
-    assert "обсудить сумму" in prepared_text.lower()
+    assert "основной сценарий" in prepared_text.lower()
+    assert "занижен" not in prepared_text.lower()
     notify_text = " ".join(
         str(c.args[0]) for c in orch.review_service.tg_bot.notify.await_args_list
     )

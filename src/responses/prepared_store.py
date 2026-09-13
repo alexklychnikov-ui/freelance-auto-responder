@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.evidence.models import EvidenceBundle
 from src.models import GptScoreResult, ProjectFull
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ class PreparedResponse:
         journal_exported: bool = False,
         journal_confirmed: bool = False,
         screenshot_path: str | None = None,
+        evidence: EvidenceBundle | None = None,
     ) -> None:
         self.platform = platform
         self.source_key = source_key
@@ -45,6 +47,7 @@ class PreparedResponse:
         self.journal_exported = journal_exported
         self.journal_confirmed = journal_confirmed
         self.screenshot_path = screenshot_path
+        self.evidence = evidence
 
     def to_dict(self) -> dict:
         return {
@@ -63,10 +66,19 @@ class PreparedResponse:
             "journal_exported": self.journal_exported,
             "journal_confirmed": self.journal_confirmed,
             "screenshot_path": self.screenshot_path,
+            "evidence": (
+                self.evidence.model_dump(mode="json") if self.evidence is not None else None
+            ),
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> PreparedResponse:
+        raw_evidence = data.get("evidence")
+        evidence = (
+            EvidenceBundle.model_validate(raw_evidence)
+            if raw_evidence is not None
+            else None
+        )
         return cls(
             platform=data["platform"],
             source_key=data["source_key"],
@@ -83,7 +95,9 @@ class PreparedResponse:
             journal_exported=bool(data.get("journal_exported", False)),
             journal_confirmed=bool(data.get("journal_confirmed", False)),
             screenshot_path=data.get("screenshot_path"),
+            evidence=evidence,
         )
+
 
 
 class PreparedResponseStore:

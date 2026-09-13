@@ -32,6 +32,12 @@ from tests.test_project_brief_checklist import (
     _yandex_347bc2fc,
 )
 from src.config import Settings
+from src.evidence.models import (
+    EvidenceBundle,
+    EvidenceFact,
+    EvidenceInsight,
+    EvidenceSource,
+)
 from src.models import ProjectFull
 
 
@@ -713,4 +719,220 @@ def test_yandex_over_1000_chars_too_long() -> None:
         bloated, project, verdict="pass", missing=[]
     )
     assert "too_long" in forced
+
+
+def _evidence_bundle_for_pipeline(*, gov_status: str = "unavailable") -> EvidenceBundle:
+    return EvidenceBundle(
+        status="partial",
+        required=True,
+        project_hash="h3252339",
+        sources=[
+            EvidenceSource(
+                id="src-rossii",
+                kind="url",
+                role="reference",
+                input_ref="https://торги-россии.рф/",
+                status="verified",
+            ),
+            EvidenceSource(
+                id="src-gov",
+                kind="url",
+                role="data_source",
+                input_ref="https://torgi.gov.ru",
+                status=gov_status,  # type: ignore[arg-type]
+            ),
+        ],
+        facts=[
+            EvidenceFact(
+                id="f1",
+                source_id="src-rossii",
+                claim="На странице указан лот №184729",
+                anchors=["184729"],
+                relevance=0.9,
+                eligible_for_response=True,
+            ),
+            EvidenceFact(
+                id="f2",
+                source_id="src-rossii",
+                claim="Указана цена 1 250 000 ₽",
+                anchors=["1 250 000"],
+                relevance=0.8,
+                eligible_for_response=True,
+            ),
+        ],
+        insights=[
+            EvidenceInsight(
+                fact_ids=["f1"],
+                finding="ЛК на аналоге",
+                implementation_consequence="MVP без ЛК",
+                kind="scope",
+            )
+        ],
+    )
+
+
+_EVIDENCE_GOOD_DRAFT = (
+    "Здравствуйте!\n"
+    "По лоту 184729 вижу цену 1 250 000 ₽ — нужен поиск и выдача документов без ЛК.\n"
+    "Сделаю MVP поиска по извещению и вложениям под структуру ГИС.\n"
+    "Срок — 10–14 дней. Стоимость — от 32 700 ₽.\n"
+    "Если подход ок — напишите, согласуем старт."
+)
+
+
+def test_pipeline_no_evidence_happy_path_one_draft(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+    drafts = 0
+
+    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+        nonlocal drafts
+        drafts += 1
+        assert "verified_evidence" not in user
+        return SAMPLE_DRAFT
+
+    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+        if "ExpertReviewer" in system:
+            return {
+                "verdict": "pass",
+                "score": 9,
+                "feedback": "ok",
+                "must_fix": [],
+            }
+        return {
+            "verdict": "pass",
+            "issues": [],
+            "missing": [],
+            "style_notes": "ok",
+        }
+
+    monkeypatch.setattr(pipe, "_openai_text", fake_text)
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
+    out = pipe.generate(_project(), "ctx", evidence=None)
+    assert "Сделаю Telegram-бота" in out
+    assert drafts == 1
+
+
+def test_build_draft_payload_includes_verified_evidence() -> None:
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+    pipe._last_evidence = _evidence_bundle_for_pipeline()
+    payload = pipe._build_draft_payload(_project(), "ctx")
+    assert "verified_evidence" in payload
+    assert payload["verified_evidence"]["facts"]
+    assert all("quote" not in f for f in payload["verified_evidence"]["facts"])
+
+
+def test_critique_logic_fails_on_generic_evidence_opener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+    pipe._last_evidence = _evidence_bundle_for_pipeline()
+    payloads: list[dict] = []
+
+    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+        payloads.append(user)
+        return {
+            "verdict": "pass",
+            "issues": [],
+            "missing": [],
+            "style_notes": "ok",
+        }
+
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
+    draft = "Здравствуйте! Сделаю сайт под ваше ТЗ за неделю."
+    result = pipe._critique_logic(draft, _project())
+    assert result["verdict"] == "fail"
+    assert any(i.startswith("evidence:generic_opener:") for i in result["issues"])
+    assert "verified_evidence" in payloads[0]
+    assert any(i.startswith("evidence:") for i in payloads[0]["local_issues"])
+
+
+def test_critique_logic_passes_with_anchors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+    pipe._last_evidence = _evidence_bundle_for_pipeline()
+
+    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+        assert "verified_evidence" in user
+        assert not any(i.startswith("evidence:") for i in user["local_issues"])
+        return {
+            "verdict": "pass",
+            "issues": [],
+            "missing": [],
+            "style_notes": "ok",
+        }
+
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
+    result = pipe._critique_logic(_EVIDENCE_GOOD_DRAFT, _project())
+    assert result["verdict"] == "pass"
+
+
+def test_critique_unverified_inspect_forces_fail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+    pipe._last_evidence = _evidence_bundle_for_pipeline(gov_status="unavailable")
+
+    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+        return {
+            "verdict": "pass",
+            "issues": [],
+            "missing": [],
+            "style_notes": "ok",
+        }
+
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
+    draft = (
+        "Здравствуйте!\n"
+        "Лот 184729 и 1 250 000 ₽ — структура поиска без ЛК.\n"
+        "Я открыл torgi.gov.ru и сверил извещения.\n"
+        "Срок — 10 дней. Стоимость — от 30 000 ₽.\n"
+        "Если подход ок — напишите, согласуем старт."
+    )
+    result = pipe._critique_logic(draft, _project())
+    assert result["verdict"] == "fail"
+    assert any("unverified_inspect" in i for i in result["issues"])
+
+
+def test_expert_revises_when_evidence_usage_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+    pipe._last_evidence = _evidence_bundle_for_pipeline()
+
+    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+        assert "verified_evidence" in user
+        return {
+            "verdict": "pass",
+            "score": 9,
+            "feedback": "ok",
+            "must_fix": [],
+        }
+
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
+    draft = "Здравствуйте! Сделаю сайт аналогичный торги-россии."
+    expert = pipe._expert_review(draft, {"verdict": "pass"}, _project())
+    assert expert["verdict"] == "revise_draft"
+    assert any(i.startswith("evidence:") for i in expert["must_fix"])
+
+
+def test_draft_soft_retry_on_evidence_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+    pipe._last_evidence = _evidence_bundle_for_pipeline()
+    calls: list[dict] = []
+
+    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+        calls.append(user)
+        if len(calls) == 1:
+            return "Здравствуйте! Сделаю сайт под ваше ТЗ."
+        return _EVIDENCE_GOOD_DRAFT
+
+    monkeypatch.setattr(pipe, "_openai_text", fake_text)
+    out = pipe._draft(_project(), "ctx")
+    assert "184729" in out
+    assert len(calls) == 2
+    assert "verified_evidence" in calls[0]
+    assert "evidence_usage_issues" in (calls[1].get("feedback") or {})
 

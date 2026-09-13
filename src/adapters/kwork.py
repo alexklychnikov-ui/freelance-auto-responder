@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
 
+from src.adapters.kwork_attachments import enrich_description_with_attachments
 from src.adapters.kwork_delivery import (
     KWORK_DELIVERY_DAY_OPTIONS,
     snap_delivery_days,
@@ -3154,6 +3155,8 @@ class KworkAdapter:
                 full_description="",
                 tags=[],
             )
+
+        desc = enrich_description_with_attachments(self.browser, desc)
 
         return ProjectFull(
             platform=self.platform_id,

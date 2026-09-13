@@ -5,6 +5,8 @@ import re
 from src.models import ProjectFull
 
 MIN_OFFER_PRICE_RUB = 500
+DESIRED_GAP_RATIO = 1.2
+LISTED_PRICE_MIX = 0.15
 
 
 def apply_competitive_price(
@@ -45,6 +47,20 @@ def _budget_amounts(project: ProjectFull) -> list[int]:
     for raw in (project.desired_budget, project.max_budget):
         amounts.extend(_parse_amounts(raw))
     return [a for a in amounts if a >= MIN_OFFER_PRICE_RUB]
+
+
+def parse_desired_budget_rub(project: ProjectFull) -> int | None:
+    """Желаемый бюджет из desired_budget only (title digits ignored).
+
+    «до N» → N; otherwise min of amounts in that field (от N / single / range).
+    """
+    raw = (project.desired_budget or "").replace("\u00a0", " ")
+    amounts = [a for a in _parse_amounts(raw) if a >= MIN_OFFER_PRICE_RUB]
+    if not amounts:
+        return None
+    if re.search(r"\bдо\b", raw, flags=re.IGNORECASE):
+        return max(amounts)
+    return min(amounts)
 
 
 def parse_budget_ceiling_rub(project: ProjectFull) -> int | None:
@@ -148,6 +164,43 @@ def pick_commercial_price(market: int, offer: int) -> int:
     return m if m > 0 else max(0, o)
 
 
+def pick_listed_offer_price(
+    project: ProjectFull,
+    *,
+    fair: int = 0,
+    form_min: int | None = None,
+    form_max: int | None = None,
+) -> int:
+    """Price in the order corridor, near желаемый — never default to допустимый max."""
+    desired = parse_desired_budget_rub(project)
+    amounts = _budget_amounts(project)
+    hi = parse_budget_ceiling_rub(project)
+    lo = desired if desired is not None else (min(amounts) if amounts else None)
+    if lo is None and hi is None:
+        base = 8000
+    else:
+        if lo is None:
+            lo = hi
+        if hi is None:
+            hi = lo
+        if lo is None or hi is None:
+            base = 8000
+        else:
+            if lo > hi:
+                lo = hi
+            if fair > 0:
+                target_hi = min(int(fair), hi)
+            else:
+                target_hi = lo
+            if target_hi <= lo:
+                base = lo
+            else:
+                base = int(lo + (target_hi - lo) * LISTED_PRICE_MIX)
+    return clamp_price_to_budget(
+        int(base), project, form_min=form_min, form_max=form_max
+    )
+
+
 def budget_gap(
     fair_price: int,
     project: ProjectFull,
@@ -155,61 +208,75 @@ def budget_gap(
     multiplier: float = 1.0,
     form_max: int | None = None,
 ) -> dict | None:
-    """Soft gap when fair estimate exceeds listed budget ceiling.
+    """Soft gap when fair is materially above желаемый or above допустимый.
 
-    Returns None if no ceiling or fair_price is within ceiling * multiplier.
-    Prefer meaningful gap: fair > ceiling (multiplier default 1.0).
-
-    ``gap["ceiling"]`` / TG «потолок» = project допустимый (or desired «до X»).
-    ``form_max`` is a fallback ceiling only when project has no listed ceiling —
-    never override допустимый with a tighter form band from желаемый.
-    Form fill still clamps via ``clamp_price_to_budget(..., form_max=...)``.
+    ``gap["ceiling"]`` = customer-facing listed budget we stay in (desired
+    if present, else допустимый / form_max). ``gap["fill_price"]`` = listed
+    corridor price (near desired), not max ceiling. ``max_ceiling`` = допустимый.
+    ``form_max`` is a fallback ceiling only when project has no listed ceiling.
     """
+    desired = parse_desired_budget_rub(project)
     project_ceiling = parse_budget_ceiling_rub(project)
-    ceiling = project_ceiling
-    if ceiling is None and form_max is not None:
-        ceiling = int(form_max)
+    max_ceiling = project_ceiling
+    if max_ceiling is None and form_max is not None:
+        max_ceiling = int(form_max)
+    listed = desired if desired is not None else max_ceiling
     fair = int(fair_price or 0)
-    if ceiling is None or fair <= 0:
+    if listed is None or fair <= 0:
         return None
-    threshold = int(ceiling * float(multiplier))
-    if fair <= threshold:
+    above_desired = (
+        desired is not None and fair > int(desired * DESIRED_GAP_RATIO)
+    )
+    above_max = (
+        max_ceiling is not None
+        and fair > int(max_ceiling * float(multiplier))
+    )
+    if not above_desired and not above_max:
         return None
+    fill = pick_listed_offer_price(
+        project, fair=fair, form_max=form_max
+    )
     return {
-        "ceiling": ceiling,
+        "ceiling": int(listed),
         "fair_price": fair,
-        # fill_price for messaging = project ceiling; form may clamp lower separately
-        "fill_price": ceiling,
-        "ratio": round(fair / ceiling, 4),
+        "fill_price": int(fill),
+        "ratio": round(fair / listed, 4),
         "form_max": int(form_max) if form_max is not None else None,
-        "project_ceiling": int(project_ceiling) if project_ceiling is not None else None,
+        "project_ceiling": (
+            int(project_ceiling) if project_ceiling is not None else None
+        ),
+        "max_ceiling": int(max_ceiling) if max_ceiling is not None else None,
+        "desired": int(desired) if desired is not None else None,
     }
 
 
 def format_budget_mismatch_sentence(gap: dict) -> str:
     fair = format_rub_amount(int(gap["fair_price"]))
-    ceiling = format_rub_amount(int(gap["ceiling"]))
+    listed = int(gap.get("fill_price") or gap["ceiling"])
+    fill = format_rub_amount(listed)
     return (
-        f"По объёму работ ориентир — от {fair} ₽; "
-        f"указанный в заказе бюджет ({ceiling} ₽) для такого объёма выглядит заниженным. "
-        f"Предлагаю обсудить сумму под ваш результат."
+        f"В бюджете заказа ({fill} ₽) сделаю основной сценарий по ТЗ. "
+        f"Полный объём — ориентир от {fair} ₽, если захотите расширить."
     )
 
 
-_DISCUSS_PRICE_RE = re.compile(
-    r"обсудить\s+(?:сумм\w*|цен\w*|бюджет\w*|стоим\w*)|"
-    r"выглядит\s+занижен|"
-    r"бюджет[^\n.]{0,40}занижен",
+_SCOPE_NOTE_RE = re.compile(
+    r"основн\w+\s+сценари|"
+    r"полн\w+\s+объ[её]м|"
+    r"если\s+захотите\s+расширить|"
+    r"в\s+бюджет\w*\s+заказ",
     flags=re.IGNORECASE,
 )
 
+_ZANIZHEN_RE = re.compile(r"занижен", flags=re.IGNORECASE)
+
 
 def response_has_budget_discuss_note(text: str) -> bool:
-    return bool(_DISCUSS_PRICE_RE.search(text or ""))
+    return bool(_SCOPE_NOTE_RE.search(text or ""))
 
 
 def ensure_budget_mismatch_note(text: str, gap: dict | None) -> str:
-    """Append deterministic soft sentence if gap present and discuss CTA missing."""
+    """Append deterministic scope sentence if gap present and note missing."""
     if not gap:
         return text
     body = (text or "").rstrip()
@@ -222,36 +289,38 @@ def ensure_budget_mismatch_note(text: str, gap: dict | None) -> str:
 
 
 def budget_mismatch_issues(text: str, gap: dict | None) -> list[str]:
-    """Local checks when budget_mismatch is set: need fair price + discuss CTA."""
+    """Local checks: listed asking price + scope note; ban «занижен» / fair-only."""
     if not gap:
         return []
     issues: list[str] = []
     body = text or ""
     compact = re.sub(r"[\s\u00a0]+", "", body)
     fair = int(gap["fair_price"])
-    ceiling = int(gap["ceiling"])
+    fill = int(gap.get("fill_price") or gap["ceiling"])
     fair_compact = re.sub(r"\s+", "", format_rub_amount(fair))
-    ceiling_compact = re.sub(r"\s+", "", format_rub_amount(ceiling))
+    fill_compact = re.sub(r"\s+", "", format_rub_amount(fill))
+    has_fill = str(fill) in compact or fill_compact in compact
     has_fair = str(fair) in compact or fair_compact in compact
-    has_discuss = response_has_budget_discuss_note(body)
-    # «Стоимость — от {ceiling}» without fair looks like accepting tiny budget
-    echoes_ceiling_only = (
-        not has_fair
-        and ceiling_compact in compact
+    has_note = response_has_budget_discuss_note(body)
+    if _ZANIZHEN_RE.search(body):
+        issues.append("budget_mismatch:zanizhen_strategy")
+    if not has_note:
+        issues.append("budget_mismatch:no_scope_note")
+    asks_fair_only = (
+        has_fair
+        and not has_fill
         and bool(
             re.search(
-                rf"(?:стоим\w*|цен\w*|бюджет)\D{{0,20}}{re.escape(ceiling_compact)}",
+                rf"(?:стоим\w*|цен\w*|бюджет)\D{{0,20}}{re.escape(fair_compact)}",
                 compact,
                 flags=re.IGNORECASE,
             )
         )
     )
-    if echoes_ceiling_only and not has_discuss:
-        issues.append("budget_mismatch:ceiling_as_price_no_discuss")
-    elif not has_discuss:
-        issues.append("budget_mismatch:no_discuss_cta")
-    elif not has_fair:
-        issues.append("budget_mismatch:no_fair_price")
+    if asks_fair_only:
+        issues.append("budget_mismatch:fair_as_asking_price")
+    elif not has_fill:
+        issues.append("budget_mismatch:no_listed_price")
     return issues
 
 
@@ -261,15 +330,8 @@ def suggest_offer_price(
     form_min: int | None = None,
     form_max: int | None = None,
 ) -> str:
-    amounts = _budget_amounts(project)
-    if not amounts:
-        base = 8000
-    elif len(amounts) >= 2:
-        desired, maximum = min(amounts), max(amounts)
-        base = int(desired + (maximum - desired) * 0.6)
-    else:
-        base = amounts[0]
-    price = clamp_price_to_budget(
-        base, project, form_min=form_min, form_max=form_max
+    return str(
+        pick_listed_offer_price(
+            project, form_min=form_min, form_max=form_max
+        )
     )
-    return str(price)

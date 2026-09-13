@@ -8,7 +8,9 @@ from src.adapters.kwork_pricing import (
     ensure_budget_mismatch_note,
     format_budget_mismatch_sentence,
     parse_budget_ceiling_rub,
+    parse_desired_budget_rub,
     pick_commercial_price,
+    pick_listed_offer_price,
     suggest_offer_price,
 )
 from src.models import ProjectFull
@@ -40,8 +42,35 @@ def test_suggest_offer_price_with_range() -> None:
         max_budget="до 24 000 ₽",
     )
     price = int(suggest_offer_price(project))
-    assert 8000 <= price <= 24000
-    assert price != 5000
+    assert price == 8000
+    assert abs(price - 8000) < abs(price - 24000)
+    assert price <= 12_000
+
+
+def test_pick_listed_closer_to_desired_than_fair_or_max() -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3229782",
+        url="https://kwork.ru/projects/3229782",
+        title="Bot",
+        full_description="",
+        desired_budget="до 15 000 ₽",
+        max_budget="до 45 000 ₽",
+    )
+    listed = pick_listed_offer_price(project, fair=19_000)
+    assert 15_000 <= listed <= 18_000
+    assert abs(listed - 15_000) < abs(listed - 19_000)
+    assert abs(listed - 15_000) < abs(listed - 45_000)
+    assert listed != 19_000
+    assert listed != 45_000
+    listed_no_fair = pick_listed_offer_price(project)
+    assert listed_no_fair == 15_000
+    gap = budget_gap(20_000, project)
+    assert gap is not None
+    assert gap["ceiling"] == 15_000
+    assert 15_000 <= int(gap["fill_price"]) <= 18_000
+    assert int(gap["fill_price"]) != 45_000
 
 
 def test_suggest_offer_price_ignores_title_digits() -> None:
@@ -162,14 +191,20 @@ def test_parse_ceiling_prefers_dopustimy_over_desired() -> None:
         max_budget="до 45 000 ₽",
     )
     assert parse_budget_ceiling_rub(project) == 45_000
+    assert parse_desired_budget_rub(project) == 15_000
     gap = budget_gap(60_000, project, form_max=15_000)
     assert gap is not None
-    assert gap["ceiling"] == 45_000
-    assert gap["fill_price"] == 45_000
-    # Form still clamps to form_max; gap messaging keeps project ceiling
+    assert gap["ceiling"] == 15_000
+    assert gap["fill_price"] == 15_000
+    assert gap["max_ceiling"] == 45_000
+    # Form still clamps to form_max; gap messaging stays in listed/desired
     assert clamp_price_to_budget(60_000, project, form_max=15_000) == 15_000
-    # Fair within допустимый → no soft gap even if form_max tighter
-    assert budget_gap(20_000, project, form_max=15_000) is None
+    # 3229782: fair inside допустимый but above desired → gap, fill near 15k not 45k
+    gap_mid = budget_gap(20_000, project, form_max=15_000)
+    assert gap_mid is not None
+    assert gap_mid["ceiling"] == 15_000
+    assert gap_mid["fill_price"] == 15_000
+    assert gap_mid["fair_price"] == 20_000
 
 
 def test_budget_gap_uses_form_max_when_project_ceiling_missing() -> None:
@@ -189,11 +224,13 @@ def test_budget_gap_uses_form_max_when_project_ceiling_missing() -> None:
     assert gap["ceiling"] == 1500
     assert gap["fair_price"] == 25_000
     note = ensure_budget_mismatch_note("Срок — 7 дней. Стоимость — от 25 000 ₽.", gap)
-    assert "обсудить сумму" in note.lower()
+    assert "основной сценарий" in note.lower()
     assert "1 500" in note
+    assert "занижен" not in note.lower()
+    assert "обсудить сумму" not in note.lower()
 
 
-def test_format_budget_mismatch_sentence_has_discuss_cta() -> None:
+def test_format_budget_mismatch_sentence_has_scope_note() -> None:
     gap = {
         "ceiling": 1500,
         "fair_price": 20_000,
@@ -203,8 +240,9 @@ def test_format_budget_mismatch_sentence_has_discuss_cta() -> None:
     sentence = format_budget_mismatch_sentence(gap)
     assert "20 000" in sentence
     assert "1 500" in sentence
-    assert "обсудить сумму" in sentence.lower()
-    assert "занижен" in sentence.lower()
+    assert "основной сценарий" in sentence.lower()
+    assert "занижен" not in sentence.lower()
+    assert "обсудить сумму" not in sentence.lower()
 
 
 def test_ensure_budget_mismatch_note_appends_once() -> None:
@@ -214,15 +252,16 @@ def test_ensure_budget_mismatch_note_appends_once() -> None:
         "fill_price": 1500,
         "ratio": 13.3333,
     }
-    base = "Соберу бота. Срок — 5 дней. Стоимость — от 20 000 ₽."
+    base = "Соберу бота. Срок — 5 дней. Стоимость — от 1 500 ₽."
     out = ensure_budget_mismatch_note(base, gap)
-    assert "обсудить сумму" in out.lower()
-    assert out.count("выглядит заниженным") == 1
+    assert "основной сценарий" in out.lower()
+    assert out.count("основной сценарий") == 1
+    assert "занижен" not in out.lower()
     out2 = ensure_budget_mismatch_note(out, gap)
     assert out2 == out.rstrip()
 
 
-def test_budget_mismatch_issues_ceiling_echo() -> None:
+def test_budget_mismatch_issues_listed_not_fair_only() -> None:
     gap = {
         "ceiling": 1500,
         "fair_price": 20_000,
@@ -231,8 +270,15 @@ def test_budget_mismatch_issues_ceiling_echo() -> None:
     }
     bad = "Срок — 5 дней. Стоимость — от 1 500 ₽. Предлагаю обсудить детали."
     assert budget_mismatch_issues(bad, gap)
-    good = (
+    zanizhen = (
         "Стоимость — от 20 000 ₽. Указанный бюджет выглядит заниженным. "
         "Предлагаю обсудить сумму под ваш результат."
+    )
+    issues = budget_mismatch_issues(zanizhen, gap)
+    assert "budget_mismatch:zanizhen_strategy" in issues
+    good = (
+        "Стоимость — от 1 500 ₽. В бюджете заказа (1 500 ₽) сделаю "
+        "основной сценарий по ТЗ. Полный объём — ориентир от 20 000 ₽, "
+        "если захотите расширить."
     )
     assert not budget_mismatch_issues(good, gap)

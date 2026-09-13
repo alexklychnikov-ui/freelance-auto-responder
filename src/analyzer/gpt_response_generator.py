@@ -87,6 +87,7 @@ class GptResponseGenerator:
         price_hint: int | str | None = None,
         days_hint: int | None = None,
         budget_mismatch: dict[str, Any] | None = None,
+        evidence: Any | None = None,
     ) -> str:
         _ = platform_label  # reserved for multi-platform prompts
         return self._pipeline.generate(
@@ -98,6 +99,7 @@ class GptResponseGenerator:
             price_hint=price_hint,
             days_hint=days_hint,
             budget_mismatch=budget_mismatch,
+            evidence=evidence,
         )
 
     async def generate_with_progress(
@@ -112,6 +114,7 @@ class GptResponseGenerator:
         price_hint: int | str | None = None,
         days_hint: int | None = None,
         budget_mismatch: dict[str, Any] | None = None,
+        evidence: Any | None = None,
     ) -> str:
         _ = platform_label
         return await self._pipeline.generate_with_progress(
@@ -123,5 +126,6 @@ class GptResponseGenerator:
             price_hint=price_hint,
             days_hint=days_hint,
             budget_mismatch=budget_mismatch,
+            evidence=evidence,
             threaded=True,
         )
