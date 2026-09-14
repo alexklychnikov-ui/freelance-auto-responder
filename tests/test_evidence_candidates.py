@@ -103,6 +103,24 @@ def test_attachment_marker_parsing() -> None:
         "Техническое задание.pdf",
         "data.xlsx",
     ]
+    assert all(c.role == "documentation" for c in atts)
+
+
+def test_extract_inlined_attachment_body() -> None:
+    from src.evidence.discovery import extract_inlined_attachment
+
+    desc = (
+        "intro\n\n"
+        "--- Вложение: Техническое задание.pdf ---\n"
+        "тело PDF\nвторая строка\n\n"
+        "--- Вложение: data.xlsx ---\n"
+        "sheet row"
+    )
+    assert extract_inlined_attachment(desc, "Техническое задание.pdf") == (
+        "тело PDF\nвторая строка"
+    )
+    assert extract_inlined_attachment(desc, "data.xlsx") == "sheet row"
+    assert extract_inlined_attachment(desc, "missing.docx") is None
 
 
 def test_xlsx_multi_sheet_extract_smoke() -> None:

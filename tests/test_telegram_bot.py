@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from aiogram import Bot
@@ -243,6 +243,45 @@ def test_review_keyboard_without_url_has_no_open_button() -> None:
     assert kb.inline_keyboard[0][0].text == "✅ Откликнуть"
 
 
+def test_review_keyboard_ignores_internal_tz_url() -> None:
+    from datetime import datetime, timezone
+
+    from src.models import GptScoreResult, PendingOffer, ProjectFull
+    from src.telegram_bot.bot import build_review_keyboard
+
+    offer = PendingOffer(
+        platform="telegram",
+        source_key="tz_manual",
+        project_id="tz_123",
+        url="tz://tz_123",
+        title="ТЗ без публичной ссылки",
+        project=ProjectFull(
+            platform="telegram",
+            source_key="tz_manual",
+            project_id="tz_123",
+            url="tz://tz_123",
+            title="ТЗ без публичной ссылки",
+            full_description="desc " * 20,
+        ),
+        score=GptScoreResult(
+            score=8,
+            fit=True,
+            reason="ok",
+            matched_skills=[],
+            risks=[],
+            suggested_project_type="Telegram-бот",
+            competition_level="low",
+            recommendation="откликаться",
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+
+    kb = build_review_keyboard(offer)
+
+    assert len(kb.inline_keyboard) == 1
+    assert all(button.url is None for row in kb.inline_keyboard for button in row)
+
+
 def test_prepared_keyboard_has_confirm_and_regenerate() -> None:
     from datetime import datetime, timezone
 
@@ -251,6 +290,7 @@ def test_prepared_keyboard_has_confirm_and_regenerate() -> None:
         CALLBACK_CORRECT,
         CALLBACK_JOURNAL_CONFIRM,
         CALLBACK_REGENERATE,
+        CALLBACK_REJECT,
         build_journal_confirm_keyboard,
         build_manual_copy_keyboard,
     )
@@ -291,6 +331,8 @@ def test_prepared_keyboard_has_confirm_and_regenerate() -> None:
     corr_row = kb.inline_keyboard[1]
     assert corr_row[0].text == "✏️ Корректировка"
     assert CALLBACK_CORRECT in (corr_row[0].callback_data or "")
+    assert corr_row[1].text == "❌ Пропустить"
+    assert CALLBACK_REJECT in (corr_row[1].callback_data or "")
 
     mkb = build_manual_copy_keyboard(offer)
     assert any(
@@ -298,6 +340,90 @@ def test_prepared_keyboard_has_confirm_and_regenerate() -> None:
         for row in mkb.inline_keyboard
         for btn in row
     )
+    assert any(
+        btn.text == "❌ Пропустить" and CALLBACK_REJECT in (btn.callback_data or "")
+        for row in mkb.inline_keyboard
+        for btn in row
+    )
+
+
+def test_manual_copy_keyboard_ignores_internal_tz_url() -> None:
+    from datetime import datetime, timezone
+
+    from src.models import GptScoreResult, PendingOffer, ProjectFull
+    from src.telegram_bot.bot import build_manual_copy_keyboard
+
+    offer = PendingOffer(
+        platform="telegram",
+        source_key="tz_manual",
+        project_id="tz_123",
+        url="tz://tz_123",
+        title="test",
+        project=ProjectFull(
+            platform="telegram",
+            source_key="tz_manual",
+            project_id="tz_123",
+            url="tz://tz_123",
+            title="test",
+            full_description="desc",
+        ),
+        score=GptScoreResult(
+            score=8,
+            fit=True,
+            reason="ok",
+            matched_skills=[],
+            risks=[],
+            suggested_project_type="Telegram-бот",
+            competition_level="low",
+            recommendation="откликаться",
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+
+    kb = build_manual_copy_keyboard(offer)
+
+    assert len(kb.inline_keyboard) == 2
+    assert all(button.url is None for row in kb.inline_keyboard for button in row)
+
+
+def test_manual_copy_keyboard_keeps_https_open_button() -> None:
+    from datetime import datetime, timezone
+
+    from src.models import GptScoreResult, PendingOffer, ProjectFull
+    from src.telegram_bot.bot import build_manual_copy_keyboard
+
+    offer = PendingOffer(
+        platform="flru",
+        source_key="flru_manual",
+        project_id="5514790",
+        url="https://www.fl.ru/projects/5514790/test.html",
+        title="test",
+        project=ProjectFull(
+            platform="flru",
+            source_key="flru_manual",
+            project_id="5514790",
+            url="https://www.fl.ru/projects/5514790/test.html",
+            title="test",
+            full_description="desc",
+        ),
+        score=GptScoreResult(
+            score=8,
+            fit=True,
+            reason="ok",
+            matched_skills=[],
+            risks=[],
+            suggested_project_type="Telegram-бот",
+            competition_level="low",
+            recommendation="откликаться",
+        ),
+        created_at=datetime.now(timezone.utc),
+    )
+
+    kb = build_manual_copy_keyboard(offer)
+
+    assert len(kb.inline_keyboard) == 3
+    assert kb.inline_keyboard[-1][0].text == "👁 Открыть проект"
+    assert kb.inline_keyboard[-1][0].url == "https://www.fl.ru/projects/5514790/test.html"
 
 
 @pytest.mark.asyncio
@@ -344,4 +470,20 @@ async def test_start_clears_corr_awaiting() -> None:
     bot.bot.session.make_request = AsyncMock(return_value=True)
     await bot.dispatcher.feed_update(bot.bot, _make_update("/start"))
     assert "123" not in bot._corr_awaiting
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_mark_review_skipped_disables_html_parse() -> None:
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    callback = MagicMock()
+    callback.message = MagicMock()
+    callback.message.text = "📌 ТГ бот\n📊 Оценка GPT: 8/10 — Python & AI <bot>"
+    callback.message.caption = None
+    callback.message.edit_text = AsyncMock()
+    await bot.mark_review_skipped(callback)
+    kwargs = callback.message.edit_text.await_args.kwargs
+    assert kwargs["parse_mode"] is None
+    assert kwargs["reply_markup"] is None
+    assert "Пропущено" in callback.message.edit_text.await_args.args[0]
     await bot.close()

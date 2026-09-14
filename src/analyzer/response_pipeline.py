@@ -2,17 +2,19 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import re
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Generator
 from typing import Any
 
 import httpx
 
-from src.adapters.kwork_pricing import budget_mismatch_issues
+from src.adapters.kwork_pricing import budget_mismatch_issues, ensure_budget_mismatch_note
 from src.analyzer.gpt_scorer import _extract_json
+from src.analyzer.openai_compat import post_chat
 from src.analyzer.project_brief import (
     build_project_brief,
     buyer_checklist_issues,
@@ -39,9 +41,12 @@ ProgressFn = Callable[[str], None]
 MSG_DRAFT = "✍️ [1/3] Пишу продающий отклик…"
 MSG_LOGIC = "🧠 [2/3] Проверяю логику и полноту…"
 MSG_EXPERT = "🎓 [3/3] Экспертная рецензия…"
-MSG_REVISE = "🔄 Доработка после рецензии (цикл {n}/2)…"
+MSG_REVISE = "🔄 Доработка после рецензии (цикл {n}/{total})…"
 MSG_DONE = "✅ Отклик готов (прошёл ExpertReview)"
-MSG_LIMIT = "⚠️ Отклик сдан после лимита циклов"
+MSG_LIMIT = "⚠️ Сдан лучший вариант (циклов: {cycles}). Осталось: {issues}"
+
+LIMIT_ISSUES_SHOWN = 3
+LIMIT_ISSUES_MAX_CHARS = 120
 
 REVISE_SYSTEM_PROMPT = """\
 Ты правишь готовый отклик по инструкциям фрилансера. \
@@ -50,6 +55,9 @@ REVISE_SYSTEM_PROMPT = """\
 Не добавляй markdown. Верни ТОЛЬКО текст отклика."""
 
 MAX_REVISION_CYCLES = 2
+
+_STEP_NOTIFY = "notify"
+_STEP_CALL = "call"
 
 _PLATFORM_POLICIES: dict[str, dict[str, Any]] = {
     "kwork": {
@@ -279,7 +287,9 @@ DRAFT_SYSTEM_PROMPT = """\
 4. Экспертная рекомендация — ОДНА короткая, только если реально полезна. \
 Иначе пропусти. Не выдумывай ради шаблона.
 
-5. Срок — всегда, хотя бы ориентир: «Срок — 5–7 дней.» (days_hint / default_days).
+5. Срок — всегда, хотя бы ориентир: «Срок — 5–7 дней.» (days_hint / default_days). \
+Если days_hint задан — используй его (одно число или узкий диапазон ±1 день), \
+не раздувай срок из‑за объёма каталога.
 
 6. Стоимость — всегда: «от … ₽» или диапазон. ЗАПРЕЩЕНО: «по договорённости», \
 «обсудим стоимость» без цифры. (price_hint / бюджет проекта.) Цена = price_hint \
@@ -360,8 +370,8 @@ Fail: другое приветствие или нет «Здравствуйт
 НЕ парафраз ТЗ; НЕ «Понимаю, что…». \
 Fail если первый глагол «Соберу» (или снова «Соберу» при recent_openings с «Соберу»).
 3) Есть короткое «как решим» без пересказа ТЗ
-4) Срок есть; цена есть цифрой («от»/диапазон). Fail: «по договорённости», \
-«обсудим стоимость» без суммы
+4) Срок есть (ориентир days_hint); цена есть цифрой («от»/диапазон, ориентир \
+price_hint). Fail: «по договорённости», «обсудим стоимость» без суммы
 5) CTA есть. Fail: «Предлагаю обсудить детали и приступить» (+ «к работе»)
 6) Нет клише/био/перечня опыта; нет стопки стека без нужды; ≤1 уточняющий вопрос
 7) Нет нарушений Kwork (ссылки, созвоны, markdown-списки)
@@ -393,7 +403,7 @@ EXPERT_REVIEWER_PROMPT = """\
 Тест 10–15 секунд: заказчик думает \
 «Этот исполнитель уже знает, как решить мою задачу»? Если нет → revise_draft.
 
-Учитывай critique и соответствие ТЗ.
+Учитывай critique, соответствие tz_facts и явные ответы на buyer_questions.
 
 Авто-revise_draft (must_fix):
 - «Понимаю, что…» / парафраз ТЗ вместо результата
@@ -669,6 +679,38 @@ def _price_from_project(project: ProjectFull) -> str | None:
     return None
 
 
+def format_limit_message(cycles: int, issues: list[str]) -> str:
+    """MSG_LIMIT with the leftover issues, HTML-escaped for Telegram."""
+    joined = ", ".join(issues[:LIMIT_ISSUES_SHOWN])
+    if len(joined) > LIMIT_ISSUES_MAX_CHARS:
+        joined = joined[: LIMIT_ISSUES_MAX_CHARS - 1].rstrip(" ,") + "…"
+    return MSG_LIMIT.format(
+        cycles=cycles,
+        issues=html.escape(joined) if joined else "нет замечаний",
+    )
+
+
+def _issue_signature(*groups: list[str]) -> frozenset[str]:
+    return frozenset(
+        _normalize_match_text(str(item))
+        for group in groups
+        for item in group
+        if str(item).strip()
+    )
+
+
+def _pick_best_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Fewest local issues wins; then highest expert score; then the latest draft."""
+    return max(
+        enumerate(candidates),
+        key=lambda pair: (
+            -len(pair[1]["local_issues"]),
+            int(pair[1]["expert_score"] or 0),
+            pair[0],
+        ),
+    )[1]
+
+
 class ResponsePipeline:
     def __init__(
         self,
@@ -698,9 +740,10 @@ class ResponsePipeline:
         user: dict[str, Any],
         project_id: str,
         temperature: float = 0.75,
+        model: str | None = None,
     ) -> str:
         body = {
-            "model": self.settings.openai_model,
+            "model": model or self.settings.openai_model,
             "messages": [
                 {"role": "system", "content": system},
                 {
@@ -719,9 +762,10 @@ class ResponsePipeline:
         user: dict[str, Any],
         project_id: str,
         temperature: float = 0.2,
+        model: str | None = None,
     ) -> dict[str, Any]:
         body = {
-            "model": self.settings.openai_model,
+            "model": model or self.settings.openai_model,
             "messages": [
                 {"role": "system", "content": system},
                 {
@@ -748,7 +792,7 @@ class ResponsePipeline:
         client = self._get_client()
         response: httpx.Response | None = None
         for attempt in range(4):
-            response = client.post(url, headers=headers, json=body)
+            response = post_chat(client, url, headers=headers, body=body)
             if response.status_code == 429 and attempt < 3:
                 wait = 2 ** attempt
                 logger.warning(
@@ -806,6 +850,45 @@ class ResponsePipeline:
             payload["verified_evidence"] = verified
         return payload
 
+    def _local_issues(
+        self,
+        draft: str,
+        project: ProjectFull,
+        budget_mismatch: dict[str, Any] | None = None,
+    ) -> list[str]:
+        """Deterministic issues of a draft — single source for draft/critique/cycle."""
+        platform = _normalize_platform(project.platform)
+        issues: list[str] = []
+        if platform == "kwork":
+            issues += soft_banned_issues(draft)
+            issues += [f"kwork:{v}" for v in kwork_compliance_issues(draft)]
+        issues += list(buyer_checklist_issues(project, draft))
+        issues += list(payment_mismatch_issues(project, draft))
+        issues += budget_mismatch_issues(draft, budget_mismatch)
+        issues += evidence_usage_issues(draft, self._last_evidence)
+        return issues
+
+    def _repair_local_issues(
+        self,
+        draft: str,
+        project: ProjectFull,
+        budget_mismatch: dict[str, Any] | None = None,
+    ) -> tuple[str, list[str]]:
+        """Fix mechanically repairable issues before spending a revision cycle."""
+        issues = self._local_issues(draft, project, budget_mismatch)
+        if "budget_mismatch:no_scope_note" not in issues:
+            return draft, issues
+        repaired = finalize_response_text(
+            ensure_budget_mismatch_note(draft, budget_mismatch), project
+        )
+        if repaired == draft:
+            return draft, issues
+        logger.info(
+            "response_pipeline deterministic_repair project_id=%s applied=budget_scope_note",
+            project.project_id,
+        )
+        return repaired, self._local_issues(repaired, project, budget_mismatch)
+
     def _draft(
         self,
         project: ProjectFull,
@@ -817,6 +900,7 @@ class ResponsePipeline:
         days_hint: int | None = None,
         feedback: dict[str, Any] | str | None = None,
         budget_mismatch: dict[str, Any] | None = None,
+        model: str | None = None,
     ) -> str:
         platform = _normalize_platform(project.platform)
         prompts = _prompts_for_platform(platform)
@@ -830,23 +914,23 @@ class ResponsePipeline:
             feedback=feedback,
             budget_mismatch=budget_mismatch,
         )
-        logger.info("response_pipeline draft project_id=%s", project.project_id)
+        model = model or self.settings.model_for("draft")
+        logger.info(
+            "response_pipeline draft project_id=%s model=%s",
+            project.project_id,
+            model,
+        )
         text = self._openai_text(
             system=prompts["draft"],
             user=payload,
             project_id=project.project_id,
             temperature=0.82,
+            model=model,
         )
         text = finalize_response_text(text, project)
-        banned: list[str] = []
-        if platform == "kwork":
-            banned += soft_banned_issues(text)
-            banned += [f"kwork:{v}" for v in kwork_compliance_issues(text)]
-        banned += [
-            f"checklist:{v}" for v in buyer_checklist_issues(project, text)
-        ] + [f"tz:{v}" for v in payment_mismatch_issues(project, text)]
-        banned += budget_mismatch_issues(text, budget_mismatch)
-        evidence_issues = evidence_usage_issues(text, self._last_evidence)
+        local = self._local_issues(text, project, budget_mismatch)
+        evidence_issues = [i for i in local if i.startswith("evidence:")]
+        banned = [i for i in local if not i.startswith("evidence:")]
         if banned or evidence_issues:
             logger.info(
                 "response_pipeline draft soft_retry project_id=%s banned=%s evidence=%s",
@@ -886,6 +970,7 @@ class ResponsePipeline:
                 user=retry,
                 project_id=project.project_id,
                 temperature=0.9,
+                model=model,
             )
             text = finalize_response_text(text, project)
         return text
@@ -896,24 +981,25 @@ class ResponsePipeline:
         project: ProjectFull,
         *,
         budget_mismatch: dict[str, Any] | None = None,
+        recent_responses: Any = None,
+        price_hint: int | str | None = None,
+        days_hint: int | None = None,
     ) -> dict[str, Any]:
         buyer_questions = extract_buyer_questions(project)
         platform = _normalize_platform(project.platform)
         prompts = _prompts_for_platform(platform)
-        local_issues: list[str] = []
-        if platform == "kwork":
-            local_issues += soft_banned_issues(draft)
-            local_issues += [
-                f"kwork:{v}" for v in kwork_compliance_issues(draft)
-            ]
-        local_issues += budget_mismatch_issues(draft, budget_mismatch)
-        local_issues += evidence_usage_issues(draft, self._last_evidence)
+        local_issues = self._local_issues(draft, project, budget_mismatch)
         payload: dict[str, Any] = {
             "platform": platform,
             "platform_policy": _platform_policy(platform),
             "project_brief": build_project_brief(project),
             "buyer_name": _buyer_first_name(project.buyer),
             "buyer_questions": buyer_questions,
+            "recent_responses": recent_responses
+            if recent_responses is not None
+            else {"count": 0},
+            "price_hint": price_hint or _price_from_project(project),
+            "days_hint": days_hint or self.settings.default_offer_days,
             "response_text": draft,
             "local_issues": local_issues,
         }
@@ -922,11 +1008,18 @@ class ResponsePipeline:
         verified = compact_verified_evidence(self._last_evidence)
         if verified is not None:
             payload["verified_evidence"] = verified
+        model = self.settings.model_for("logic")
+        logger.info(
+            "response_pipeline logic project_id=%s model=%s",
+            project.project_id,
+            model,
+        )
         data = self._openai_json(
             system=prompts["logic"],
             user=payload,
             project_id=project.project_id,
             temperature=0.1,
+            model=model,
         )
         verdict = str(data.get("verdict") or "fail").lower().strip()
         if verdict not in {"pass", "fail"}:
@@ -963,6 +1056,7 @@ class ResponsePipeline:
         project: ProjectFull,
         *,
         budget_mismatch: dict[str, Any] | None = None,
+        recent_responses: Any = None,
     ) -> dict[str, Any]:
         platform = _normalize_platform(project.platform)
         prompts = _prompts_for_platform(platform)
@@ -971,6 +1065,11 @@ class ResponsePipeline:
             "platform_policy": _platform_policy(platform),
             "project_brief": build_project_brief(project),
             "buyer_name": _buyer_first_name(project.buyer),
+            "tz_facts": extract_tz_facts(project),
+            "buyer_questions": extract_buyer_questions(project),
+            "recent_responses": recent_responses
+            if recent_responses is not None
+            else {"count": 0},
             "response_text": draft,
             "critique": critique,
         }
@@ -979,10 +1078,17 @@ class ResponsePipeline:
         verified = compact_verified_evidence(self._last_evidence)
         if verified is not None:
             payload["verified_evidence"] = verified
+        model = self.settings.model_for("expert")
+        logger.info(
+            "response_pipeline expert project_id=%s model=%s",
+            project.project_id,
+            model,
+        )
         data = self._openai_json(
             system=prompts["expert"],
             user=payload,
             project_id=project.project_id,
+            model=model,
         )
         verdict = str(data.get("verdict") or "revise_draft").lower().strip()
         if verdict not in {"pass", "revise_draft", "revise_logic"}:
@@ -1028,6 +1134,7 @@ class ResponsePipeline:
             user=user,
             project_id=project.project_id,
             temperature=0.4,
+            model=self.settings.model_for("revise"),
         ).strip()
 
     def generate(
@@ -1099,6 +1206,164 @@ class ResponsePipeline:
         except Exception:
             logger.warning("response_pipeline TG notify failed", exc_info=True)
 
+    def _pipeline_steps(
+        self,
+        project: ProjectFull,
+        lightrag_context: str,
+        *,
+        examples: str = "",
+        recent_responses: Any = None,
+        price_hint: int | str | None = None,
+        days_hint: int | None = None,
+        budget_mismatch: dict[str, Any] | None = None,
+    ) -> Generator[tuple[str, Any], Any, str]:
+        """Single revision loop; drivers execute the yielded notify/call steps."""
+        draft_kwargs: dict[str, Any] = {
+            "examples": examples,
+            "recent_responses": recent_responses,
+            "price_hint": price_hint,
+            "days_hint": days_hint,
+            "budget_mismatch": budget_mismatch,
+        }
+        logic_kwargs: dict[str, Any] = {
+            "budget_mismatch": budget_mismatch,
+            "recent_responses": recent_responses,
+            "price_hint": price_hint,
+            "days_hint": days_hint,
+        }
+        expert_kwargs: dict[str, Any] = {
+            "budget_mismatch": budget_mismatch,
+            "recent_responses": recent_responses,
+        }
+        max_cycles = max(
+            1, int(getattr(self.settings, "response_max_cycles", MAX_REVISION_CYCLES))
+        )
+        max_seconds = float(getattr(self.settings, "response_max_seconds", 0.0) or 0.0)
+        stagnation_limit = max(
+            1, int(getattr(self.settings, "response_stagnation_limit", 2))
+        )
+        started = time.monotonic()
+
+        yield (_STEP_NOTIFY, MSG_DRAFT)
+        draft = yield (
+            _STEP_CALL,
+            (self._draft, (project, lightrag_context), draft_kwargs),
+        )
+        draft, local = self._repair_local_issues(draft, project, budget_mismatch)
+        candidates: list[dict[str, Any]] = [
+            {"text": draft, "local_issues": local, "expert_score": None}
+        ]
+
+        prev_signature: frozenset[str] | None = None
+        stagnation = 0
+        escalated = False
+        critique: dict[str, Any] = {"verdict": "fail"}
+        cycle = 0
+
+        while True:
+            cycle += 1
+            current = candidates[-1]
+            yield (_STEP_NOTIFY, MSG_LOGIC)
+            critique = yield (
+                _STEP_CALL,
+                (
+                    self._critique_logic,
+                    (current["text"], project),
+                    logic_kwargs,
+                ),
+            )
+            logic_pass = critique.get("verdict") == "pass"
+
+            expert: dict[str, Any] | None = None
+            if logic_pass:
+                yield (_STEP_NOTIFY, MSG_EXPERT)
+                expert = yield (
+                    _STEP_CALL,
+                    (
+                        self._expert_review,
+                        (current["text"], critique, project),
+                        expert_kwargs,
+                    ),
+                )
+                current["expert_score"] = int(expert.get("score") or 0)
+
+            logger.info(
+                "response_pipeline cycle project_id=%s n=%s logic=%s "
+                "expert_score=%s local_issues=%s",
+                project.project_id,
+                cycle,
+                critique.get("verdict"),
+                current["expert_score"],
+                current["local_issues"],
+            )
+
+            if expert is not None and expert.get("verdict") == "pass":
+                yield (_STEP_NOTIFY, MSG_DONE)
+                return finalize_response_text(current["text"], project)
+
+            signature = _issue_signature(
+                current["local_issues"],
+                list(critique.get("issues") or []),
+                list(critique.get("missing") or []),
+                list((expert or {}).get("must_fix") or []),
+            )
+            stagnation = stagnation + 1 if signature == prev_signature else 0
+            prev_signature = signature
+            stagnant = stagnation >= stagnation_limit
+            timed_out = max_seconds > 0 and time.monotonic() - started >= max_seconds
+
+            if stagnant:
+                logger.info(
+                    "response_pipeline stagnation project_id=%s cycle=%s "
+                    "issues=%s escalated=%s",
+                    project.project_id,
+                    cycle,
+                    sorted(signature),
+                    "false" if escalated else "true",
+                )
+            if cycle >= max_cycles or timed_out or (stagnant and escalated):
+                break
+
+            model: str | None = None
+            if stagnant:
+                escalated = True
+                model = self.settings.model_for("escalation")
+            feedback = (
+                {"role": "ExpertReviewer", **expert}
+                if expert is not None
+                else {"role": "LogicCritic", **critique}
+            )
+            yield (_STEP_NOTIFY, MSG_REVISE.format(n=cycle, total=max_cycles))
+            revised = yield (
+                _STEP_CALL,
+                (
+                    self._draft,
+                    (project, lightrag_context),
+                    {**draft_kwargs, "feedback": feedback, "model": model},
+                ),
+            )
+            revised, local = self._repair_local_issues(
+                revised, project, budget_mismatch
+            )
+            candidates.append(
+                {"text": revised, "local_issues": local, "expert_score": None}
+            )
+
+        best = _pick_best_candidate(candidates)
+        if best["expert_score"] is None:
+            yield (_STEP_NOTIFY, MSG_EXPERT)
+            final_expert = yield (
+                _STEP_CALL,
+                (
+                    self._expert_review,
+                    (best["text"], critique, project),
+                    expert_kwargs,
+                ),
+            )
+            best["expert_score"] = int(final_expert.get("score") or 0)
+        yield (_STEP_NOTIFY, format_limit_message(cycle, best["local_issues"]))
+        return finalize_response_text(best["text"], project)
+
     def _generate_sync(
         self,
         project: ProjectFull,
@@ -1113,12 +1378,7 @@ class ResponsePipeline:
         evidence: Any | None = None,
     ) -> str:
         self._last_evidence = evidence
-
-        def notify(msg: str) -> None:
-            self._safe_progress(progress, msg)
-
-        notify(MSG_DRAFT)
-        draft = self._draft(
+        steps = self._pipeline_steps(
             project,
             lightrag_context,
             examples=examples,
@@ -1127,55 +1387,18 @@ class ResponsePipeline:
             days_hint=days_hint,
             budget_mismatch=budget_mismatch,
         )
-        best = draft
-        best_score = 0
-
-        for cycle in range(1, MAX_REVISION_CYCLES + 1):
-            notify(MSG_LOGIC)
-            critique = self._critique_logic(
-                draft, project, budget_mismatch=budget_mismatch
-            )
-            if critique.get("verdict") != "pass":
-                notify(MSG_REVISE.format(n=cycle))
-                draft = self._draft(
-                    project,
-                    lightrag_context,
-                    examples=examples,
-                    recent_responses=recent_responses,
-                    price_hint=price_hint,
-                    days_hint=days_hint,
-                    budget_mismatch=budget_mismatch,
-                    feedback={"role": "LogicCritic", **critique},
-                )
-                continue
-
-            notify(MSG_EXPERT)
-            expert = self._expert_review(
-                draft, critique, project, budget_mismatch=budget_mismatch
-            )
-            score = int(expert.get("score") or 0)
-            if score >= best_score:
-                best_score = score
-                best = draft
-
-            if expert.get("verdict") == "pass":
-                notify(MSG_DONE)
-                return finalize_response_text(draft, project)
-
-            notify(MSG_REVISE.format(n=cycle))
-            draft = self._draft(
-                project,
-                lightrag_context,
-                examples=examples,
-                recent_responses=recent_responses,
-                price_hint=price_hint,
-                days_hint=days_hint,
-                budget_mismatch=budget_mismatch,
-                feedback={"role": "ExpertReviewer", **expert},
-            )
-
-        notify(MSG_LIMIT)
-        return finalize_response_text(best, project)
+        sent: Any = None
+        try:
+            while True:
+                kind, payload = steps.send(sent)
+                sent = None
+                if kind == _STEP_NOTIFY:
+                    self._safe_progress(progress, payload)
+                else:
+                    fn, args, kwargs = payload
+                    sent = fn(*args, **kwargs)
+        except StopIteration as stop:
+            return str(stop.value)
 
     async def generate_with_progress(
         self,
@@ -1198,9 +1421,7 @@ class ResponsePipeline:
                 return await asyncio.to_thread(fn, *args, **kwargs)
             return fn(*args, **kwargs)
 
-        await self._safe_notify(notify, MSG_DRAFT)
-        draft = await _call(
-            self._draft,
+        steps = self._pipeline_steps(
             project,
             lightrag_context,
             examples=examples,
@@ -1209,61 +1430,15 @@ class ResponsePipeline:
             days_hint=days_hint,
             budget_mismatch=budget_mismatch,
         )
-        best = draft
-        best_score = 0
-
-        for cycle in range(1, MAX_REVISION_CYCLES + 1):
-            await self._safe_notify(notify, MSG_LOGIC)
-            critique = await _call(
-                self._critique_logic,
-                draft,
-                project,
-                budget_mismatch=budget_mismatch,
-            )
-            if critique.get("verdict") != "pass":
-                await self._safe_notify(notify, MSG_REVISE.format(n=cycle))
-                draft = await _call(
-                    self._draft,
-                    project,
-                    lightrag_context,
-                    examples=examples,
-                    recent_responses=recent_responses,
-                    price_hint=price_hint,
-                    days_hint=days_hint,
-                    budget_mismatch=budget_mismatch,
-                    feedback={"role": "LogicCritic", **critique},
-                )
-                continue
-
-            await self._safe_notify(notify, MSG_EXPERT)
-            expert = await _call(
-                self._expert_review,
-                draft,
-                critique,
-                project,
-                budget_mismatch=budget_mismatch,
-            )
-            score = int(expert.get("score") or 0)
-            if score >= best_score:
-                best_score = score
-                best = draft
-
-            if expert.get("verdict") == "pass":
-                await self._safe_notify(notify, MSG_DONE)
-                return finalize_response_text(draft, project)
-
-            await self._safe_notify(notify, MSG_REVISE.format(n=cycle))
-            draft = await _call(
-                self._draft,
-                project,
-                lightrag_context,
-                examples=examples,
-                recent_responses=recent_responses,
-                price_hint=price_hint,
-                days_hint=days_hint,
-                budget_mismatch=budget_mismatch,
-                feedback={"role": "ExpertReviewer", **expert},
-            )
-
-        await self._safe_notify(notify, MSG_LIMIT)
-        return finalize_response_text(best, project)
+        sent: Any = None
+        try:
+            while True:
+                kind, payload = steps.send(sent)
+                sent = None
+                if kind == _STEP_NOTIFY:
+                    await self._safe_notify(notify, payload)
+                else:
+                    fn, args, kwargs = payload
+                    sent = await _call(fn, *args, **kwargs)
+        except StopIteration as stop:
+            return str(stop.value)

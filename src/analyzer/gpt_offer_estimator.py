@@ -14,6 +14,7 @@ from src.adapters.kwork_pricing import (
     suggest_offer_price,
 )
 from src.analyzer.gpt_scorer import _extract_json
+from src.analyzer.openai_compat import post_chat
 from src.config import Settings
 from src.models import OfferTerms, ProjectFull
 
@@ -29,7 +30,8 @@ SYSTEM_PROMPT = """\
 3) Предложи срок delivery_days (целое число дней) — только из списка Kwork: 1,2,3,4,5,6,7,10,14,21,30,60.
 
 Правила:
-- Цена из объёма работ, не константа. Учитывай desired/max бюджет заказчика.
+- Цена из объёма работ, не константа. Держись ближе к желаемому бюджету заказчика.
+- Не ставь по умолчанию допустимый максимум (max_budget / «допустимый»).
 - Если max бюджет указан — не превышай его.
 - Если бюджет не указан — оцени рынок по описанию (не занижай без причины).
 - Срок из плана: простые задачи 1-3 дня, средние 5-10, сложные 14-21.
@@ -121,7 +123,7 @@ class GptOfferEstimator:
             "lightrag_context": lightrag_context,
         }
         body = {
-            "model": self.settings.openai_model,
+            "model": self.settings.model_for("estimate"),
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {
@@ -144,7 +146,7 @@ class GptOfferEstimator:
             project.platform,
         )
         try:
-            response = self._get_client().post(url, headers=headers, json=body)
+            response = post_chat(self._get_client(), url, headers=headers, body=body)
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
             return _normalize_terms(
@@ -167,7 +169,7 @@ class GptOfferEstimator:
             "lightrag_context": lightrag_context,
         }
         body = {
-            "model": self.settings.openai_model,
+            "model": self.settings.model_for("estimate"),
             "messages": [
                 {"role": "system", "content": MARKET_COST_SYSTEM_PROMPT},
                 {
@@ -189,7 +191,7 @@ class GptOfferEstimator:
             project.platform,
         )
         try:
-            response = self._get_client().post(url, headers=headers, json=body)
+            response = post_chat(self._get_client(), url, headers=headers, body=body)
             response.raise_for_status()
             content = response.json()["choices"][0]["message"]["content"]
             raw = _extract_json(content)

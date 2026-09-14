@@ -138,7 +138,9 @@ def test_sync_journal_from_offers_updates_excel(tmp_path: Path) -> None:
             }
         ]
     )
-    result = sync_journal_from_kwork_offers(journal_path, offers=offers)
+    result = sync_journal_from_kwork_offers(
+        journal_path, offers=offers, update_existing=True
+    )
     assert result.error is None
     assert result.matched == 1
     assert result.updated == 1

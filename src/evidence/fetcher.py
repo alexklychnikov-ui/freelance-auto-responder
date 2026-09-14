@@ -36,6 +36,7 @@ class SourceContent:
     error_code: str | None
     method: Literal["http", "browser"] = "http"
     title: str | None = None
+    raw_text: str | None = None
 
 
 class _SSRFBackend(httpcore.SyncBackend):
@@ -99,6 +100,7 @@ def fetch_url(
     timeout: float = 60.0,
     max_bytes: int = MAX_FETCH_BYTES,
     client: httpx.Client | None = None,
+    keep_raw: bool = False,
 ) -> SourceContent:
     """Streaming GET with SSRF guards, redirect re-check, size/time limits."""
     current = url
@@ -213,6 +215,7 @@ def fetch_url(
                         error_code=None,
                         method="http",
                         title=doc.title,
+                        raw_text=raw if keep_raw else None,
                     )
             except PermissionError as exc:
                 code = str(exc) if str(exc) else "blocked_ip"

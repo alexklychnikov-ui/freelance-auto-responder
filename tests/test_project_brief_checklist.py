@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from src.analyzer.project_brief import (
     buyer_checklist_issues,
+    checklist_rule_for_question,
     extract_buyer_checklist,
     extract_buyer_questions,
     extract_tz_facts,
+    is_parsing_task,
+    is_site_recon_task,
 )
 from src.models import ProjectFull
 
@@ -213,3 +216,19 @@ def test_buyer_checklist_issues_yandex_347bc2fc_bad() -> None:
 def test_buyer_checklist_issues_yandex_347bc2fc_gold() -> None:
     assert buyer_checklist_issues(_yandex_347bc2fc(), _YANDEX_347BC2FC_GOLD) == []
     assert len(_YANDEX_347BC2FC_GOLD.strip()) <= 1000
+
+
+def test_checklist_rule_передач_before_входит() -> None:
+    assert (
+        checklist_rule_for_question("Что будет входить в итоговую передачу проекта")
+        == "передача"
+    )
+    assert checklist_rule_for_question("что входит в стоимость") == "входит"
+    assert checklist_rule_for_question("ориентировочную стоимость") == "стоимость"
+
+
+def test_site_recon_task_excludes_collect_applications() -> None:
+    assert is_parsing_task("Бот должен собирать заявки от клиентов")
+    assert not is_site_recon_task("Бот должен собирать заявки от клиентов")
+    assert is_site_recon_task("Нужно спарсить контент с сайта")
+    assert is_site_recon_task("Собрать данные каталога товаров в CSV")

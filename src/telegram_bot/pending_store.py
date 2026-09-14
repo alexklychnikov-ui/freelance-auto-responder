@@ -73,6 +73,12 @@ class PendingStore:
                 return offer
         return None
 
+    def find_by_telegram_message_id(self, message_id: int) -> PendingOffer | None:
+        for offer in self.list_all():
+            if offer.telegram_message_id == message_id:
+                return offer
+        return None
+
     def expire_stale(self, timeout_hours: int) -> list[PendingOffer]:
         now = datetime.now(timezone.utc)
         expired: list[PendingOffer] = []

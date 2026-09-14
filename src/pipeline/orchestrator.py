@@ -20,6 +20,11 @@ from src.adapters.kwork_pricing import (
     pick_listed_offer_price,
     price_exceeds_budget_ceiling,
 )
+from src.adapters.offer_scope import (
+    catalog_item_count_from_evidence,
+    listed_price_mix_for_scope,
+    suggest_delivery_days_for_scope,
+)
 from src.adapters.kwork import (
     KworkAdapter,
     OfferFormSnapshot,
@@ -890,9 +895,18 @@ class PipelineOrchestrator:
             logger.exception(
                 "fair_price_estimate_failed project_id=%s", offer.project_id
             )
-        gap = budget_gap(fair_price, offer.project) if fair_price > 0 else None
-        listed = pick_listed_offer_price(offer.project, fair=fair_price)
+        volume = catalog_item_count_from_evidence(evidence)
+        mix = listed_price_mix_for_scope(offer.project, volume=volume)
+        gap = (
+            budget_gap(fair_price, offer.project, mix=mix)
+            if fair_price > 0
+            else None
+        )
+        listed = pick_listed_offer_price(offer.project, fair=fair_price, mix=mix)
         price_hint: int | str | None = listed if listed > 0 else None
+        days_hint = suggest_delivery_days_for_scope(
+            offer.project, volume=volume
+        )
         gen = self.response_generator
         gen_with = getattr(gen, "generate_with_progress", None)
         if (
@@ -907,6 +921,7 @@ class PipelineOrchestrator:
                 examples=examples,
                 recent_responses=recent,
                 price_hint=price_hint,
+                days_hint=days_hint,
                 budget_mismatch=gap,
                 evidence=evidence,
             )
@@ -918,6 +933,7 @@ class PipelineOrchestrator:
                 examples=examples,
                 recent_responses=recent,
                 price_hint=price_hint,
+                days_hint=days_hint,
                 budget_mismatch=gap,
                 evidence=evidence,
             )
@@ -1205,16 +1221,41 @@ class PipelineOrchestrator:
             offer,
         )
 
+    def _scope_volume(self, offer: PendingOffer) -> int | None:
+        return catalog_item_count_from_evidence(getattr(offer, "evidence", None))
+
+    def _scoped_delivery_days(
+        self, offer: PendingOffer, terms_days: int
+    ) -> int:
+        scope_days = suggest_delivery_days_for_scope(
+            offer.project, volume=self._scope_volume(offer)
+        )
+        days = int(terms_days or 0)
+        if scope_days is not None:
+            days = int(scope_days)
+        tier = offer.acceptance_tier or resolve_acceptance_tier(
+            offer.project, offer.score, self.settings
+        )
+        if tier in ("quick_win", "experience_win"):
+            days = min(days, self.settings.quick_win_max_delivery_days)
+        return days
+
     def _resolve_listed_fill(
         self,
         project: ProjectFull,
         *,
         fair_price: int = 0,
         offer_price: int = 0,
+        volume: int | None = None,
     ) -> tuple[int, dict | None, int]:
         gap_fair = int(fair_price or 0) or int(offer_price or 0)
-        gap = budget_gap(gap_fair, project) if gap_fair > 0 else None
-        listed = pick_listed_offer_price(project, fair=int(fair_price or 0))
+        mix = listed_price_mix_for_scope(project, volume=volume)
+        gap = (
+            budget_gap(gap_fair, project, mix=mix) if gap_fair > 0 else None
+        )
+        listed = pick_listed_offer_price(
+            project, fair=int(fair_price or 0), mix=mix
+        )
         return listed, gap, gap_fair
 
     async def _send_manual_copy(
@@ -1269,17 +1310,14 @@ class PipelineOrchestrator:
                 platform,
             )
         offer_price = int(terms.price_rub or 0)
+        volume = self._scope_volume(offer)
         price_rub, gap, _gap_fair = self._resolve_listed_fill(
-            offer.project, fair_price=fair_price, offer_price=offer_price
+            offer.project,
+            fair_price=fair_price,
+            offer_price=offer_price,
+            volume=volume,
         )
-        delivery_days = terms.delivery_days
-        tier = offer.acceptance_tier or resolve_acceptance_tier(
-            offer.project, offer.score, self.settings
-        )
-        if tier in ("quick_win", "experience_win"):
-            delivery_days = min(
-                delivery_days, self.settings.quick_win_max_delivery_days
-            )
+        delivery_days = self._scoped_delivery_days(offer, terms.delivery_days)
 
         if not skip_checklist_enrich:
             response_text = append_missing_checklist_answers(
@@ -1348,18 +1386,15 @@ class PipelineOrchestrator:
                 "fair_price_estimate_failed project_id=%s", offer.project_id
             )
         offer_price = int(terms.price_rub or 0)
+        volume = self._scope_volume(offer)
         fill_price, gap, gap_fair = self._resolve_listed_fill(
-            offer.project, fair_price=fair_price, offer_price=offer_price
+            offer.project,
+            fair_price=fair_price,
+            offer_price=offer_price,
+            volume=volume,
         )
         price = str(fill_price)
-        delivery_days = terms.delivery_days
-        tier = offer.acceptance_tier or resolve_acceptance_tier(
-            offer.project, offer.score, self.settings
-        )
-        if tier in ("quick_win", "experience_win"):
-            delivery_days = min(
-                delivery_days, self.settings.quick_win_max_delivery_days
-            )
+        delivery_days = self._scoped_delivery_days(offer, terms.delivery_days)
         if not skip_checklist_enrich:
             response_text = append_missing_checklist_answers(
                 response_text,
@@ -1459,13 +1494,17 @@ class PipelineOrchestrator:
                                 offer.project_id,
                             )
                         offer_price = int(terms.price_rub or 0)
+                        volume = self._scope_volume(offer)
                         fill_price, gap, gap_fair = self._resolve_listed_fill(
                             offer.project,
                             fair_price=fair_price,
                             offer_price=offer_price,
+                            volume=volume,
                         )
                         price = str(fill_price)
-                        delivery_days = terms.delivery_days
+                        delivery_days = self._scoped_delivery_days(
+                            offer, terms.delivery_days
+                        )
                         if not skip_checklist_enrich:
                             response_text = append_missing_checklist_answers(
                                 response_text,

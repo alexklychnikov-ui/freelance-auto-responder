@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from src.analyzer.gpt_scorer import _extract_json
+from src.analyzer.openai_compat import post_chat
 from src.analyzer.project_brief import build_project_brief, extract_tz_facts
 from src.config import Settings
 from src.models import ProjectFull
@@ -105,7 +106,7 @@ class ResponseQaValidator:
             "response_text": response,
         }
         body = {
-            "model": self.settings.openai_model,
+            "model": self.settings.model_for("qa"),
             "messages": [
                 {"role": "system", "content": QA_SYSTEM_PROMPT},
                 {
@@ -122,7 +123,7 @@ class ResponseQaValidator:
             "Content-Type": "application/json",
         }
         try:
-            resp = self._get_client().post(url, headers=headers, json=body)
+            resp = post_chat(self._get_client(), url, headers=headers, body=body)
             resp.raise_for_status()
             data = _extract_json(resp.json()["choices"][0]["message"]["content"])
             gpt_issues = list(data.get("issues") or [])

@@ -96,6 +96,19 @@ def test_append_missing_checklist() -> None:
     assert "14 дн" in enriched
     assert "aiogram" in enriched.lower()
     assert "исходный код" in enriched.lower()
+    assert "в передачу входят" in enriched.lower()
+
+
+def test_append_missing_checklist_входит_not_передача() -> None:
+    from src.analyzer.response_text import append_missing_checklist_answers
+    from tests.test_project_brief_checklist import _yandex_347bc2fc
+
+    project = _yandex_347bc2fc()
+    base = "Сделаю учёт рабочего времени на Python."
+    enriched = append_missing_checklist_answers(base, project, price_rub=35000, delivery_days=14)
+    low = enriched.lower()
+    assert "в стоимость входит" in low
+    assert "в передачу входят" not in low
 
 
 def test_kwork_compliance_detects_call() -> None:
@@ -132,7 +145,14 @@ def test_banned_phrase_triggers_retry(monkeypatch) -> None:
     pipe: ResponsePipeline = gen._pipeline
     calls: list[str] = []
 
-    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
         calls.append(json.dumps(user, ensure_ascii=False))
         if len(calls) == 1:
             return "Добрый день! С удовольствием помогу с вашим проектом."
@@ -142,7 +162,14 @@ def test_banned_phrase_triggers_retry(monkeypatch) -> None:
             "Если подход ок — напишите, согласуем старт."
         )
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         if "ExpertReviewer" in system:
             return {
                 "verdict": "pass",

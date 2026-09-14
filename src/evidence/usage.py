@@ -41,13 +41,16 @@ def eligible_facts(bundle: EvidenceBundle | dict[str, Any] | None) -> list[Evide
     return [f for f in parsed.facts if f.eligible_for_response]
 
 
+_MIN_ANCHOR_LEN = 4
+
+
 def eligible_anchors(bundle: EvidenceBundle | dict[str, Any] | None) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for fact in eligible_facts(bundle):
         for anchor in fact.anchors:
-            key = anchor.casefold()
-            if not key or key in seen:
+            key = anchor.casefold().strip()
+            if len(key) < _MIN_ANCHOR_LEN or key in seen:
                 continue
             seen.add(key)
             out.append(anchor)

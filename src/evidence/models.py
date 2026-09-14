@@ -19,7 +19,7 @@ class EvidenceSource(BaseModel):
     input_ref: str
     final_url: str | None = None
     title: str | None = None
-    fetch_method: Literal["http", "browser", "attachment"] = "http"
+    fetch_method: Literal["http", "browser", "attachment", "offline"] = "http"
     status: Literal["verified", "partial", "unavailable", "rejected"] = "unavailable"
     http_status: int | None = None
     content_type: str | None = None

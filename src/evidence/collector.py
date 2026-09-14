@@ -7,10 +7,16 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Mapping
 
-from src.evidence.discovery import ResourceCandidate, discover
+from src.analyzer.project_brief import is_site_recon_task
+from src.evidence.discovery import (
+    ResourceCandidate,
+    discover,
+    extract_inlined_attachment,
+)
 from src.evidence.fetcher import SourceContent, fetch_url, fetch_with_browser
 from src.evidence.models import EvidenceBundle, EvidenceFact, EvidenceSource
 from src.evidence.normalize import normalize_content
+from src.evidence.recon import is_recon_target, run_site_recon
 from src.evidence.researcher import build_insights, extract_facts_from_text
 from src.models import ProjectFull
 
@@ -121,6 +127,7 @@ class EvidenceService:
         timeout: float = 60.0,
         use_browser_fallback: bool = False,
         client=None,
+        project_text: str | None = None,
     ) -> EvidenceSource:
         """Fetch one candidate into EvidenceSource. No LLM / extraction."""
         now = datetime.now(timezone.utc)
@@ -136,10 +143,24 @@ class EvidenceService:
         )
 
         if candidate.kind != "url":
+            inlined = extract_inlined_attachment(
+                project_text or "", candidate.input_ref
+            )
+            if inlined:
+                return base.model_copy(
+                    update={
+                        "status": "verified",
+                        "error_code": None,
+                        "fetch_method": "offline",
+                        "content_type": "text/plain",
+                        "content_hash": _content_hash(inlined),
+                        "retrieved_at": now,
+                    }
+                )
             return base.model_copy(
                 update={
-                    "status": "rejected",
-                    "error_code": "not_http_url",
+                    "status": "unavailable",
+                    "error_code": "attachment_not_inlined",
                     "fetch_method": "attachment",
                 }
             )
@@ -188,6 +209,7 @@ class EvidenceService:
         injected_texts: Mapping[str, str] | None = None,
         use_browser_fallback: bool = False,
         max_facts_per_source: int = 7,
+        recon_max_pages: int | None = None,
     ) -> EvidenceBundle:
         """Discover → fetch/inject → extract grounded facts → EvidenceBundle.
 
@@ -198,6 +220,7 @@ class EvidenceService:
         now = datetime.now(timezone.utc)
         resolved_max = max_urls
         resolved_timeout = timeout
+        resolved_recon = recon_max_pages
         if settings is not None:
             if resolved_max is None:
                 resolved_max = int(getattr(settings, "evidence_max_urls", 3))
@@ -205,10 +228,14 @@ class EvidenceService:
                 resolved_timeout = float(
                     getattr(settings, "evidence_timeout_seconds", 60.0)
                 )
+            if resolved_recon is None:
+                resolved_recon = int(getattr(settings, "evidence_recon_max_pages", 3))
         if resolved_max is None:
             resolved_max = 3
         if resolved_timeout is None:
             resolved_timeout = 60.0
+        if resolved_recon is None:
+            resolved_recon = 3
 
         candidates = self.collect_candidates(project, max_urls=resolved_max)
         required = bool(candidates)
@@ -231,6 +258,7 @@ class EvidenceService:
         facts: list[EvidenceFact] = []
         source_texts: dict[str, str] = {}
         warnings: list[str] = []
+        recon_targets: list[str] = []
 
         for candidate in candidates:
             sid = _source_id(candidate.input_ref)
@@ -246,15 +274,35 @@ class EvidenceService:
             )
 
             if candidate.kind != "url":
+                inlined = extract_inlined_attachment(
+                    project.full_description or "", candidate.input_ref
+                )
+                if not inlined:
+                    warnings.append(
+                        f"attachment not inlined: {candidate.input_ref}"
+                    )
+                    continue
                 sources.append(
                     base.model_copy(
                         update={
-                            "status": "rejected",
-                            "error_code": "not_http_url",
+                            "status": "verified",
+                            "error_code": None,
+                            "fetch_method": "offline",
+                            "content_type": "text/plain",
+                            "content_hash": _content_hash(inlined),
+                            "title": candidate.title_hint or candidate.input_ref,
                         }
                     )
                 )
-                warnings.append(f"attachment skipped: {candidate.input_ref}")
+                source_texts[sid] = inlined
+                facts.extend(
+                    extract_facts_from_text(
+                        sid,
+                        candidate.role,
+                        inlined,
+                        max_facts=max_facts_per_source,
+                    )
+                )
                 continue
 
             text: str | None = None
@@ -329,6 +377,10 @@ class EvidenceService:
                     warnings.append(
                         f"fetch failed {candidate.input_ref}: {content.error_code}"
                     )
+                elif candidate.role in ("data_source", "unknown"):
+                    target = content.final_url or candidate.input_ref
+                    if is_recon_target(target):
+                        recon_targets.append(target)
 
             if not text:
                 # Unavailable/rejected → no "inspected" facts for this site
@@ -350,6 +402,37 @@ class EvidenceService:
             facts,
             source_texts=source_texts,
         )
+
+        project_text = f"{project.title or ''}\n{project.full_description or ''}"
+        if (
+            fetch
+            and resolved_recon > 0
+            and recon_targets
+            and is_site_recon_task(project_text)
+        ):
+            try:
+                recon_timeout = min(float(resolved_timeout), 15.0)
+                recon = run_site_recon(
+                    recon_targets[0],
+                    timeout=recon_timeout,
+                    max_pages=resolved_recon,
+                    client=http_client,
+                )
+            except Exception:
+                logger.warning("evidence_recon_failed", exc_info=True)
+                warnings.append(f"recon failed {recon_targets[0]}")
+            else:
+                known_ids = {s.id for s in sources}
+                for src in recon.sources:
+                    if src.id in known_ids:
+                        continue
+                    known_ids.add(src.id)
+                    sources.append(src)
+                    source_texts[src.id] = recon.texts.get(src.id, "")
+                facts.extend(f for f in recon.facts if f.source_id in known_ids)
+                insights.extend(recon.insights)
+                warnings.extend(recon.warnings)
+
         status = _bundle_status(required=required, sources=sources)
         latency_ms = int((time.perf_counter() - t0) * 1000)
         status_counts = Counter(s.status for s in sources)

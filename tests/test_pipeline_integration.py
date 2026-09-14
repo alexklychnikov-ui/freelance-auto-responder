@@ -16,6 +16,16 @@ from src.store.repository import ProjectRepository
 
 @pytest.fixture
 def settings(tmp_path: Path) -> Settings:
+    sources = tmp_path / "sources.yaml"
+    sources.write_text(
+        "sources:\n"
+        "  - id: kwork_dev_it\n"
+        "    platform: kwork\n"
+        "    enabled: true\n"
+        "    url: https://kwork.ru/projects?c=11\n"
+        "    bootstrap: true\n",
+        encoding="utf-8",
+    )
     return Settings(
         openai_api_key="test-key",
         openai_base_url="https://api.example.com/openai/v1",
@@ -29,6 +39,9 @@ def settings(tmp_path: Path) -> Settings:
         max_daily_responses=5,
         kwork_inbox_mirror_enabled=False,
         kwork_inbox_seen_db=str(tmp_path / "kwork_inbox_seen.db"),
+        flru_inbox_mirror_enabled=False,
+        flru_inbox_seen_db=str(tmp_path / "flru_inbox_seen.db"),
+        sources_config_path=str(sources),
         _env_file=None,
     )
 
@@ -40,8 +53,10 @@ def project_full() -> ProjectFull:
         source_key="kwork_dev_it",
         project_id="999",
         url="https://kwork.ru/projects/999",
-        title="AI bot",
-        full_description="Need Python bot",
+        title="AI Telegram bot for inventory sync",
+        full_description=(
+            "Need a Python/aiogram bot that monitors channels and syncs deals to Sheets."
+        ),
         desired_budget="5000",
         offers_count=3,
     )

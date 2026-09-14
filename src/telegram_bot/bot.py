@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import logging
 from typing import Any
+from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -99,6 +100,15 @@ def _project_view_url(url: str) -> str:
     return f"{base}/view"
 
 
+def _public_button_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return url
+
+
 def _callback_data(action: str, platform: str, source_key: str, project_id: str) -> str:
     p = _CB_PLATFORM.get(platform, platform)
     s = _CB_SOURCE.get(source_key, source_key)
@@ -168,6 +178,7 @@ def format_review_card(offer: PendingOffer) -> str:
 
 def build_review_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
     p, s, pid = offer.platform, offer.source_key, offer.project_id
+    public_url = _public_button_url(offer.url)
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
@@ -180,12 +191,12 @@ def build_review_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
             ),
         ],
     ]
-    if offer.url:
+    if public_url:
         rows.append(
             [
                 InlineKeyboardButton(
                     text="👁 Открыть",
-                    url=offer.url,
+                    url=public_url,
                 ),
             ]
         )
@@ -210,6 +221,10 @@ def build_journal_confirm_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="✏️ Корректировка",
                     callback_data=_callback_data(CALLBACK_CORRECT, p, s, pid),
+                ),
+                InlineKeyboardButton(
+                    text="❌ Пропустить",
+                    callback_data=_callback_data(CALLBACK_REJECT, p, s, pid),
                 ),
             ],
         ]
@@ -239,6 +254,7 @@ def build_prepare_retry_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
 def build_manual_copy_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
     """Regenerate + journal confirm for manual-copy platforms."""
     p, s, pid = offer.platform, offer.source_key, offer.project_id
+    public_url = _public_button_url(offer.url)
     rows: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
@@ -255,9 +271,13 @@ def build_manual_copy_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
                 text="✏️ Корректировка",
                 callback_data=_callback_data(CALLBACK_CORRECT, p, s, pid),
             ),
+            InlineKeyboardButton(
+                text="❌ Пропустить",
+                callback_data=_callback_data(CALLBACK_REJECT, p, s, pid),
+            ),
         ],
     ]
-    if offer.url:
+    if public_url:
         open_label = (
             "👁 Открыть заказ"
             if offer.platform == "yandex_uslugi"
@@ -267,7 +287,7 @@ def build_manual_copy_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
             [
                 InlineKeyboardButton(
                     text=open_label,
-                    url=_project_view_url(offer.url),
+                    url=_project_view_url(public_url),
                 ),
             ]
         )
@@ -558,7 +578,8 @@ class TelegramReviewBot:
             "Открой ссылку <b>под тем же аккаунтом Kwork</b>, что на VPS.\n"
             "Проверь форму и нажми «Предложить» на Kwork.\n"
             "Затем <b>Подтвердить отклик</b> — запись в Excel.\n"
-            "Или <b>Перегенерировать</b> — новый текст + заполнение формы заново."
+            "Или <b>Перегенерировать</b> — новый текст + заполнение формы заново.\n"
+            "Или <b>Пропустить</b> — не откликаться."
         )
         if deadline_manual:
             text += "\n⚠️ Срок в форме — выбери вручную в dropdown"
@@ -654,7 +675,8 @@ class TelegramReviewBot:
             f"{link_line}"
             f"{hint} Лимит ~{soft_limit}/сутки.\n"
             "Затем <b>Подтвердить отклик</b> — запись в Excel.\n"
-            "Или <b>Перегенерировать</b> — новый текст."
+            "Или <b>Перегенерировать</b> — новый текст.\n"
+            "Или <b>Пропустить</b> — не откликаться."
         )
         msg = await self._bot.send_message(
             chat_id=self.chat_id,
@@ -715,8 +737,9 @@ class TelegramReviewBot:
             return
         base = callback.message.text or callback.message.caption or ""
         await callback.message.edit_text(
-            f"{base}\n\n📒 <b>Записано в журнал</b>",
+            f"{base}\n\n📒 Записано в журнал",
             reply_markup=None,
+            parse_mode=None,
             disable_web_page_preview=True,
         )
 
@@ -725,8 +748,9 @@ class TelegramReviewBot:
             return
         base = callback.message.text or callback.message.caption or ""
         await callback.message.edit_text(
-            f"{base}\n\n❌ <b>Пропущено</b>",
+            f"{base}\n\n❌ Пропущено",
             reply_markup=None,
+            parse_mode=None,
             disable_web_page_preview=True,
         )
 
@@ -735,8 +759,9 @@ class TelegramReviewBot:
             return
         base = callback.message.text or callback.message.caption or ""
         await callback.message.edit_text(
-            f"{base}\n\n✅ <b>Готовлю данные для отклика</b>",
+            f"{base}\n\n✅ Готовлю данные для отклика",
             reply_markup=None,
+            parse_mode=None,
             disable_web_page_preview=True,
         )
 

@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from src.analyzer.openai_compat import post_chat
 from src.config import Settings
 from src.models import GptScoreResult, ProjectFull
 
@@ -319,7 +320,7 @@ class GptScorer:
             "response_examples": examples,
         }
         body = {
-            "model": self.settings.openai_model,
+            "model": self.settings.model_for("score"),
             "messages": [
                 {"role": "system", "content": self._system_prompt},
                 {
@@ -344,7 +345,7 @@ class GptScorer:
         client = self._get_client()
         last_exc: Exception | None = None
         for attempt in range(4):
-            response = client.post(url, headers=headers, json=body)
+            response = post_chat(client, url, headers=headers, body=body)
             if response.status_code == 429 and attempt < 3:
                 wait = 2 ** attempt
                 logger.warning("gpt_score rate limited, retry in %ss", wait)

@@ -303,6 +303,23 @@ def extract_attachment_markers(text: str) -> list[str]:
     return names
 
 
+def extract_inlined_attachment(text: str, name: str) -> str | None:
+    """Return body under ``--- Вложение: {name} ---`` if already enriched into TZ."""
+    target = (name or "").strip().lower()
+    if not target or not text:
+        return None
+    matches = list(_ATTACHMENT_MARKER_RE.finditer(text))
+    for i, m in enumerate(matches):
+        marker_name = (m.group(1) or "").strip()
+        if marker_name.lower() != target:
+            continue
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        body = text[start:end].strip()
+        return body or None
+    return None
+
+
 def extract_url_candidates(
     text: str,
     *,
@@ -365,7 +382,7 @@ def discover(
         attachments.append(
             ResourceCandidate(
                 kind="attachment",
-                role="unknown",
+                role="documentation",
                 input_ref=name,
                 title_hint=name,
                 priority=50,

@@ -275,3 +275,47 @@ def test_golden_offline_3252339_collect_compact_usage() -> None:
     bad_issues = evidence_usage_issues(BAD_RESPONSE, bundle)
     assert bad_issues
     assert evidence_usage_issues(GOOD_RESPONSE, bundle) == []
+
+
+def test_short_numeric_anchors_do_not_satisfy_usage_gate() -> None:
+    bundle = EvidenceBundle(
+        status="complete",
+        required=True,
+        project_hash="x",
+        sources=[
+            EvidenceSource(
+                id="s1",
+                kind="url",
+                role="data_source",
+                input_ref="https://shop.example/",
+                fetch_method="http",
+                status="verified",
+            )
+        ],
+        facts=[
+            EvidenceFact(
+                id="f1",
+                source_id="s1",
+                claim="На карточке 2 вариантов",
+                quote="Длина 120 см",
+                anchors=["2", "0"],
+                verification="structured_value",
+                eligible_for_response=True,
+            ),
+            EvidenceFact(
+                id="f2",
+                source_id="s1",
+                claim="В sitemap 8 URL",
+                quote="https://shop.example/item.html",
+                anchors=["8 URL", "3 страниц"],
+                verification="structured_value",
+                eligible_for_response=True,
+            ),
+        ],
+    )
+    weak = "Срок 10 дней, стоимость 20 000 руб — сделаю парсер."
+    issues = evidence_usage_issues(weak, bundle)
+    assert "evidence:no_anchors_used" in issues or "evidence:insufficient_anchors" in issues
+
+    good = "В sitemap 8 URL и 3 страниц товаров — обойду по sitemap."
+    assert evidence_usage_issues(good, bundle) == []

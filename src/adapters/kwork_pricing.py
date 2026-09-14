@@ -170,8 +170,14 @@ def pick_listed_offer_price(
     fair: int = 0,
     form_min: int | None = None,
     form_max: int | None = None,
+    mix: float | None = None,
 ) -> int:
-    """Price in the order corridor, near желаемый — never default to допустимый max."""
+    """Price in the order corridor, near желаемый — never default to допустимый max.
+
+    ``mix`` (0..1) walks from желаемый toward min(fair, ceiling).
+    Default ``LISTED_PRICE_MIX``; large parse catalogs pass a higher mix.
+    """
+    price_mix = LISTED_PRICE_MIX if mix is None else max(0.0, min(1.0, float(mix)))
     desired = parse_desired_budget_rub(project)
     amounts = _budget_amounts(project)
     hi = parse_budget_ceiling_rub(project)
@@ -195,7 +201,7 @@ def pick_listed_offer_price(
             if target_hi <= lo:
                 base = lo
             else:
-                base = int(lo + (target_hi - lo) * LISTED_PRICE_MIX)
+                base = int(lo + (target_hi - lo) * price_mix)
     return clamp_price_to_budget(
         int(base), project, form_min=form_min, form_max=form_max
     )
@@ -207,6 +213,7 @@ def budget_gap(
     *,
     multiplier: float = 1.0,
     form_max: int | None = None,
+    mix: float | None = None,
 ) -> dict | None:
     """Soft gap when fair is materially above желаемый or above допустимый.
 
@@ -234,7 +241,7 @@ def budget_gap(
     if not above_desired and not above_max:
         return None
     fill = pick_listed_offer_price(
-        project, fair=fair, form_max=form_max
+        project, fair=fair, form_max=form_max, mix=mix
     )
     return {
         "ceiling": int(listed),
@@ -260,19 +267,42 @@ def format_budget_mismatch_sentence(gap: dict) -> str:
     )
 
 
-_SCOPE_NOTE_RE = re.compile(
-    r"основн\w+\s+сценари|"
-    r"полн\w+\s+объ[её]м|"
-    r"если\s+захотите\s+расширить|"
-    r"в\s+бюджет\w*\s+заказ",
-    flags=re.IGNORECASE,
+_SCOPE_NOTE_SIGNALS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "listed_budget",
+        re.compile(
+            r"в\s+бюджет\w*\s+заказ|"
+            r"бюджет\w*\s+заказа|"
+            r"в\s+указанн\w+\s+бюджет|"
+            r"в\s+рамках\s+бюджет|"
+            r"сумм\w*\s+заказа",
+            flags=re.IGNORECASE,
+        ),
+    ),
+    (
+        "main_scope",
+        re.compile(r"основн\w+\s+сценари|базов\w+\s+сценари|mvp", flags=re.IGNORECASE),
+    ),
+    (
+        "full_scope",
+        re.compile(
+            r"полн\w+\s+объ[её]м|"
+            r"ориентир\w*\s+от|"
+            r"если\s+захотите\s+расширить|"
+            r"расширени\w+\s+объ[её]ма",
+            flags=re.IGNORECASE,
+        ),
+    ),
 )
 
 _ZANIZHEN_RE = re.compile(r"занижен", flags=re.IGNORECASE)
 
 
 def response_has_budget_discuss_note(text: str) -> bool:
-    return bool(_SCOPE_NOTE_RE.search(text or ""))
+    """Scope note needs two independent signals, not a single stray phrase."""
+    body = text or ""
+    hits = sum(1 for _, pattern in _SCOPE_NOTE_SIGNALS if pattern.search(body))
+    return hits >= 2
 
 
 def ensure_budget_mismatch_note(text: str, gap: dict | None) -> str:

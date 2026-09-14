@@ -11,6 +11,7 @@ from src.adapters.kwork_pricing import (
     parse_desired_budget_rub,
     pick_commercial_price,
     pick_listed_offer_price,
+    response_has_budget_discuss_note,
     suggest_offer_price,
 )
 from src.models import ProjectFull
@@ -282,3 +283,20 @@ def test_budget_mismatch_issues_listed_not_fair_only() -> None:
         "если захотите расширить."
     )
     assert not budget_mismatch_issues(good, gap)
+
+
+def test_scope_note_needs_two_signals() -> None:
+    gap = {
+        "ceiling": 2300,
+        "fair_price": 45_000,
+        "fill_price": 2300,
+        "ratio": 19.5652,
+    }
+    single = "Стоимость — от 2 300 ₽, что включает основные сценарии парсинга."
+    assert response_has_budget_discuss_note(single) is False
+    assert "budget_mismatch:no_scope_note" in budget_mismatch_issues(single, gap)
+    full = format_budget_mismatch_sentence(gap)
+    assert response_has_budget_discuss_note(full) is True
+    repaired = ensure_budget_mismatch_note(single, gap)
+    assert response_has_budget_discuss_note(repaired) is True
+    assert "budget_mismatch:no_scope_note" not in budget_mismatch_issues(repaired, gap)

@@ -17,12 +17,12 @@ from src.analyzer.response_pipeline import (
     MSG_DONE,
     MSG_DRAFT,
     MSG_EXPERT,
-    MSG_LIMIT,
     MSG_LOGIC,
     MSG_REVISE,
     ResponsePipeline,
     draft_too_short_for_questions,
     force_logic_fail_for_questions,
+    format_limit_message,
     soft_banned_issues,
     _buyer_first_name,
 )
@@ -41,13 +41,14 @@ from src.evidence.models import (
 from src.models import ProjectFull
 
 
-def _settings() -> Settings:
+def _settings(**overrides: object) -> Settings:
     return Settings(
         openai_api_key="k",
         telegram_bot_token="t",
         telegram_chat_id="1",
         response_journal="j.xlsx",
         _env_file=None,
+        **overrides,
     )
 
 
@@ -139,12 +140,26 @@ def test_pipeline_happy_path_one_draft(monkeypatch: pytest.MonkeyPatch) -> None:
     texts: list[str] = []
     drafts = 0
 
-    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
         nonlocal drafts
         drafts += 1
         return SAMPLE_DRAFT
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         if "ExpertReviewer" in system:
             return {
                 "verdict": "pass",
@@ -176,12 +191,26 @@ def test_pipeline_critic_fail_then_pass(monkeypatch: pytest.MonkeyPatch) -> None
     drafts = 0
     logic_calls = 0
 
-    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
         nonlocal drafts
         drafts += 1
         return SAMPLE_DRAFT + f" v{drafts}"
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         nonlocal logic_calls
         if "ExpertReviewer" in system:
             return {
@@ -211,7 +240,7 @@ def test_pipeline_critic_fail_then_pass(monkeypatch: pytest.MonkeyPatch) -> None
     out = pipe.generate(_project(), "ctx", progress=msgs.append)
     assert drafts == 2
     assert "v2" in out
-    assert any("цикл 1/2" in m for m in msgs)
+    assert MSG_REVISE.format(n=1, total=4) in msgs
 
 
 def test_pipeline_expert_revise_then_pass(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -219,12 +248,26 @@ def test_pipeline_expert_revise_then_pass(monkeypatch: pytest.MonkeyPatch) -> No
     drafts = 0
     expert_calls = 0
 
-    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
         nonlocal drafts
         drafts += 1
         return SAMPLE_DRAFT + f" e{drafts}"
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         nonlocal expert_calls
         if "ExpertReviewer" in system:
             expert_calls += 1
@@ -260,12 +303,26 @@ def test_pipeline_max_cycles_returns_best(monkeypatch: pytest.MonkeyPatch) -> No
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
     drafts = 0
 
-    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
         nonlocal drafts
         drafts += 1
         return SAMPLE_DRAFT + f" lim{drafts}"
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         if "ExpertReviewer" in system:
             return {
                 "verdict": "revise_draft",
@@ -284,20 +341,34 @@ def test_pipeline_max_cycles_returns_best(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.setattr(pipe, "_openai_json", fake_json)
     msgs: list[str] = []
     out = pipe.generate(_project(), "ctx", progress=msgs.append)
-    # initial + 2 revision rewrites after expert
-    assert drafts == 3
-    assert MSG_LIMIT in msgs
-    assert "lim" in out
+    # initial + 3 revision rewrites after expert (response_max_cycles=4)
+    assert drafts == 4
+    assert any(m.startswith("⚠️ Сдан лучший вариант") for m in msgs)
+    assert "lim4" in out
 
 
 @pytest.mark.asyncio
 async def test_generate_with_progress_async(monkeypatch: pytest.MonkeyPatch) -> None:
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
 
-    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
         return SAMPLE_DRAFT
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         if "ExpertReviewer" in system:
             return {
                 "verdict": "pass",
@@ -333,13 +404,27 @@ def test_gpt_generator_banned_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     pipe = gen._pipeline
     drafts: list[str] = []
 
-    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
         drafts.append(json.dumps(user, ensure_ascii=False))
         if len(drafts) == 1 and not user.get("feedback"):
             return "Добрый день! С удовольствием помогу с вашим проектом."
         return SAMPLE_DRAFT
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         if "ExpertReviewer" in system:
             return {
                 "verdict": "pass",
@@ -413,7 +498,14 @@ def test_platform_policy_non_kwork_relaxed_requirements(monkeypatch: pytest.Monk
     draft = "Сделаю API-интеграцию. Срок 3 дня. Стоимость 1000."
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         assert user["platform"] == "default"
         assert user["platform_policy"]["policy_id"] == "default"
         assert user["local_issues"] == []
@@ -434,11 +526,25 @@ def test_platform_prompt_selection_kwork_and_default(monkeypatch: pytest.MonkeyP
     systems_text: list[str] = []
     systems_json: list[str] = []
 
-    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
         systems_text.append(system)
         return SAMPLE_DRAFT
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         systems_json.append(system)
         if "ExpertReviewer" in system or "финальный гейт" in system:
             return {
@@ -502,7 +608,14 @@ def test_critique_force_fail_short_draft_many_questions(
 
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         assert "buyer_questions" in user
         assert len(user["buyer_questions"]) >= 5
         assert temperature == 0.1
@@ -536,7 +649,14 @@ def test_critique_logic_passes_buyer_questions_colon_list(
     bad = "Сделаю бота. Срок 10 дней. Стоимость от 12 000 ₽."
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         assert len(user["buyer_questions"]) == 3
         return {
             "verdict": "pass",
@@ -569,7 +689,14 @@ def test_buyer_questions_uncovered_fail_deterministic(
     draft = "Здравствуйте! Могу начать сегодня. Работаю аккуратно и по этапам."
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         return {
             "verdict": "pass",
             "issues": [],
@@ -603,7 +730,14 @@ def test_buyer_questions_covered_no_extra_fail(monkeypatch: pytest.MonkeyPatch) 
     )
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         return {
             "verdict": "pass",
             "issues": [],
@@ -634,7 +768,14 @@ def test_buyer_question_single_shared_word_not_enough_for_long_question(
     draft = "Здравствуйте! Для интеграции подготовлю план этапов, срок 5 дней, стоимость 15000 рублей."
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         return {
             "verdict": "pass",
             "issues": [],
@@ -685,7 +826,14 @@ def test_yandex_347bc2fc_bad_fails_logic_even_if_critic_passes(
 
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         return {
             "verdict": "pass",
             "issues": [],
@@ -784,13 +932,27 @@ def test_pipeline_no_evidence_happy_path_one_draft(monkeypatch: pytest.MonkeyPat
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
     drafts = 0
 
-    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
         nonlocal drafts
         drafts += 1
         assert "verified_evidence" not in user
         return SAMPLE_DRAFT
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         if "ExpertReviewer" in system:
             return {
                 "verdict": "pass",
@@ -828,7 +990,14 @@ def test_critique_logic_fails_on_generic_evidence_opener(
     pipe._last_evidence = _evidence_bundle_for_pipeline()
     payloads: list[dict] = []
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         payloads.append(user)
         return {
             "verdict": "pass",
@@ -852,7 +1021,14 @@ def test_critique_logic_passes_with_anchors(
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
     pipe._last_evidence = _evidence_bundle_for_pipeline()
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         assert "verified_evidence" in user
         assert not any(i.startswith("evidence:") for i in user["local_issues"])
         return {
@@ -873,7 +1049,14 @@ def test_critique_unverified_inspect_forces_fail(
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
     pipe._last_evidence = _evidence_bundle_for_pipeline(gov_status="unavailable")
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         return {
             "verdict": "pass",
             "issues": [],
@@ -900,7 +1083,14 @@ def test_expert_revises_when_evidence_usage_fails(
     pipe = ResponsePipeline(_settings(), http_client=MagicMock())
     pipe._last_evidence = _evidence_bundle_for_pipeline()
 
-    def fake_json(*, system: str, user: dict, project_id: str, temperature: float = 0.2):
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
         assert "verified_evidence" in user
         return {
             "verdict": "pass",
@@ -923,7 +1113,14 @@ def test_draft_soft_retry_on_evidence_usage(
     pipe._last_evidence = _evidence_bundle_for_pipeline()
     calls: list[dict] = []
 
-    def fake_text(*, system: str, user: dict, project_id: str, temperature: float = 0.75):
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
         calls.append(user)
         if len(calls) == 1:
             return "Здравствуйте! Сделаю сайт под ваше ТЗ."
@@ -935,4 +1132,379 @@ def test_draft_soft_retry_on_evidence_usage(
     assert len(calls) == 2
     assert "verified_evidence" in calls[0]
     assert "evidence_usage_issues" in (calls[1].get("feedback") or {})
+
+
+_DRAFT_TWO_ISSUES = SAMPLE_DRAFT + "\n    Обращайтесь. Задача понятна. mark2"
+_DRAFT_ONE_ISSUE = SAMPLE_DRAFT + "\n    Обращайтесь. mark1"
+
+_BUDGET_GAP = {
+    "ceiling": 1500,
+    "fair_price": 20_000,
+    "fill_price": 1500,
+    "ratio": 13.3333,
+}
+
+
+def _text_by_generation(texts: list[str], models: list[str | None] | None = None):
+    """Fake _openai_text: one text per _draft call, soft retry reuses it."""
+    state = {"gen": 0}
+
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
+        if temperature != 0.9:
+            state["gen"] += 1
+            if models is not None:
+                models.append(model)
+        return texts[min(state["gen"], len(texts)) - 1]
+
+    return fake_text
+
+
+def _logic_fail_json(
+    *,
+    system: str,
+    user: dict,
+    project_id: str,
+    temperature: float = 0.2,
+    model: str | None = None,
+):
+    if "ExpertReviewer" in system:
+        return {
+            "verdict": "revise_draft",
+            "score": 6,
+            "feedback": "ещё",
+            "must_fix": ["fix"],
+        }
+    return {
+        "verdict": "fail",
+        "issues": ["no price"],
+        "missing": ["price"],
+        "style_notes": "",
+    }
+
+
+def test_logic_always_fails_returns_later_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = ResponsePipeline(
+        _settings(response_max_cycles=2, response_stagnation_limit=9),
+        http_client=MagicMock(),
+    )
+    monkeypatch.setattr(
+        pipe,
+        "_openai_text",
+        _text_by_generation([_DRAFT_TWO_ISSUES, _DRAFT_ONE_ISSUE]),
+    )
+    monkeypatch.setattr(pipe, "_openai_json", _logic_fail_json)
+    msgs: list[str] = []
+    out = pipe.generate(_project(), "ctx", progress=msgs.append)
+    assert "mark1" in out
+    assert "mark2" not in out
+    assert any(m.startswith("⚠️ Сдан лучший вариант") for m in msgs)
+
+
+def test_expert_review_runs_even_when_logic_always_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = ResponsePipeline(
+        _settings(response_max_cycles=2, response_stagnation_limit=9),
+        http_client=MagicMock(),
+    )
+    experts = 0
+
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
+        nonlocal experts
+        if "ExpertReviewer" in system:
+            experts += 1
+        return _logic_fail_json(
+            system=system,
+            user=user,
+            project_id=project_id,
+            temperature=temperature,
+            model=model,
+        )
+
+    monkeypatch.setattr(
+        pipe,
+        "_openai_text",
+        _text_by_generation([_DRAFT_TWO_ISSUES, _DRAFT_ONE_ISSUE]),
+    )
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
+    msgs: list[str] = []
+    pipe.generate(_project(), "ctx", progress=msgs.append)
+    assert experts >= 1
+    assert MSG_EXPERT in msgs
+
+
+def test_budget_scope_note_repaired_without_spending_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+    no_note = (
+        "Здравствуйте! Сделаю Telegram-бота под заявки менеджеру.\n"
+        "Срок — 5 дней. Стоимость — от 1 500 ₽.\n"
+        "Если подход ок — напишите, согласуем старт."
+    )
+    logic_calls = 0
+
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
+        nonlocal logic_calls
+        if "ExpertReviewer" in system:
+            return {"verdict": "pass", "score": 9, "feedback": "", "must_fix": []}
+        logic_calls += 1
+        assert not any(i.startswith("budget_mismatch:") for i in user["local_issues"])
+        return {
+            "verdict": "pass",
+            "issues": [],
+            "missing": [],
+            "style_notes": "",
+        }
+
+    monkeypatch.setattr(pipe, "_openai_text", _text_by_generation([no_note]))
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
+    msgs: list[str] = []
+    out = pipe.generate(
+        _project(), "ctx", budget_mismatch=_BUDGET_GAP, progress=msgs.append
+    )
+    assert "основной сценарий" in out.lower()
+    assert logic_calls == 1
+    assert not any(m.startswith("🔄") for m in msgs)
+    assert MSG_DONE in msgs
+
+
+def test_stagnation_escalates_once_then_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = ResponsePipeline(
+        _settings(
+            response_max_cycles=10,
+            response_stagnation_limit=2,
+            openai_model_escalation="gpt-escalate",
+        ),
+        http_client=MagicMock(),
+    )
+    models: list[str | None] = []
+    logic_calls = 0
+
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
+        nonlocal logic_calls
+        if "ExpertReviewer" in system:
+            return {
+                "verdict": "revise_draft",
+                "score": 5,
+                "feedback": "",
+                "must_fix": ["fix"],
+            }
+        logic_calls += 1
+        return {
+            "verdict": "fail",
+            "issues": ["no price"],
+            "missing": ["price"],
+            "style_notes": "",
+        }
+
+    monkeypatch.setattr(
+        pipe, "_openai_text", _text_by_generation([SAMPLE_DRAFT], models)
+    )
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
+    out = pipe.generate(_project(), "ctx")
+    assert out
+    assert models.count("gpt-escalate") == 1
+    assert logic_calls == 4
+
+
+def test_time_budget_exit_returns_best_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import src.analyzer.response_pipeline as rp
+
+    pipe = ResponsePipeline(
+        _settings(
+            response_max_cycles=10,
+            response_max_seconds=1.0,
+            response_stagnation_limit=9,
+        ),
+        http_client=MagicMock(),
+    )
+    ticks = iter([0.0, 0.5, 5.0])
+
+    def fake_monotonic() -> float:
+        try:
+            return next(ticks)
+        except StopIteration:
+            return 5.0
+
+    monkeypatch.setattr(rp.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(
+        pipe,
+        "_openai_text",
+        _text_by_generation([_DRAFT_TWO_ISSUES, _DRAFT_ONE_ISSUE]),
+    )
+    monkeypatch.setattr(pipe, "_openai_json", _logic_fail_json)
+    msgs: list[str] = []
+    out = pipe._generate_sync(_project(), "ctx", progress=msgs.append)
+    assert "mark1" in out
+    assert "mark2" not in out
+    assert any(m.startswith("⚠️ Сдан лучший вариант") for m in msgs)
+
+
+@pytest.mark.asyncio
+async def test_sync_and_async_paths_match(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _prepare() -> ResponsePipeline:
+        pipe = ResponsePipeline(
+            _settings(response_max_cycles=3, response_stagnation_limit=9),
+            http_client=MagicMock(),
+        )
+        monkeypatch.setattr(
+            pipe,
+            "_openai_text",
+            _text_by_generation([_DRAFT_TWO_ISSUES, _DRAFT_ONE_ISSUE, SAMPLE_DRAFT]),
+        )
+        monkeypatch.setattr(pipe, "_openai_json", _logic_fail_json)
+        return pipe
+
+    sync_msgs: list[str] = []
+    sync_out = _prepare()._generate_sync(
+        _project(), "ctx", progress=sync_msgs.append
+    )
+
+    async_msgs: list[str] = []
+
+    async def notify(msg: str) -> None:
+        async_msgs.append(msg)
+
+    async_out = await _prepare().generate_with_progress(
+        _project(), "ctx", notify=notify, threaded=False
+    )
+    assert sync_out == async_out
+    assert sync_msgs == async_msgs
+
+
+def _capture_step_payloads(
+    pipe: ResponsePipeline, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, dict]:
+    payloads: dict[str, dict] = {}
+
+    def fake_text(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.75,
+        model: str | None = None,
+    ):
+        payloads.setdefault("draft", user)
+        return SAMPLE_DRAFT
+
+    def fake_json(
+        *,
+        system: str,
+        user: dict,
+        project_id: str,
+        temperature: float = 0.2,
+        model: str | None = None,
+    ):
+        if system == EXPERT_REVIEWER_PROMPT:
+            payloads["expert"] = user
+            return {"verdict": "pass", "score": 9, "feedback": "", "must_fix": []}
+        payloads["logic"] = user
+        return {
+            "verdict": "pass",
+            "issues": [],
+            "missing": [],
+            "style_notes": "",
+        }
+
+    monkeypatch.setattr(pipe, "_openai_text", fake_text)
+    monkeypatch.setattr(pipe, "_openai_json", fake_json)
+    return payloads
+
+
+def test_review_steps_get_same_hints_and_history_as_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = ResponsePipeline(_settings(), http_client=MagicMock())
+    payloads = _capture_step_payloads(pipe, monkeypatch)
+    recent = {
+        "count": 2,
+        "recent_openings": ["Соберу бота", "Сделаю бота"],
+        "recent_closings": ["Предлагаю обсудить детали и приступить."],
+    }
+    out = pipe._generate_sync(
+        _project(),
+        "ctx",
+        recent_responses=recent,
+        price_hint=25_000,
+        days_hint=9,
+    )
+    assert out
+    draft, logic, expert = payloads["draft"], payloads["logic"], payloads["expert"]
+    assert logic["price_hint"] == draft["price_hint"] == 25_000
+    assert logic["days_hint"] == draft["days_hint"] == 9
+    assert logic["recent_responses"] == draft["recent_responses"] == recent
+    assert expert["recent_responses"] == recent
+    assert expert["buyer_questions"] == draft["buyer_questions"]
+    assert expert["tz_facts"] == draft["tz_facts"]
+
+
+@pytest.mark.asyncio
+async def test_review_steps_hints_fallback_to_project_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    pipe = ResponsePipeline(settings, http_client=MagicMock())
+    payloads = _capture_step_payloads(pipe, monkeypatch)
+
+    async def notify(msg: str) -> None:
+        return None
+
+    out = await pipe.generate_with_progress(
+        _project(), "ctx", notify=notify, threaded=False
+    )
+    assert out
+    draft, logic, expert = payloads["draft"], payloads["logic"], payloads["expert"]
+    assert logic["price_hint"] == draft["price_hint"] == "20000"
+    assert logic["days_hint"] == draft["days_hint"] == settings.default_offer_days
+    assert logic["recent_responses"] == {"count": 0}
+    assert expert["recent_responses"] == {"count": 0}
+    assert expert["tz_facts"] == draft["tz_facts"]
+
+
+def test_format_limit_message_lists_remaining_issues() -> None:
+    msg = format_limit_message(
+        4, ["budget_mismatch:no_scope_note", "evidence:insufficient_anchors"]
+    )
+    assert "циклов: 4" in msg
+    assert "budget_mismatch:no_scope_note" in msg
+    assert "evidence:insufficient_anchors" in msg
+    trimmed = format_limit_message(4, [f"issue_{i}" for i in range(10)])
+    assert "issue_3" not in trimmed
+    assert "нет замечаний" in format_limit_message(2, [])
 

@@ -57,6 +57,7 @@ def test_offer_estimator_fallback(tmp_path) -> None:
     )
     estimator = GptOfferEstimator(settings, http_client=MagicMock())
     terms = estimator.fallback(project, "Готов за 5 дней")
-    # suggest mid ≈17600 → *0.8 → 14100 (nearest 100)
-    assert terms.price_rub == 14100
+    # listed price stays at желаемый 8000 (never mid/допустимый);
+    # competitive 0.8 → 6400 is lifted back to the желаемый floor by the clamp
+    assert terms.price_rub == 8000
     assert terms.delivery_days == 5

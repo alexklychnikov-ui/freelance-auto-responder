@@ -9,6 +9,19 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+OPENAI_MODEL_ROLES = (
+    "draft",
+    "logic",
+    "expert",
+    "revise",
+    "score",
+    "evidence",
+    "escalation",
+    "estimate",
+    "qa",
+)
+
+
 class SourceConfig(BaseModel):
     id: str
     platform: str
@@ -31,6 +44,15 @@ class Settings(BaseSettings):
     openai_api_key: str
     openai_base_url: str = "https://api.proxyapi.ru/openai/v1"
     openai_model: str = "gpt-4o-mini"
+    openai_model_draft: str = ""
+    openai_model_logic: str = ""
+    openai_model_expert: str = ""
+    openai_model_revise: str = ""
+    openai_model_score: str = ""
+    openai_model_evidence: str = ""
+    openai_model_escalation: str = ""
+    openai_model_estimate: str = ""
+    openai_model_qa: str = ""
 
     telegram_bot_token: str
     telegram_chat_id: str
@@ -77,6 +99,9 @@ class Settings(BaseSettings):
     dry_run_submit: bool = False
     prepare_only_no_submit: bool = True
     default_offer_days: int = 14
+    response_max_cycles: int = 4
+    response_max_seconds: float = 240.0
+    response_stagnation_limit: int = 2
     prepared_responses_dir: str = "data/prepared_responses"
     pending_timeout_hours: int = 24
     operator_timezone: str = "Asia/Irkutsk"
@@ -84,6 +109,7 @@ class Settings(BaseSettings):
     evidence_research_enabled: bool = False
     evidence_max_urls: int = 3
     evidence_timeout_seconds: float = 60.0
+    evidence_recon_max_pages: int = 3
 
 
     kwork_login: str | None = None
@@ -116,10 +142,19 @@ class Settings(BaseSettings):
             data["openai_model"] = data["openai_model"].strip()
         return data
 
-    @field_validator("openai_model")
+    @field_validator(
+        "openai_model",
+        *[f"openai_model_{role}" for role in OPENAI_MODEL_ROLES],
+    )
     @classmethod
     def _strip_model(cls, v: str) -> str:
         return v.strip()
+
+    def model_for(self, role: str) -> str:
+        key = role.strip().lower()
+        if key not in OPENAI_MODEL_ROLES:
+            return self.openai_model
+        return getattr(self, f"openai_model_{key}").strip() or self.openai_model
 
     def kwork_credentials(self) -> tuple[str, str] | None:
         login = (self.kwork_login or "").strip()

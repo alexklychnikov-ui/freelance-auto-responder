@@ -267,6 +267,11 @@ def append_missing_checklist_answers(
             "В передачу входят исходный код, база данных, инструкция по запуску "
             "и проверка основных сценариев."
         )
+    if "checklist:входит" in missing:
+        extras.append(
+            "В стоимость входит основной функционал по ТЗ, установка/запуск "
+            "и инструкция по проверке основных сценариев."
+        )
     if not extras:
         return text
     indented = "\n".join(_with_red_line(x) for x in extras)

@@ -191,10 +191,12 @@ class ReviewService:
         callback: CallbackQuery,
     ) -> None:
         offer = self.store.load(platform, source_key, project_id)
+        if offer is None and callback.message is not None:
+            offer = self.store.find_by_telegram_message_id(callback.message.message_id)
         if offer is None:
             await callback.answer("Заявка не найдена", show_alert=True)
             return
-        if offer.status != "pending":
+        if offer.status not in ("pending", "approved", "prepared"):
             await callback.answer(f"Уже обработано: {offer.status}", show_alert=True)
             return
         chat_id = str(self.settings.telegram_chat_id)
@@ -202,17 +204,24 @@ class ReviewService:
             await callback.answer("Недоступно", show_alert=True)
             return
 
+        await callback.answer("Пропущено")
         offer.status = "rejected"
         self.store.save(offer)
-        self.repository.update_status(platform, source_key, project_id, "rejected")
-        await self.tg_bot.mark_review_skipped(callback)
-        await callback.answer("Пропущено")
+        self.repository.update_status(
+            offer.platform, offer.source_key, offer.project_id, "rejected"
+        )
+        try:
+            await self.tg_bot.mark_review_skipped(callback)
+        except Exception:
+            logger.exception(
+                "mark_review_skipped_failed project_id=%s", offer.project_id
+            )
         await self.tg_bot.notify(f"❌ Пропущен: {offer.title}")
         logger.info(
             "review_rejected platform=%s source=%s project_id=%s",
-            platform,
-            source_key,
-            project_id,
+            offer.platform,
+            offer.source_key,
+            offer.project_id,
         )
 
     async def _handle_response_text(self, message: Message) -> None:

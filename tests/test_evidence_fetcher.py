@@ -221,7 +221,7 @@ def test_evidence_service_fetch_rejects_ssrf() -> None:
     assert src.error_code == "blocked_ip"
 
 
-def test_evidence_service_attachment_rejected() -> None:
+def test_evidence_service_attachment_without_inline_unavailable() -> None:
     svc = EvidenceService()
     cand = ResourceCandidate(
         kind="attachment",
@@ -229,8 +229,54 @@ def test_evidence_service_attachment_rejected() -> None:
         input_ref="tz.pdf",
     )
     src = svc.fetch_candidate(cand)
-    assert src.status == "rejected"
-    assert src.error_code == "not_http_url"
+    assert src.status == "unavailable"
+    assert src.error_code == "attachment_not_inlined"
+
+
+def test_evidence_service_attachment_from_inline_verified() -> None:
+    svc = EvidenceService()
+    cand = ResourceCandidate(
+        kind="attachment",
+        role="documentation",
+        input_ref="ТЕХНИЧЕСКОЕ ЗАДАНИЕ для парсинга.docx",
+    )
+    text = (
+        "Нужен парсер.\n\n"
+        "--- Вложение: ТЕХНИЧЕСКОЕ ЗАДАНИЕ для парсинга.docx ---\n"
+        "Формат вывода: xml, csv. Артикул 04229. Несколько цен на карточке.\n"
+    )
+    src = svc.fetch_candidate(cand, project_text=text)
+    assert src.status == "verified"
+    assert src.error_code is None
+    assert src.fetch_method == "offline"
+    assert src.content_hash
+
+
+def test_collect_uses_inlined_attachment_without_not_http_url() -> None:
+    from src.models import ProjectFull
+
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3252551",
+        url="https://kwork.ru/projects/3252551",
+        title="Спарсить контент с сайта",
+        full_description=(
+            "Парсер для https://example-shop.test/\n\n"
+            "--- Вложение: ТЕХНИЧЕСКОЕ ЗАДАНИЕ для парсинга.docx ---\n"
+            "Формат: xml/csv. Артикул. Несколько цен на товар.\n"
+        ),
+    )
+    bundle = EvidenceService().collect(project, fetch=False, max_urls=1)
+    assert all(s.error_code != "not_http_url" for s in bundle.sources)
+    att = [s for s in bundle.sources if s.kind == "attachment"]
+    assert len(att) == 1
+    assert att[0].status == "verified"
+    assert att[0].fetch_method == "offline"
+    assert "attachment skipped" not in " ".join(bundle.warnings)
+    assert "not_http_url" not in " ".join(
+        s.error_code or "" for s in bundle.sources
+    )
 
 
 def test_source_content_dataclass() -> None:

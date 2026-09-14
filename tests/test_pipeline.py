@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from src.adapters.yandex_uslugi import YandexSubmittedOffer
 from src.config import Settings
 from src.models import GptScoreResult, OfferTerms, PendingOffer, ProjectFull, ProjectPreview
 from src.pipeline.orchestrator import PipelineOrchestrator
@@ -26,6 +27,8 @@ def settings(tmp_path: Path) -> Settings:
         min_gpt_score=7,
         kwork_inbox_mirror_enabled=False,
         kwork_inbox_seen_db=str(tmp_path / "kwork_inbox_seen.db"),
+        flru_inbox_mirror_enabled=False,
+        flru_inbox_seen_db=str(tmp_path / "flru_inbox_seen.db"),
         _env_file=None,
     )
 
@@ -793,6 +796,9 @@ async def test_journal_confirm_skips_kwork_snapshot_for_non_kwork(
     orch.review_service.tg_bot.notify = AsyncMock()
     orch._fetch_submitted_offer_text = MagicMock(
         side_effect=AssertionError("kwork snapshot must not run for yandex")
+    )
+    orch._fetch_yandex_submitted_offer = MagicMock(
+        return_value=YandexSubmittedOffer(ok=False, error="not_available")
     )
 
     await orch.handle_journal_confirm(

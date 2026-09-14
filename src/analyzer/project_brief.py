@@ -13,6 +13,11 @@ _PARSE_TASK_RE = re.compile(
     r"(парс\w*|скрап\w*|собира\w+|выгруж\w+|мониторинг\s+цен|парсер)",
     re.IGNORECASE,
 )
+_SITE_RECON_TASK_RE = re.compile(
+    r"(парс\w*|скрап\w*|выгруж\w*|парсер|"
+    r"(?:собира\w+|собр\w+)\s+(?:данн|товар|каталог|цен|контент|таблиц))",
+    re.IGNORECASE,
+)
 _BOT_TASK_RE = re.compile(r"telegram[- ]?бот|бот на python|aiogram|телеграм[- ]?бот", re.I)
 _TARGET_RE = re.compile(
     r"(ссылк\w*|публикац\w*|пост\w*|цен\w*|контакт\w*|email|телефон)",
@@ -110,6 +115,8 @@ def checklist_rule_for_question(item: str) -> ChecklistRule | None:
     low = (item or "").lower()
     if _POST_LAUNCH_ITEM_RE.search(low):
         return "расходы"
+    if re.search(r"передач|итог", low):
+        return "передача"
     if "входит" in low:
         return "входит"
     if re.search(r"стоимост|цен[аеу]", low):
@@ -120,8 +127,6 @@ def checklist_rule_for_question(item: str) -> ChecklistRule | None:
         return "стек"
     if "код" in low:
         return "код"
-    if re.search(r"передач|итог", low):
-        return "передача"
     return None
 
 
@@ -208,6 +213,16 @@ def buyer_checklist_issues(project: ProjectFull, response: str) -> list[str]:
             _exhaustive: Never = rule
             raise ValueError(_exhaustive)
     return issues
+
+
+def is_parsing_task(text: str) -> bool:
+    """True when the TZ text describes parsing/scraping/data collection."""
+    return bool(_PARSE_TASK_RE.search(text or ""))
+
+
+def is_site_recon_task(text: str) -> bool:
+    """Narrower gate for website recon: parse/scrape, not «собирать заявки»."""
+    return bool(_SITE_RECON_TASK_RE.search(text or ""))
 
 
 def extract_tz_facts(project: ProjectFull) -> list[str]:
