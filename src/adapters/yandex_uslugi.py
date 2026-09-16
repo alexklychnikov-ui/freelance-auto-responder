@@ -85,37 +85,93 @@ ORDER_EXTRACTOR_JS = """
     norm(document.querySelector('[class*="title"], [class*="Title"]')?.textContent) ||
     norm(document.title).replace(/\\s*[|·—-].*$/, '');
 
+  const h1 = document.querySelector('h1');
+  const root =
+    document.querySelector('main, [role="main"], article') ||
+    h1?.closest('section, article, [class*="order"], [class*="Order"]') ||
+    h1?.parentElement ||
+    document.body;
+
+  const inNoise = (el) =>
+    !!el?.closest(
+      'aside, [class*="sidebar"], [class*="Sidebar"], [class*="otherOrder"], [class*="OtherOrder"], [class*="other-order"], [class*="recommend"], [class*="Recommend"], [class*="similar"], [class*="Similar"]'
+    );
+
   const descCandidates = [
-    ...document.querySelectorAll(
+    ...root.querySelectorAll(
       '[class*="description"], [class*="Description"], [class*="text"], article, main p'
     ),
-  ];
+  ].filter((el) => !inNoise(el));
   let full_description = '';
   for (const el of descCandidates) {
     const t = norm(el.textContent);
     if (t.length > full_description.length) full_description = t;
   }
   if (full_description.length < 40) {
-    const main = document.querySelector('main, [role="main"], article') || document.body;
-    full_description = norm(main?.innerText || '').slice(0, 8000);
+    full_description = norm(root.innerText || '').slice(0, 8000);
   }
 
-  const moneyBits = [];
-  const moneyRe = /(\\d[\\d\\s\\u00a0]*)\\s*₽|₽\\s*(\\d[\\d\\s\\u00a0]*)|до\\s*(\\d[\\d\\s\\u00a0]*)/gi;
-  const bodyText = document.body?.innerText || '';
-  let mm;
-  while ((mm = moneyRe.exec(bodyText)) && moneyBits.length < 6) {
-    moneyBits.push(norm(mm[0]));
+  const isNegotiable = (t) =>
+    /по\\s+договор[её]нност|договор[её]нност\\w*/i.test(t || '');
+  const moneyRe =
+    /(?:до\\s*)?\\d[\\d\\s\\u00a0]*\\s*₽|₽\\s*\\d[\\d\\s\\u00a0]*/i;
+  const charLimitNoise = (t) => /\\d[\\d\\s]*\\s*символ/i.test(t || '');
+
+  const pickBudgetTexts = () => {
+    const nodes = [
+      ...root.querySelectorAll(
+        '[class*="price"], [class*="Price"], [class*="budget"], [class*="Budget"], [class*="cost"], [class*="Cost"]'
+      ),
+    ].filter((el) => !inNoise(el));
+    const out = [];
+    for (const el of nodes) {
+      const t = norm(el.textContent);
+      if (!t || charLimitNoise(t)) continue;
+      out.push(t);
+    }
+    if (out.length) return out;
+    // Fallback: lines near «Стоимость» / «Бюджет» inside the order card only.
+    const lines = norm(root.innerText || '')
+      .split(/\\n+/)
+      .map(norm)
+      .filter(Boolean);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!/стоим(?:ость|ости)|бюджет|цен[аыуе]/i.test(line)) continue;
+      const chunk = [line, lines[i + 1] || ''].join(' ');
+      if (charLimitNoise(chunk)) continue;
+      out.push(chunk);
+      if (out.length >= 2) break;
+    }
+    return out;
+  };
+
+  let desired_budget = null;
+  let max_budget = null;
+  const budgetTexts = pickBudgetTexts();
+  if (budgetTexts.some(isNegotiable) && !budgetTexts.some((t) => moneyRe.test(t))) {
+    desired_budget = null;
+    max_budget = null;
+  } else {
+    const moneyBits = [];
+    for (const t of budgetTexts) {
+      if (isNegotiable(t) && !moneyRe.test(t)) continue;
+      const m = t.match(moneyRe);
+      if (!m) continue;
+      const bit = norm(m[0]);
+      if (bit && !moneyBits.includes(bit)) moneyBits.push(bit);
+      if (moneyBits.length >= 2) break;
+    }
+    desired_budget = moneyBits[0] || null;
+    max_budget = moneyBits.length > 1 ? moneyBits[1] : desired_budget;
   }
-  const desired_budget = moneyBits[0] || null;
-  const max_budget = moneyBits.length > 1 ? moneyBits[1] : desired_budget;
 
   let buyer = null;
   // Do NOT use [class*="user"] — matches logged-in account menu (own name).
   const buyerEl = document.querySelector(
     '[class*="clientName"], [class*="ClientName"], [class*="customerName"], [class*="CustomerName"], [data-qa*="customer"], [data-qa*="client"]'
   );
-  if (buyerEl) buyer = norm(buyerEl.textContent).slice(0, 80);
+  if (buyerEl && !inNoise(buyerEl)) buyer = norm(buyerEl.textContent).slice(0, 80);
 
   return {
     project_id: pathId,
@@ -205,6 +261,61 @@ def parse_listing_from_html(html: str) -> list[dict[str, Any]]:
     return cards
 
 
+_NEGOTIABLE_BUDGET_RE = re.compile(
+    r"по\s+договор[её]нност|договор[её]нност\w*",
+    re.I,
+)
+_ORDER_MONEY_RE = re.compile(
+    r"(?:до\s*)?\d[\d\s\u00a0]*\s*₽|₽\s*\d[\d\s\u00a0]*",
+    re.I,
+)
+_CHAR_LIMIT_RE = re.compile(r"\d[\d\s]*\s*символ", re.I)
+
+
+def _budgets_from_order_html(scoped_html: str) -> tuple[str | None, str | None]:
+    """Extract desired/max budget from order card HTML only (no page-wide scrape)."""
+    texts: list[str] = []
+    for m in re.finditer(
+        r'class="[^"]*(?:price|budget|cost)[^"]*"[^>]*>(.*?)</(?:div|span|p|li|td|dd)>',
+        scoped_html,
+        flags=re.I | re.DOTALL,
+    ):
+        raw = re.sub(r"<[^>]+>", " ", m.group(1))
+        text = re.sub(r"\s+", " ", raw).strip()
+        if text and not _CHAR_LIMIT_RE.search(text):
+            texts.append(text)
+    if not texts:
+        plain = re.sub(r"<script[^>]*>.*?</script>", " ", scoped_html, flags=re.I | re.DOTALL)
+        plain = re.sub(r"<style[^>]*>.*?</style>", " ", plain, flags=re.I | re.DOTALL)
+        plain = re.sub(r"<[^>]+>", "\n", plain)
+        for line in plain.splitlines():
+            line = re.sub(r"\s+", " ", line).strip()
+            if not line or _CHAR_LIMIT_RE.search(line):
+                continue
+            if re.search(r"стоим(?:ость|ости)|бюджет|цен[аыуе]", line, flags=re.I):
+                texts.append(line)
+    if texts and any(_NEGOTIABLE_BUDGET_RE.search(t) for t in texts):
+        if not any(_ORDER_MONEY_RE.search(t) for t in texts):
+            return None, None
+    money: list[str] = []
+    for t in texts:
+        if _NEGOTIABLE_BUDGET_RE.search(t) and not _ORDER_MONEY_RE.search(t):
+            continue
+        m = _ORDER_MONEY_RE.search(t)
+        if not m:
+            continue
+        bit = re.sub(r"\s+", " ", m.group(0)).strip()
+        if bit and bit not in money:
+            money.append(bit)
+        if len(money) >= 2:
+            break
+    if not money:
+        return None, None
+    desired = money[0]
+    max_b = money[1] if len(money) > 1 else desired
+    return desired, max_b
+
+
 def parse_order_from_html(html: str, order_id: str | None = None) -> dict[str, Any]:
     pid = (order_id or "").lower() or None
     if not pid:
@@ -226,13 +337,21 @@ def parse_order_from_html(html: str, order_id: str | None = None) -> dict[str, A
             if title:
                 break
 
+    # Prefer <main>/<article> so sidebar «Другие заказы» cannot leak budgets.
+    scoped = html
+    for pat in (r"<main[^>]*>(.*?)</main>", r"<article[^>]*>(.*?)</article>"):
+        m = re.search(pat, html, flags=re.I | re.DOTALL)
+        if m and len(m.group(1)) > 80:
+            scoped = m.group(1)
+            break
+
     desc = ""
     for pat in (
         r'class="[^"]*description[^"]*"[^>]*>(.*?)</(?:div|p|section)>',
         r"<article[^>]*>(.*?)</article>",
         r"<main[^>]*>(.*?)</main>",
     ):
-        m = re.search(pat, html, flags=re.I | re.DOTALL)
+        m = re.search(pat, scoped if "description" in pat else html, flags=re.I | re.DOTALL)
         if m:
             raw = re.sub(r"<script[^>]*>.*?</script>", " ", m.group(1), flags=re.I | re.DOTALL)
             raw = re.sub(r"<style[^>]*>.*?</style>", " ", raw, flags=re.I | re.DOTALL)
@@ -241,19 +360,12 @@ def parse_order_from_html(html: str, order_id: str | None = None) -> dict[str, A
             if len(text) > len(desc):
                 desc = text
 
-    money = re.findall(
-        r"(?:до\s*)?\d[\d\s\u00a0]*\s*₽",
-        html,
-        flags=re.I,
-    )
-    money = [re.sub(r"\s+", " ", x).strip() for x in money[:4]]
-    desired = money[0] if money else None
-    max_b = money[1] if len(money) > 1 else desired
+    desired, max_b = _budgets_from_order_html(scoped)
 
     buyer = None
     bm = re.search(
         r'(?:заказчик|клиент)[^<]{0,40}</[^>]+>\s*<[^>]+>([^<]{2,80})',
-        html,
+        scoped,
         flags=re.I,
     )
     if bm:

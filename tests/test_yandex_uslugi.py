@@ -53,7 +53,20 @@ def test_parse_order_from_html_fixture() -> None:
     assert "Telegram" in raw["title"] or "бот" in raw["title"].lower()
     assert "aiogram" in (raw["full_description"] or "").lower()
     assert raw["desired_budget"]
+    assert "15 000" in (raw["desired_budget"] or "")
     assert "₽" in (raw["desired_budget"] or "")
+    # Sidebar noise must not leak into order budget.
+    assert "199" not in (raw["desired_budget"] or "")
+    assert "1000" not in (raw["desired_budget"] or "")
+    assert "1000" not in (raw["max_budget"] or "")
+
+
+def test_parse_order_negotiable_ignores_sidebar_money() -> None:
+    html = (FIXTURES / "yandex_order_negotiable.html").read_text(encoding="utf-8")
+    raw = parse_order_from_html(html, order_id=UUID1)
+    assert "лендинг" in (raw["title"] or "").lower()
+    assert raw["desired_budget"] is None
+    assert raw["max_budget"] is None
 
 
 def test_submit_response_manual_only() -> None:
