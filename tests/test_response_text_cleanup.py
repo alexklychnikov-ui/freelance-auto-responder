@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from src.adapters.kwork import _strip_stage_title_leakage
 from src.analyzer.response_text import (
+    diversify_mini_proof,
     ensure_hello_greeting,
     finalize_response_text,
     payment_mismatch_issues,
@@ -139,3 +140,28 @@ def test_ensure_hello_greeting_idempotent() -> None:
     assert ensure_hello_greeting("Сделаю бота.") == "Здравствуйте! Сделаю бота."
     assert ensure_hello_greeting("Здравствуйте! Уже есть.") == "Здравствуйте! Уже есть."
     assert ensure_hello_greeting("Ирина, здравствуйте! Текст.") == "Здравствуйте! Текст."
+
+
+def test_diversify_mini_proof_stock_opener() -> None:
+    text = (
+        "Здравствуйте!\n"
+        "Сделаю бота под FAQ и тикеты.\n"
+        "Могу показать похожий demo/кейс в чате Kwork. Срок — 7 дн."
+    )
+    out = diversify_mini_proof(text, seed="kwork:3262983")
+    assert "Могу показать похожий demo/кейс в чате Kwork" not in out
+    assert ("в чате" in out.lower()) or ("в переписке" in out.lower())
+    # Same seed → same variant
+    assert diversify_mini_proof(text, seed="kwork:3262983") == out
+
+
+def test_finalize_replaces_stock_mini_proof() -> None:
+    project = _project("бот").model_copy(update={"project_id": "3262991"})
+    text = (
+        "Здравствуйте!\n"
+        "Сделаю Telegram-бота оценки блюд.\n"
+        "Могу показать близкий demo/кейс в чате Kwork. Срок — 5 дн."
+    )
+    out = finalize_response_text(text, project)
+    assert "demo/кейс в чате Kwork" not in out
+    assert "Здравствуйте!" in out

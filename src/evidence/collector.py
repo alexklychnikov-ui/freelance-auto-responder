@@ -4,12 +4,13 @@ import hashlib
 import logging
 import time
 from collections import Counter
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timezone
-from typing import Mapping
 
 from src.analyzer.project_brief import is_site_recon_task
 from src.evidence.discovery import (
     ResourceCandidate,
+    _dedupe_key,
     discover,
     extract_inlined_attachment,
 )
@@ -107,6 +108,33 @@ def _bundle_status(
     if failed and not verified:
         return "failed"
     return "partial"
+
+
+def _candidate_dedupe_key(candidate: ResourceCandidate) -> str:
+    if candidate.kind == "url":
+        return f"url:{_dedupe_key(candidate.input_ref)}"
+    return f"att:{(candidate.input_ref or '').strip().lower()}"
+
+
+def _merge_candidates(
+    discovered: Sequence[ResourceCandidate],
+    extra: Sequence[ResourceCandidate] | None,
+    *,
+    max_urls: int,
+) -> list[ResourceCandidate]:
+    by_key: dict[str, ResourceCandidate] = {}
+    for candidate in [*discovered, *(extra or ())]:
+        key = _candidate_dedupe_key(candidate)
+        if key in ("url:", "att:"):
+            continue
+        prev = by_key.get(key)
+        if prev is None or candidate.priority > prev.priority:
+            by_key[key] = candidate
+    merged = list(by_key.values())
+    merged.sort(key=lambda c: (-c.priority, 0 if c.kind == "url" else 1, c.input_ref))
+    if max_urls <= 0:
+        return []
+    return merged[:max_urls]
 
 
 class EvidenceService:
@@ -210,6 +238,7 @@ class EvidenceService:
         use_browser_fallback: bool = False,
         max_facts_per_source: int = 7,
         recon_max_pages: int | None = None,
+        extra_candidates: Sequence[ResourceCandidate] | None = None,
     ) -> EvidenceBundle:
         """Discover → fetch/inject → extract grounded facts → EvidenceBundle.
 
@@ -237,7 +266,11 @@ class EvidenceService:
         if resolved_recon is None:
             resolved_recon = 3
 
-        candidates = self.collect_candidates(project, max_urls=resolved_max)
+        discovered = self.collect_candidates(project, max_urls=resolved_max)
+        candidates = _merge_candidates(
+            discovered, extra_candidates, max_urls=resolved_max
+        )
+        # Instruction/extra URLs alone still require research (no early not_required).
         required = bool(candidates)
         if not required:
             latency_ms = int((time.perf_counter() - t0) * 1000)

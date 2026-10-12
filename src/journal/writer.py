@@ -29,11 +29,52 @@ JOURNAL_COLUMNS = [
     "Результат общения",
     "Предложения",
     "Отклик",
+    "Бюджет заказчика",
+    "Моя цена",
+    "Релевантность",
+    "Похожий кейс",
+    "Тип отклика",
+    "Причина отказа",
 ]
+
+# Expanded funnel statuses for docs/comments (update_status stays free-text).
+FUNNEL_STATUSES = (
+    "Подготовлен",
+    "Отправлен",
+    "Просмотрен",
+    "Ответ получен",
+    "Диалог",
+    "Созвон",
+    "Тестовое",
+    "Заказ",
+    "Отказ",
+    "Без ответа",
+)
 
 OFFER_COLUMN = 8
 RESPONSE_COLUMN = 9
+KPI_FIRST_COLUMN = 10
+KPI_LAST_COLUMN = 15
+CLIENT_BUDGET_COLUMN = 10
+MY_PRICE_COLUMN = 11
+RELEVANCE_COLUMN = 12
+SIMILAR_CASE_COLUMN = 13
+RESPONSE_KIND_COLUMN = 14
+REJECT_REASON_COLUMN = 15
 TEXT_COLUMN_WIDTH = 73
+
+_STOCK_RESPONSE_PHRASES = (
+    "здравствуйте",
+    "добрый день",
+    "готов обсудить",
+    "давайте обсудим",
+    "могу выполнить",
+    "готов приступить",
+    "с уважением",
+    "буду рад",
+    "напишите",
+    "свяжитесь",
+)
 
 PLATFORM_DISPLAY = {
     "kwork": "Kwork",
@@ -102,6 +143,49 @@ def format_response_payload(
     return f"Отклик\n{body}\n\nОбщий бюджет: {price_text}\nСрок: {days_text}".strip()
 
 
+def client_budget_value(project: ProjectFull) -> str:
+    return (project.desired_budget or project.max_budget or "").strip()
+
+
+def relevance_tier(
+    score: GptScoreResult,
+    *,
+    acceptance_tier: str | None = None,
+) -> str:
+    """A/B/C relevance from score (+ optional acceptance quick/experience)."""
+    if score.score >= 7 and score.fit:
+        return "A"
+    if score.score >= 5 or acceptance_tier in ("quick_win", "experience_win"):
+        return "B"
+    return "C"
+
+
+def similar_case_label(score: GptScoreResult) -> str:
+    return "Да" if score.matched_skills else "Нет"
+
+
+def _is_mostly_stock_phrases(text: str) -> bool:
+    low = (text or "").lower()
+    if not low.strip():
+        return True
+    hits = sum(1 for phrase in _STOCK_RESPONSE_PHRASES if phrase in low)
+    # Short texts with several stock openers/closers count as template-only.
+    return hits >= 2 and len(low.strip()) <= 220
+
+
+def response_kind_label(response_text: str) -> str:
+    """Шаблон / Персональный / Персональный + demo."""
+    body = (response_text or "").strip()
+    low = body.lower()
+    has_demo = "demo" in low or "демо" in low
+    personal = len(body) > 200 and not _is_mostly_stock_phrases(body)
+    if has_demo:
+        return "Персональный + demo"
+    if personal:
+        return "Персональный"
+    return "Шаблон"
+
+
 class JournalWriter:
     def __init__(self, journal_path: str | Path) -> None:
         self.journal_path = Path(journal_path)
@@ -138,6 +222,65 @@ class JournalWriter:
             self.journal_path.parent.mkdir(parents=True, exist_ok=True)
             wb.save(self.journal_path)
 
+    def _ensure_kpi_headers(self, ws) -> None:
+        header = self._header_row(ws)
+        header_fill = PatternFill(
+            fill_type="solid",
+            start_color="1F4E78",
+            end_color="1F4E78",
+        )
+        header_font = Font(color="FFFFFF", bold=True)
+        header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for col in range(KPI_FIRST_COLUMN, KPI_LAST_COLUMN + 1):
+            expected = JOURNAL_COLUMNS[col - 1]
+            cell = ws.cell(row=header, column=col)
+            if cell.value != expected:
+                cell.value = expected
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = header_align
+
+    def _write_kpi_cells(
+        self,
+        ws,
+        row: int,
+        *,
+        project: ProjectFull | None = None,
+        score: GptScoreResult | None = None,
+        response_text: str = "",
+        price: str | None = None,
+        acceptance_tier: str | None = None,
+        project_type_title: str = "",
+    ) -> None:
+        """Fill KPI columns 10–14; leave 15 (Причина отказа) empty for manual entry."""
+        if project is not None:
+            client_budget = client_budget_value(project)
+        else:
+            client_budget = ""
+
+        my_price = (price or "").strip()
+
+        if score is not None:
+            relevance = relevance_tier(score, acceptance_tier=acceptance_tier)
+            similar = similar_case_label(score)
+        else:
+            relevance = "C" if project_type_title else ""
+            similar = "Нет"
+
+        kind = response_kind_label(response_text) if response_text else ""
+
+        if self._writable(ws, row, CLIENT_BUDGET_COLUMN):
+            ws.cell(row=row, column=CLIENT_BUDGET_COLUMN, value=client_budget or None)
+        if self._writable(ws, row, MY_PRICE_COLUMN):
+            ws.cell(row=row, column=MY_PRICE_COLUMN, value=my_price or None)
+        if self._writable(ws, row, RELEVANCE_COLUMN):
+            ws.cell(row=row, column=RELEVANCE_COLUMN, value=relevance or None)
+        if self._writable(ws, row, SIMILAR_CASE_COLUMN):
+            ws.cell(row=row, column=SIMILAR_CASE_COLUMN, value=similar or None)
+        if self._writable(ws, row, RESPONSE_KIND_COLUMN):
+            ws.cell(row=row, column=RESPONSE_KIND_COLUMN, value=kind or None)
+        # col 15 left empty intentionally
+
     def _apply_journal_layout(self, ws) -> None:
         header = self._header_row(ws)
         ws.column_dimensions["H"].width = TEXT_COLUMN_WIDTH
@@ -158,6 +301,8 @@ class JournalWriter:
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = header_align
+
+        self._ensure_kpi_headers(ws)
 
         text_align = Alignment(vertical="top", wrap_text=True)
         for row in range(header + 1, ws.max_row + 1):
@@ -365,9 +510,7 @@ class JournalWriter:
         if row is None:
             wb.close()
             return False
-        for col in range(1, len(JOURNAL_COLUMNS) + 1):
-            if self._writable(ws, row, col):
-                ws.cell(row=row, column=col, value=None)
+        ws.delete_rows(row, 1)
         wb.save(self.journal_path)
         wb.close()
         logger.info("journal_row_removed project_id=%s row=%d", project_id, row)
@@ -492,6 +635,15 @@ class JournalWriter:
         ws.cell(row=row, column=9, value=response_payload)
         ws.cell(row=row, column=8).alignment = Alignment(vertical="top", wrap_text=True)
         ws.cell(row=row, column=9).alignment = Alignment(vertical="top", wrap_text=True)
+        offered_price = project.desired_budget or project.max_budget
+        self._write_kpi_cells(
+            ws,
+            row,
+            project=project,
+            score=score,
+            response_text=response_text,
+            price=offered_price,
+        )
 
         wb.save(self.journal_path)
         logger.info(
@@ -536,6 +688,14 @@ class JournalWriter:
         ws.cell(row=row, column=9, value=response_payload)
         ws.cell(row=row, column=8).alignment = Alignment(vertical="top", wrap_text=True)
         ws.cell(row=row, column=9).alignment = Alignment(vertical="top", wrap_text=True)
+        self._write_kpi_cells(
+            ws,
+            row,
+            project=project,
+            score=score,
+            response_text=response_text,
+            price=price,
+        )
 
         wb.save(self.journal_path)
         logger.info(
@@ -574,6 +734,12 @@ class JournalWriter:
         ws.cell(row=row, column=9, value="")
         ws.cell(row=row, column=8).alignment = Alignment(vertical="top", wrap_text=True)
         ws.cell(row=row, column=9).alignment = Alignment(vertical="top", wrap_text=True)
+        self._write_kpi_cells(
+            ws,
+            row,
+            response_text="",
+            project_type_title=title,
+        )
 
         wb.save(self.journal_path)
         wb.close()

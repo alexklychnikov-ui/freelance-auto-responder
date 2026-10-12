@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlparse
@@ -129,6 +130,19 @@ _REFERENCE_HINTS = (
     "типа",
     "reference",
     "similar",
+    "референс",
+    "бот",
+)
+
+# @username (Telegram) — letters first, 5–32 chars total with @
+_TG_AT_HANDLE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])@([A-Za-z][A-Za-z0-9_]{3,31})\b"
+)
+
+# t.me / telegram.me /handle (schemed or bare)
+_TG_TME_RE = re.compile(
+    r"(?:https?://)?(?:t\.me|telegram\.me)/([A-Za-z][A-Za-z0-9_]{3,31})\b",
+    re.IGNORECASE,
 )
 _DOCUMENTATION_HINTS = (
     "документац",
@@ -254,6 +268,76 @@ def _classify_role(url: str, context: str) -> Role:
     return "unknown"
 
 
+def _normalize_tme_url(handle: str) -> str:
+    return f"https://t.me/{handle}"
+
+
+def _tg_handle_role(handle: str, context: str) -> Role:
+    """Telegram @handles: bot suffix always reference; else near референс/бот/аналог."""
+    if handle.lower().endswith("bot"):
+        return "reference"
+    ctx = f" {context} "
+    if any(h in ctx for h in _REFERENCE_HINTS):
+        return "reference"
+    return "reference"
+
+
+def extract_telegram_handles(text: str) -> list[str]:
+    """Unique Telegram handles from @name / t.me/name (lowercase, no @)."""
+    if not text:
+        return []
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in _TG_AT_HANDLE_RE.finditer(text):
+        handle = (m.group(1) or "").strip()
+        key = handle.lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found.append(key)
+    for m in _TG_TME_RE.finditer(text):
+        handle = (m.group(1) or "").strip()
+        key = handle.lower()
+        if not key or key in seen:
+            continue
+        # Skip t.me invite / joinchat noise
+        if key in ("joinchat", "addstickers", "share", "proxy", "socks"):
+            continue
+        seen.add(key)
+        found.append(key)
+    return found
+
+
+def _iter_telegram_spans(text: str) -> list[tuple[int, int, str]]:
+    """(start, end, normalized https://t.me/handle) for @handle and t.me/handle."""
+    spans: list[tuple[int, int, str]] = []
+    seen_keys: set[str] = set()
+    for m in _TG_AT_HANDLE_RE.finditer(text):
+        handle = (m.group(1) or "").strip()
+        if not handle:
+            continue
+        norm = _normalize_tme_url(handle)
+        key = _dedupe_key(norm)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        spans.append((m.start(), m.end(), norm))
+    for m in _TG_TME_RE.finditer(text):
+        handle = (m.group(1) or "").strip()
+        if not handle:
+            continue
+        if handle.lower() in ("joinchat", "addstickers", "share", "proxy", "socks"):
+            continue
+        norm = _normalize_tme_url(handle)
+        key = _dedupe_key(norm)
+        if not key or key in seen_keys:
+            continue
+        seen_keys.add(key)
+        spans.append((m.start(), m.end(), norm))
+    spans.sort(key=lambda x: x[0])
+    return spans
+
+
 def _iter_url_spans(text: str) -> list[tuple[int, int, str]]:
     spans: list[tuple[int, int, str]] = []
     occupied: list[tuple[int, int]] = []
@@ -342,19 +426,99 @@ def extract_url_candidates(
             continue
         seen.add(key)
         ctx = _context_window(text, start, end)
-        role = _classify_role(norm, ctx)
+        # t.me links are reference bots / channels
+        host = _host_of(norm)
+        handle = ""
+        if host in ("t.me", "telegram.me"):
+            handle = urlparse(norm).path.strip("/").split("/", 1)[0]
+            role = _tg_handle_role(handle, ctx) if handle else "reference"
+        else:
+            role = _classify_role(norm, ctx)
         found.append(
             ResourceCandidate(
                 kind="url",
                 role=role,
                 input_ref=norm,
-                title_hint=_host_of(norm) or None,
+                title_hint=handle or host or None,
+                priority=_ROLE_PRIORITY[role],
+            )
+        )
+
+    # @handle / bare t.me before max_urls slice (priority reference=60)
+    for start, end, norm in _iter_telegram_spans(text):
+        key = _dedupe_key(norm)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        ctx = _context_window(text, start, end)
+        handle = urlparse(norm).path.strip("/").split("/", 1)[0]
+        role = _tg_handle_role(handle, ctx)
+        found.append(
+            ResourceCandidate(
+                kind="url",
+                role=role,
+                input_ref=norm,
+                title_hint=handle or _host_of(norm) or None,
                 priority=_ROLE_PRIORITY[role],
             )
         )
 
     found.sort(key=lambda c: (-c.priority, c.input_ref))
     return found[:max_urls]
+
+
+def candidates_from_urls(
+    urls: Sequence[str],
+    *,
+    role: Role = "data_source",
+) -> list[ResourceCandidate]:
+    """Build URL candidates with a fixed role (e.g. instruction links)."""
+    found: list[ResourceCandidate] = []
+    seen: set[str] = set()
+    priority = _ROLE_PRIORITY[role]
+    for raw in urls:
+        text = (raw or "").strip()
+        if not text or _is_skipped_scheme(text):
+            continue
+        norm = _normalize_url(text)
+        if not norm or _is_platform_self_url(norm) or _is_file_ext_host(norm):
+            continue
+        key = _dedupe_key(norm)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        found.append(
+            ResourceCandidate(
+                kind="url",
+                role=role,
+                input_ref=norm,
+                title_hint=_host_of(norm) or None,
+                priority=priority,
+            )
+        )
+    return found
+
+
+def reference_bot_usage_issues(
+    project: ProjectFull,
+    response: str,
+) -> list[str]:
+    """If TZ names @bot / t.me bot, draft must mention the handle (with or without @)."""
+    parts = [
+        project.title or "",
+        project.full_description or "",
+        " ".join(project.tags or []),
+    ]
+    handles = extract_telegram_handles("\n".join(p for p in parts if p))
+    if not handles:
+        return []
+    hay = (response or "").casefold()
+    issues: list[str] = []
+    for handle in handles:
+        if handle in hay or f"@{handle}" in hay:
+            continue
+        issues.append(f"reference_bot:unused:{handle}")
+    return issues
 
 
 def discover(

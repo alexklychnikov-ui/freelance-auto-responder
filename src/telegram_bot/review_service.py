@@ -19,9 +19,14 @@ ApproveHandler = Callable[
     [str, str, str, PendingOffer, CallbackQuery],
     Awaitable[None],
 ]
+EarlyDecisionHandler = Callable[
+    [str, str, str, CallbackQuery],
+    Awaitable[None],
+]
 SubmitTextHandler = Callable[[PendingOffer, str], Awaitable[None]]
 ExportJournalHandler = Callable[[Message], Awaitable[None]]
 ScanReportHandler = Callable[[Message], Awaitable[None]]
+NotebookSyncHandler = Callable[[Message, int], Awaitable[None]]
 JournalConfirmHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 PrepareRetryHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 RegenerateHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
@@ -31,6 +36,7 @@ CorrectInstructionHandler = Callable[
     Awaitable[None],
 ]
 ManualProjectHandler = Callable[[Message, str, str | None], Awaitable[None]]
+ForceProjectHandler = ManualProjectHandler
 ManualTzHandler = Callable[[Message, str], Awaitable[None]]
 
 
@@ -46,13 +52,17 @@ class ReviewService:
         on_submit_text: SubmitTextHandler | None = None,
         on_export_journal: ExportJournalHandler | None = None,
         on_scan_report: ScanReportHandler | None = None,
+        on_notebook_sync: NotebookSyncHandler | None = None,
         on_journal_confirm: JournalConfirmHandler | None = None,
         on_prepare_retry: PrepareRetryHandler | None = None,
         on_regenerate: RegenerateHandler | None = None,
         on_correct: CorrectHandler | None = None,
         on_correct_instruction: CorrectInstructionHandler | None = None,
         on_manual_project: ManualProjectHandler | None = None,
+        on_force_project: ForceProjectHandler | None = None,
         on_manual_tz: ManualTzHandler | None = None,
+        on_early_go: EarlyDecisionHandler | None = None,
+        on_early_skip: EarlyDecisionHandler | None = None,
     ) -> None:
         self.settings = settings
         self.store = store
@@ -62,26 +72,34 @@ class ReviewService:
         self._on_submit_text = on_submit_text
         self._on_export_journal = on_export_journal
         self._on_scan_report = on_scan_report
+        self._on_notebook_sync = on_notebook_sync
         self._on_journal_confirm = on_journal_confirm
         self._on_prepare_retry = on_prepare_retry
         self._on_regenerate = on_regenerate
         self._on_correct = on_correct
         self._on_correct_instruction = on_correct_instruction
         self._on_manual_project = on_manual_project
+        self._on_force_project = on_force_project
         self._on_manual_tz = on_manual_tz
+        self._on_early_go = on_early_go
+        self._on_early_skip = on_early_skip
         self.tg_bot.register_handlers(
             on_approve=self._handle_approve,
             on_reject=self._handle_reject,
             on_response_text=self._handle_response_text,
             on_export_journal=self._handle_export_journal,
             on_scan_report=self._handle_scan_report,
+            on_notebook_sync=self._handle_notebook_sync,
             on_journal_confirm=self._handle_journal_confirm,
             on_prepare_retry=self._handle_prepare_retry,
             on_regenerate=self._handle_regenerate,
             on_correct=self._handle_correct,
             on_correct_instruction=self._handle_correct_instruction,
             on_manual_project=self._handle_manual_project,
+            on_force_project=self._handle_force_project,
             on_manual_tz=self._handle_manual_tz,
+            on_early_go=self._handle_early_go,
+            on_early_skip=self._handle_early_skip,
         )
 
     def set_approve_handler(self, handler: ApproveHandler) -> None:
@@ -95,6 +113,9 @@ class ReviewService:
 
     def set_scan_report_handler(self, handler: ScanReportHandler) -> None:
         self._on_scan_report = handler
+
+    def set_notebook_sync_handler(self, handler: NotebookSyncHandler) -> None:
+        self._on_notebook_sync = handler
 
     def set_journal_confirm_handler(self, handler: JournalConfirmHandler) -> None:
         self._on_journal_confirm = handler
@@ -116,8 +137,17 @@ class ReviewService:
     def set_manual_project_handler(self, handler: ManualProjectHandler) -> None:
         self._on_manual_project = handler
 
+    def set_force_project_handler(self, handler: ForceProjectHandler) -> None:
+        self._on_force_project = handler
+
     def set_manual_tz_handler(self, handler: ManualTzHandler) -> None:
         self._on_manual_tz = handler
+
+    def set_early_go_handler(self, handler: EarlyDecisionHandler) -> None:
+        self._on_early_go = handler
+
+    def set_early_skip_handler(self, handler: EarlyDecisionHandler) -> None:
+        self._on_early_skip = handler
 
     def clear_correct_awaiting(self, chat_id: str | None = None) -> None:
         key = str(chat_id or self.tg_bot.chat_id)
@@ -129,6 +159,7 @@ class ReviewService:
         score: GptScoreResult,
         *,
         acceptance_tier: Literal["standard", "quick_win", "experience_win"] | None = None,
+        budget_ceiling_warning: str | None = None,
     ) -> PendingOffer:
         offer = PendingOffer(
             platform=project.platform,
@@ -141,6 +172,7 @@ class ReviewService:
             acceptance_tier=acceptance_tier,
             created_at=datetime.now(timezone.utc),
             status="pending",
+            budget_ceiling_warning=budget_ceiling_warning,
         )
         if self.settings.require_telegram_approval:
             msg_id = await self.tg_bot.send_review_card(offer)
@@ -163,25 +195,92 @@ class ReviewService:
         project_id: str,
         callback: CallbackQuery,
     ) -> None:
-        offer = self.store.load(platform, source_key, project_id)
-        if offer is None:
-            await self.tg_bot.notify(f"⚠️ Pending offer не найден: {project_id}")
-            return
-        if offer.status != "pending":
-            await callback.answer(f"Уже обработано: {offer.status}", show_alert=True)
-            return
-        chat_id = str(self.settings.telegram_chat_id)
-        if callback.message and str(callback.message.chat.id) != chat_id:
-            await callback.answer("Недоступно", show_alert=True)
-            return
+        try:
+            offer = self.store.load(platform, source_key, project_id)
+            if offer is None:
+                await callback.answer("Заявка не найдена", show_alert=True)
+                await self.tg_bot.notify(f"⚠️ Pending offer не найден: {project_id}")
+                return
 
-        offer.status = "approved"
-        offer.approved_at = datetime.now(timezone.utc)
-        self.store.save(offer)
-        self.repository.update_status(platform, source_key, project_id, "approved")
+            chat_id = str(self.settings.telegram_chat_id)
+            msg_chat = (
+                str(callback.message.chat.id) if callback.message is not None else None
+            )
+            logger.info(
+                "approve_click project_id=%s status=%s chat=%s",
+                project_id,
+                offer.status,
+                msg_chat,
+            )
 
-        if self._on_approve is not None:
-            await self._on_approve(platform, source_key, project_id, offer, callback)
+            if callback.message and str(callback.message.chat.id) != chat_id:
+                await callback.answer("Недоступно", show_alert=True)
+                return
+
+            if offer.status == "approved":
+                await callback.answer("Продолжаю подготовку…")
+                if self._on_approve is not None:
+                    await self._on_approve(
+                        platform, source_key, project_id, offer, callback
+                    )
+                return
+
+            if offer.status != "pending":
+                await callback.answer(
+                    f"Уже обработано: {offer.status}", show_alert=True
+                )
+                return
+
+            await callback.answer("Готовлю отклик для формы…")
+
+            offer.status = "approved"
+            offer.approved_at = datetime.now(timezone.utc)
+            self.store.save(offer)
+            self.repository.update_status(platform, source_key, project_id, "approved")
+
+            if self._on_approve is not None:
+                await self._on_approve(
+                    platform, source_key, project_id, offer, callback
+                )
+        except Exception:
+            logger.exception(
+                "approve_handler_failed platform=%s source=%s project_id=%s",
+                platform,
+                source_key,
+                project_id,
+            )
+            try:
+                await self.tg_bot.notify(
+                    f"⚠️ Ошибка approve {project_id}: см. лог approve_handler_failed"
+                )
+            except Exception:
+                logger.exception(
+                    "approve_notify_failed project_id=%s", project_id
+                )
+
+    async def _handle_early_go(
+        self,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        callback: CallbackQuery,
+    ) -> None:
+        if self._on_early_go is None:
+            await callback.answer("Не настроено", show_alert=True)
+            return
+        await self._on_early_go(platform, source_key, project_id, callback)
+
+    async def _handle_early_skip(
+        self,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        callback: CallbackQuery,
+    ) -> None:
+        if self._on_early_skip is None:
+            await callback.answer("Не настроено", show_alert=True)
+            return
+        await self._on_early_skip(platform, source_key, project_id, callback)
 
     async def _handle_reject(
         self,
@@ -330,7 +429,8 @@ class ReviewService:
         await callback.answer("Пришли инструкцию следующим сообщением")
         await self.tg_bot.notify(
             f"✏️ Корректировка: {offer.title}\n"
-            "Пришли инструкцию следующим сообщением."
+            "Пришли инструкцию следующим сообщением.\n"
+            "Можно добавить ссылку на ресурс — проверю и вплету факты в отклик."
         )
         if self._on_correct is not None:
             await self._on_correct(platform, source_key, project_id, callback)
@@ -366,6 +466,16 @@ class ReviewService:
             return
         await self._on_manual_project(message, project_id, platform=platform)
 
+    async def _handle_force_project(
+        self, message: Message, project_id: str, platform: str | None = None
+    ) -> None:
+        if self._on_force_project is None:
+            await message.answer("Команда /force недоступна")
+            return
+        if str(message.chat.id) != str(self.tg_bot.chat_id):
+            return
+        await self._on_force_project(message, project_id, platform=platform)
+
     async def _handle_manual_tz(self, message: Message, text: str) -> None:
         if self._on_manual_tz is None:
             await message.answer("Команда /tz недоступна")
@@ -389,6 +499,14 @@ class ReviewService:
         if str(message.chat.id) != str(self.tg_bot.chat_id):
             return
         await self._on_scan_report(message)
+
+    async def _handle_notebook_sync(self, message: Message, days: int) -> None:
+        if self._on_notebook_sync is None:
+            await message.answer("Команда /notebook недоступна")
+            return
+        if str(message.chat.id) != str(self.tg_bot.chat_id):
+            return
+        await self._on_notebook_sync(message, days)
 
     def expire_stale_pending(self) -> list[PendingOffer]:
         expired = self.store.expire_stale(self.settings.pending_timeout_hours)

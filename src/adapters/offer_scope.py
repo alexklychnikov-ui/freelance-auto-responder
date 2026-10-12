@@ -22,6 +22,24 @@ _IMAGES_RE = re.compile(
     re.IGNORECASE,
 )
 
+_INTEGRATION_RE = re.compile(
+    r"интеграц|api\b|crm|ocr|документ|микросервис|автоматизац",
+    re.IGNORECASE,
+)
+_MANY_MODULES_RE = re.compile(
+    r"нескольк\w+\s+модул|много\s+модул|\d+\s*[-–—]?\s*модул|"
+    r"набор\s+модул|комплексн\w+\s+интеграц|микросервис",
+    re.IGNORECASE,
+)
+_TELEGRAM_BOT_RE = re.compile(
+    r"telegram[- ]?бот|телеграм[- ]?бот|\btg[- ]?бот\b",
+    re.IGNORECASE,
+)
+_LANDING_WEB_RE = re.compile(
+    r"landing|лендинг|сайт|веб[- ]?mvp|web[- ]?mvp|одностранич",
+    re.IGNORECASE,
+)
+
 LARGE_CATALOG_ITEMS = 3000
 MEDIUM_CATALOG_ITEMS = 500
 LARGE_PRICE_MIX = 0.65
@@ -81,24 +99,34 @@ def listed_price_mix_for_scope(
     return LISTED_PRICE_MIX
 
 
+def _default_days_for_task_type(text: str) -> int:
+    if _TELEGRAM_BOT_RE.search(text):
+        return 5
+    if _LANDING_WEB_RE.search(text) and not _INTEGRATION_RE.search(text):
+        return 5
+    if _INTEGRATION_RE.search(text):
+        if _MANY_MODULES_RE.search(text):
+            return 10
+        return 7
+    return 7
+
+
 def suggest_delivery_days_for_scope(
     project: ProjectFull,
     *,
     volume: int | None = None,
-) -> int | None:
-    """Volume-calibrated Kwork delivery days; None → keep pipeline default."""
+) -> int:
+    """Volume/type-calibrated Kwork delivery days (always a snapped int)."""
     text = f"{project.title or ''}\n{project.full_description or ''}"
     parsing = is_parsing_task(text)
     vol = int(volume or 0)
-    if not parsing and vol <= 0:
-        return None
-    images = project_wants_images(project)
-    if vol >= LARGE_CATALOG_ITEMS:
-        raw = 5 if images else 4
-    elif vol >= MEDIUM_CATALOG_ITEMS:
-        raw = 4 if images else 3
-    elif vol > 0 or parsing:
-        raw = 3 if images else 2
-    else:
-        return None
-    return snap_delivery_days(raw)
+    if parsing or vol > 0:
+        images = project_wants_images(project)
+        if vol >= LARGE_CATALOG_ITEMS:
+            raw = 5 if images else 4
+        elif vol >= MEDIUM_CATALOG_ITEMS:
+            raw = 4 if images else 3
+        else:
+            raw = 3 if images else 2
+        return snap_delivery_days(raw)
+    return snap_delivery_days(_default_days_for_task_type(text))

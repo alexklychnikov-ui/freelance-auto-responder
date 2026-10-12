@@ -85,4 +85,5 @@ class PendingOffer(BaseModel):
     telegram_message_id: int | None = None
     draft_message_id: int | None = None
     evidence: EvidenceBundle | None = None
+    budget_ceiling_warning: str | None = None
 

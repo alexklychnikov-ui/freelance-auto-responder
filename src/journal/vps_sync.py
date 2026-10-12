@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from src.adapters.kwork import OfferFormSnapshot, _read_offer_text_from_new_offer_form
@@ -9,7 +12,7 @@ from src.adapters.kwork_offers import KworkOfferComment, fetch_my_offer_comment_
 from src.config import Settings
 from src.journal.kwork_status_sync import sync_journal_from_kwork_offers
 from src.journal.writer import JournalWriter, format_response_payload
-from src.responses.prepared_store import PreparedResponseStore
+from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
 
 if TYPE_CHECKING:
     from src.browser.base import BrowserClient
@@ -25,6 +28,59 @@ class VpsJournalSyncResult:
     offers_appended: int = 0
     offers_matched: int = 0
     offers_error: str | None = None
+
+
+def _journal_sync_state_path(journal_path: str | Path) -> Path:
+    return Path(journal_path).with_name("journal_sync_state.json")
+
+
+def _as_utc(dt: datetime) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def load_last_sync_at(journal_path: str | Path) -> datetime | None:
+    path = _journal_sync_state_path(journal_path)
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        value = raw.get("last_sync_at")
+        if not value:
+            return None
+        return _as_utc(datetime.fromisoformat(str(value)))
+    except Exception as exc:
+        logger.warning("journal_sync_state_load_failed path=%s err=%s", path, exc)
+        return None
+
+
+def save_last_sync_at(journal_path: str | Path, when: datetime | None = None) -> Path:
+    path = _journal_sync_state_path(journal_path)
+    stamp = _as_utc(when or datetime.now(timezone.utc))
+    path.write_text(
+        json.dumps({"last_sync_at": stamp.isoformat()}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _needs_prepared_heavy_sync(
+    item: PreparedResponse,
+    *,
+    in_journal: bool,
+    last_sync_at: datetime | None,
+) -> bool:
+    """Heavy = platform browser/text fetch + append/overwrite for confirmed items."""
+    if not in_journal or not item.journal_exported:
+        return True
+    if last_sync_at is None:
+        # First run after deploy: skip already exported+in_journal re-fetch.
+        return False
+    prepared_at = item.prepared_at
+    if prepared_at is None:
+        return False
+    return _as_utc(prepared_at) >= last_sync_at
 
 
 def _platform_response_fields(
@@ -171,6 +227,7 @@ def sync_journal_on_vps(
     result = VpsJournalSyncResult()
     writer.normalize_layout()
     existing_ids = writer.project_ids_in_journal()
+    last_sync_at = load_last_sync_at(settings.response_journal)
 
     browser: BrowserClient | None = None
     try:
@@ -194,6 +251,7 @@ def sync_journal_on_vps(
                 for item in prepared_store.list_all()
                 if item.score.suggested_project_type
             },
+            update_existing=False,
         )
         result.offers_error = offers.error
         result.offers_updated = offers.updated
@@ -232,6 +290,11 @@ def sync_journal_on_vps(
                 continue
 
             in_journal = item.project_id in existing_ids
+            if not _needs_prepared_heavy_sync(
+                item, in_journal=in_journal, last_sync_at=last_sync_at
+            ):
+                continue
+
             snap = (
                 _snap_for_project(
                     browser,
@@ -297,6 +360,8 @@ def sync_journal_on_vps(
             prepared_store.save(item)
             existing_ids.add(item.project_id)
             result.appended_prepared += 1
+
+        save_last_sync_at(settings.response_journal)
     finally:
         if browser is not None:
             try:

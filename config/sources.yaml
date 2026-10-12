@@ -6,16 +6,17 @@ sources:
     scan_interval_minutes: 15
     bootstrap: true
 
+  # c=5 / c=15 — не IT (дизайн/макеты/баннеры). Early ping шёл до GPT-фильтра → спам.
   - id: kwork_c5
     platform: kwork
-    enabled: true
+    enabled: false
     url: https://kwork.ru/projects?c=5
     scan_interval_minutes: 15
     bootstrap: true
 
   - id: kwork_c15
     platform: kwork
-    enabled: true
+    enabled: false
     url: https://kwork.ru/projects?c=15
     scan_interval_minutes: 15
     bootstrap: true

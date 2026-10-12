@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -11,6 +12,12 @@ from src.config import Settings
 from src.models import GptScoreResult, OfferTerms, PendingOffer, ProjectFull, ProjectPreview
 from src.pipeline.orchestrator import PipelineOrchestrator
 from src.store.repository import ProjectRepository
+
+# Same family as ensure_budget_mismatch_note main_scope marker.
+_BUDGET_GAP_NOTE_SCOPE_RE = re.compile(
+    r"основн\w+\s+сценари|базов\w+\s+сценари|mvp",
+    flags=re.IGNORECASE,
+)
 
 
 @pytest.fixture
@@ -376,8 +383,11 @@ async def test_pipeline_skips_over_budget_ceiling(
         source_key="kwork_dev_it",
         project_id="1001",
         url="https://kwork.ru/projects/1001/view",
-        title="Heavy project",
-        full_description="Big integration",
+        title="Heavy project with long enough title for extract",
+        full_description=(
+            "Need a full Python backend integration with CRM, queues, "
+            "and admin panel for a large catalog."
+        ),
         max_budget="до 25 000 ₽",
     )
     preview = ProjectPreview(
@@ -387,6 +397,7 @@ async def test_pipeline_skips_over_budget_ceiling(
         url=project_full.url,
         title=project_full.title,
     )
+    settings.require_telegram_approval = True
     orch, mock_adapter = _make_orchestrator(
         settings, previews=[preview], project_full=project_full, score=score
     )
@@ -395,7 +406,16 @@ async def test_pipeline_skips_over_budget_ceiling(
     totals = await orch.run_scan_cycle()
 
     assert totals["new"] == 1
-    orch.review_service.tg_bot.send_review_card.assert_not_called()
+    orch.review_service.tg_bot.send_review_card.assert_called_once()
+    offer = orch.review_service.tg_bot.send_review_card.call_args[0][0]
+    assert offer.budget_ceiling_warning is not None
+    assert "60 000" in offer.budget_ceiling_warning
+    assert "25 000" in offer.budget_ceiling_warning
+    notify_text = " ".join(
+        str(c.args[0]) for c in orch.review_service.tg_bot.notify.await_args_list
+    )
+    assert "потолок" in notify_text.lower()
+    assert "60 000" in notify_text
     mock_adapter.prepare_response.assert_not_called()
     repo = ProjectRepository(settings.database_path)
     with repo._conn() as conn:
@@ -404,7 +424,7 @@ async def test_pipeline_skips_over_budget_ceiling(
             ("1001",),
         ).fetchone()
     assert row is not None
-    assert row["status"] == "skipped"
+    assert row["status"] == "notified"
 
 
 @pytest.mark.asyncio
@@ -1015,7 +1035,7 @@ async def test_prepare_form_uses_listed_near_desired_not_fair(
     assert 15_000 <= prepared_price <= 18_000
     assert prepared_price != 19_200
     assert prepared_price != 45_000
-    assert "основной сценарий" in prepared_text.lower()
+    assert _BUDGET_GAP_NOTE_SCOPE_RE.search(prepared_text)
     assert "занижен" not in prepared_text.lower()
 
 
@@ -1072,7 +1092,7 @@ async def test_prepare_budget_gap_clamps_form_price_and_appends_note(
     prepared_text = args.args[1] if args.args else args.kwargs.get("text")
     prepared_price = args.args[2] if len(args.args) > 2 else args.kwargs.get("price")
     assert prepared_price == "1500"
-    assert "основной сценарий" in prepared_text.lower()
+    assert _BUDGET_GAP_NOTE_SCOPE_RE.search(prepared_text)
     assert "занижен" not in prepared_text.lower()
     assert "обсудить сумму" not in prepared_text.lower()
     notify_text = " ".join(
@@ -1131,7 +1151,7 @@ async def test_prepare_budget_gap_from_desired_only_shows_ceiling_in_tg(
     prepared_text = args.args[1] if args.args else args.kwargs.get("text")
     prepared_price = args.args[2] if len(args.args) > 2 else args.kwargs.get("price")
     assert prepared_price == "1500"
-    assert "основной сценарий" in prepared_text.lower()
+    assert _BUDGET_GAP_NOTE_SCOPE_RE.search(prepared_text)
     assert "занижен" not in prepared_text.lower()
     notify_text = " ".join(
         str(c.args[0]) for c in orch.review_service.tg_bot.notify.await_args_list

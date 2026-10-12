@@ -1,6 +1,7 @@
 """Постобработка текста отклика перед вставкой в форму."""
 from __future__ import annotations
 
+import hashlib
 import re
 
 from src.analyzer.project_brief import build_project_brief, buyer_checklist_issues
@@ -222,12 +223,65 @@ def ensure_response_paragraphs(text: str) -> str:
     return "\n".join(_with_red_line(b) for b in blocks if b)
 
 
+# Stock mini-proof openers the model overuses at paragraph start.
+_MINI_PROOF_STOCK_RE = re.compile(
+    r"(?:^|(?<=\n)|(?<=[.!?…]\s))"
+    r"(?:"
+    r"Могу показать\s+(?:похожий|близкий)\s+demo\s*/\s*кейс\s+в\s+чате(?:\s+Kwork)?"
+    r"|Могу показать\s+(?:похожий|близкий)\s+(?:demo|кейс)\s+в\s+чате(?:\s+Kwork)?"
+    r"|Demo\s+похожего\s+кейса\s+могу показать\s+в\s+чате(?:\s+Kwork)?"
+    r"|Похожую логику[^.!?\n]{0,80}?могу показать\s+в\s+чате(?:\s+Kwork)?"
+    r"|Похожий\s+(?:demo|кейс)[^.!?\n]{0,40}?могу показать\s+в\s+чате(?:\s+Kwork)?"
+    r")"
+    r"\s*[.!]?",
+    re.I | re.M,
+)
+
+_MINI_PROOF_VARIANTS: tuple[str, ...] = (
+    "Близкий рабочий пример по такой логике пришлю в чате.",
+    "Если нужно — разберу похожий кейс прямо в переписке.",
+    "По сопоставимому кейсу могу скинуть короткое demo в чате.",
+    "Есть близкий пример: детали покажу у вас в чате.",
+    "Похожий сценарий уже делал — demo обсудим в чате без ссылок.",
+    "Могу коротко пройтись по близкому кейсу здесь в переписке.",
+    "Сопоставимый пример есть: покажу ход работ в чате.",
+)
+
+
+def _pick_mini_proof_variant(seed: str | None) -> str:
+    key = (seed or "mini-proof").encode("utf-8", errors="ignore")
+    idx = int(hashlib.md5(key).hexdigest(), 16) % len(_MINI_PROOF_VARIANTS)
+    return _MINI_PROOF_VARIANTS[idx]
+
+
+def diversify_mini_proof(text: str, *, seed: str | None = None) -> str:
+    """Replace overused «Могу показать … в чате Kwork» with a seeded variant."""
+    body = text or ""
+    if not _MINI_PROOF_STOCK_RE.search(body):
+        return body
+    replacement = _pick_mini_proof_variant(seed)
+
+    def _sub(match: re.Match[str]) -> str:
+        start = match.start()
+        prefix = ""
+        # Keep paragraph break / space before replacement when match ate it via lookbehind.
+        if start > 0 and body[start - 1] not in "\n ":
+            prefix = " "
+        return prefix + replacement
+
+    return _MINI_PROOF_STOCK_RE.sub(_sub, body, count=1)
+
+
 def finalize_response_text(text: str, project: ProjectFull | None = None) -> str:
     cleaned = unescape_literal_newlines(text)
     cleaned = strip_response_markdown(cleaned)
     cleaned = strip_github_links(cleaned)
     cleaned = strip_portfolio_footer(cleaned)
     cleaned = ensure_hello_greeting(cleaned)
+    seed = None
+    if project is not None:
+        seed = f"{project.platform}:{project.project_id}"
+    cleaned = diversify_mini_proof(cleaned, seed=seed)
     if project is not None:
         cleaned = ensure_response_paragraphs(cleaned)
     # Keep leading indent (красная строка) on the first paragraph.

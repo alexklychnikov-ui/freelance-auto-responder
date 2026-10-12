@@ -40,6 +40,41 @@ class ProjectRepository:
             ).fetchone()
         return row is not None
 
+    def get_status(
+        self, platform: str, source_key: str, project_id: str
+    ) -> str | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT status FROM projects
+                WHERE platform = ? AND source_key = ? AND project_id = ?
+                """,
+                (platform, source_key, project_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return str(row["status"] or "")
+
+    def get_score_fit(
+        self, platform: str, source_key: str, project_id: str
+    ) -> tuple[float | None, int | None]:
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT score, fit FROM projects
+                WHERE platform = ? AND source_key = ? AND project_id = ?
+                """,
+                (platform, source_key, project_id),
+            ).fetchone()
+        if row is None:
+            return None, None
+        score = row["score"]
+        fit = row["fit"]
+        return (
+            float(score) if score is not None else None,
+            int(fit) if fit is not None else None,
+        )
+
     def is_unprocessed_new(
         self, platform: str, source_key: str, project_id: str
     ) -> bool:

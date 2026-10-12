@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 
 from src.models import ProjectFull
@@ -257,14 +258,96 @@ def budget_gap(
     }
 
 
-def format_budget_mismatch_sentence(gap: dict) -> str:
-    fair = format_rub_amount(int(gap["fair_price"]))
+def customer_expansion_hint_rub(gap: dict) -> int | None:
+    """Soft customer-facing expansion orientir; hide wild fair outliers."""
+    fair = int(gap.get("fair_price") or 0)
+    fill = int(gap.get("fill_price") or gap.get("ceiling") or 0)
+    max_c_raw = gap.get("max_ceiling")
+    max_c = int(max_c_raw) if max_c_raw is not None else None
+    if fair <= 0 or fill <= 0:
+        return None
+    if max_c is not None:
+        hint = min(fair, max_c)
+        if hint <= int(fill * 1.15):
+            return None
+        return hint
+    if fair > int(fill * 3):
+        return None
+    return min(fair, int(fill * 2.5))
+
+
+_MISMATCH_WITH_HINT: tuple[str, ...] = (
+    (
+        "В бюджете заказа ({fill} ₽) сделаю основной сценарий по ТЗ. "
+        "Полный объём — ориентир от {hint} ₽, если захотите расширить."
+    ),
+    (
+        "В указанном бюджете ({fill} ₽) закрою основной сценарий по ТЗ. "
+        "Полный объём — ориентир от {hint} ₽, если решите расширить."
+    ),
+    (
+        "В рамках бюджета заказа ({fill} ₽) сделаю MVP по ТЗ. "
+        "Полный объём — ориентир от {hint} ₽ при расширении."
+    ),
+    (
+        "На сумму заказа ({fill} ₽) соберу базовый сценарий по ТЗ. "
+        "Полный объём — ориентир от {hint} ₽, если захотите расширить."
+    ),
+    (
+        "В бюджете заказа ({fill} ₽) сделаю основной сценарий. "
+        "Расширение объёма — ориентир от {hint} ₽."
+    ),
+    (
+        "В указанном бюджете ({fill} ₽) закрою MVP по ТЗ. "
+        "Полный объём обсудим отдельно — ориентир от {hint} ₽."
+    ),
+    (
+        "В рамках бюджета ({fill} ₽) сделаю основной сценарий по ТЗ; "
+        "полный объём — ориентир от {hint} ₽, если захотите расширить."
+    ),
+)
+
+_MISMATCH_SOFT: tuple[str, ...] = (
+    (
+        "В бюджете заказа ({fill} ₽) сделаю основной сценарий по ТЗ. "
+        "Расширение сверх MVP обсудим отдельно — после уточнения объёма."
+    ),
+    (
+        "В указанном бюджете ({fill} ₽) закрою основной сценарий по ТЗ. "
+        "Расширение сверх MVP обсудим отдельно после уточнения объёма."
+    ),
+    (
+        "В рамках бюджета заказа ({fill} ₽) сделаю MVP. "
+        "Расширение объёма обсудим отдельно — после уточнения."
+    ),
+    (
+        "На сумму заказа ({fill} ₽) соберу базовый сценарий. "
+        "Расширение сверх MVP обсудим отдельно."
+    ),
+    (
+        "В бюджете заказа ({fill} ₽) сделаю основной сценарий по ТЗ; "
+        "расширение сверх MVP — обсудим отдельно после уточнения объёма."
+    ),
+)
+
+
+def _pick_mismatch_variant(variants: tuple[str, ...], *, seed: str | None, fill: str, hint: int | None) -> str:
+    key = f"{seed or ''}|{fill}|{hint or 0}".encode()
+    idx = int(hashlib.md5(key).hexdigest(), 16) % len(variants)
+    return variants[idx]
+
+
+def format_budget_mismatch_sentence(gap: dict, *, seed: str | None = None) -> str:
     listed = int(gap.get("fill_price") or gap["ceiling"])
     fill = format_rub_amount(listed)
-    return (
-        f"В бюджете заказа ({fill} ₽) сделаю основной сценарий по ТЗ. "
-        f"Полный объём — ориентир от {fair} ₽, если захотите расширить."
-    )
+    hint = customer_expansion_hint_rub(gap)
+    if hint is not None:
+        tmpl = _pick_mismatch_variant(
+            _MISMATCH_WITH_HINT, seed=seed, fill=fill, hint=hint
+        )
+        return tmpl.format(fill=fill, hint=format_rub_amount(hint))
+    tmpl = _pick_mismatch_variant(_MISMATCH_SOFT, seed=seed, fill=fill, hint=None)
+    return tmpl.format(fill=fill)
 
 
 _SCOPE_NOTE_SIGNALS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -275,7 +358,8 @@ _SCOPE_NOTE_SIGNALS: tuple[tuple[str, re.Pattern[str]], ...] = (
             r"бюджет\w*\s+заказа|"
             r"в\s+указанн\w+\s+бюджет|"
             r"в\s+рамках\s+бюджет|"
-            r"сумм\w*\s+заказа",
+            r"сумм\w*\s+заказа|"
+            r"на\s+сумм\w*\s+заказ",
             flags=re.IGNORECASE,
         ),
     ),
@@ -288,14 +372,102 @@ _SCOPE_NOTE_SIGNALS: tuple[tuple[str, re.Pattern[str]], ...] = (
         re.compile(
             r"полн\w+\s+объ[её]м|"
             r"ориентир\w*\s+от|"
-            r"если\s+захотите\s+расширить|"
-            r"расширени\w+\s+объ[её]ма",
+            r"если\s+(?:захотите|решите)\s+расширить|"
+            r"при\s+расширении|"
+            r"расширени\w+\s+объ[её]ма|"
+            r"расширение\s+сверх|"
+            r"обсудим\s+отдельно",
             flags=re.IGNORECASE,
         ),
     ),
 )
 
 _ZANIZHEN_RE = re.compile(r"занижен", flags=re.IGNORECASE)
+
+_DEFER_PRICE_DAYS_RE = re.compile(
+    r"обсудим\s+после|"
+    r"после\s+уточнения(?:\s+объ[её]ма)?|"
+    r"по\s+стоимости\s+и\s+срокам\s+предлагаю\s+обсудить|"
+    r"стоимост\w*\s+и\s+срок\w*\s+(?:предлагаю\s+)?(?:обсуд|уточн)|"
+    r"срок\w*\s+и\s+стоимост\w*\s+(?:предлагаю\s+)?(?:обсуд|уточн)|"
+    r"предлагаю\s+обсудить\s+(?:стоимост|срок|цен)",
+    flags=re.IGNORECASE,
+)
+
+_ASKING_PRICE_RE = re.compile(
+    r"(?P<label>(?:стоимост\w*|цен\w*)\s*[—\-–:]\s*(?:от\s*)?)"
+    r"(?P<amount>\d(?:[\d\s\u00a0]*\d)?)\s*(?P<unit>₽|руб\.?)",
+    flags=re.IGNORECASE,
+)
+
+_OT_MVP_PRICE_RE = re.compile(
+    r"(?P<label>от\s+)(?P<amount>\d(?:[\d\s\u00a0]*\d)?)\s*(?P<unit>₽|руб\.?)"
+    r"(?P<tail>\s+за\s+MVP)",
+    flags=re.IGNORECASE,
+)
+
+_OT_ASKING_PRICE_RE = re.compile(
+    r"(?P<label>от\s+)(?P<amount>\d(?:[\d\s\u00a0]*\d)?)\s*(?P<unit>₽|руб\.?)",
+    flags=re.IGNORECASE,
+)
+
+_FAIR_ORIENTIR_RE = re.compile(
+    r"полн\w+\s+объ[её]м[^\n\d]{0,48}(?:ориентир\w*\s+)?от\s*"
+    r"(?P<amount>\d(?:[\d\s\u00a0]*\d)?)\s*(?:₽|руб\.?)",
+    flags=re.IGNORECASE,
+)
+
+_MISMATCH_FILL_RE = re.compile(
+    r"(?:"
+    r"в\s+бюджет\w*\s+заказ\w*|"
+    r"в\s+указанн\w+\s+бюджет\w*|"
+    r"в\s+рамках\s+бюджет\w*(?:\s+заказ\w*)?|"
+    r"на\s+сумм\w*\s+заказ\w*"
+    r")\s*\((?P<amount>\d(?:[\d\s\u00a0]*\d)?)(\s*₽\))",
+    flags=re.IGNORECASE,
+)
+
+_SROK_RE = re.compile(
+    r"(срок\s*[—\-–:]\s*)([^\n.]+)",
+    flags=re.IGNORECASE,
+)
+
+_MISMATCH_LEAD_RE = (
+    r"(?:"
+    r"в\s+бюджет\w*\s+заказ|"
+    r"в\s+указанн\w+\s+бюджет|"
+    r"в\s+рамках\s+бюджет|"
+    r"на\s+сумм\w*\s+заказ"
+    r")"
+)
+
+_MISMATCH_TAIL_RE = re.compile(
+    rf"\n\n(?={_MISMATCH_LEAD_RE})",
+    flags=re.IGNORECASE,
+)
+
+# Second line only if it continues the soft note — never swallow the next
+# response paragraph (that caused stub-only drafts when note led the text).
+_MISMATCH_BLOCK_RE = re.compile(
+    rf"(?:^|\n\n)(?P<block>"
+    rf"{_MISMATCH_LEAD_RE}[^\n]*"
+    r"(?:\n[^\n]*(?:расширение|полн\w+\s+объ[её]м|ориентир\w*\s+от)[^\n]*)?"
+    r")",
+    flags=re.IGNORECASE,
+)
+
+_SOFT_EXPAND_RE = re.compile(
+    r"расширение\s+сверх\s+mvp\s*[—\-]?\s*обсудим\s+отдельно[^\n]*|"
+    r"расширение\s+объ[её]ма\s+обсудим\s+отдельно[^\n]*",
+    flags=re.IGNORECASE,
+)
+
+
+def response_defers_price_or_days(text: str) -> bool:
+    """True when body clearly defers pricing / timing to clarification."""
+    # Soft mismatch note also contains «после уточнения объёма» — ignore it.
+    body = _SOFT_EXPAND_RE.sub(" ", text or "")
+    return bool(_DEFER_PRICE_DAYS_RE.search(body))
 
 
 def response_has_budget_discuss_note(text: str) -> bool:
@@ -305,17 +477,197 @@ def response_has_budget_discuss_note(text: str) -> bool:
     return hits >= 2
 
 
-def ensure_budget_mismatch_note(text: str, gap: dict | None) -> str:
-    """Append deterministic scope sentence if gap present and note missing."""
+def _hint_cap_rub(gap: dict) -> int | None:
+    """Upper bound for a customer-facing expansion number (hint or soft cap)."""
+    hint = customer_expansion_hint_rub(gap)
+    if hint is not None:
+        return hint
+    fill = int(gap.get("fill_price") or gap.get("ceiling") or 0)
+    max_c_raw = gap.get("max_ceiling")
+    if max_c_raw is not None:
+        return int(max_c_raw)
+    if fill > 0:
+        return int(fill * 2.5)
+    return None
+
+
+def _join_prefix_note_suffix(prefix: str, note: str, suffix: str) -> str:
+    prefix = (prefix or "").rstrip()
+    suffix = (suffix or "").lstrip("\n")
+    parts: list[str] = []
+    if prefix:
+        parts.append(prefix)
+    parts.append(note.rstrip())
+    if suffix:
+        parts.append(suffix)
+    return "\n\n".join(parts)
+
+
+def _normalize_mismatch_note_block(
+    body: str, gap: dict, *, seed: str | None = None
+) -> str | None:
+    """Replace trailing mismatch / scary fair orientir with soft sentence.
+
+    Always keep text outside the replaced block (prefix AND suffix). Old code
+    dropped suffix when the scope note sat at the start → stub-only responses.
+    """
+    note = format_budget_mismatch_sentence(gap, seed=seed)
+    block_m = None
+    for m in _MISMATCH_BLOCK_RE.finditer(body):
+        block_m = m
+    if block_m is not None:
+        start = block_m.start("block")
+        end = block_m.end("block")
+        return _join_prefix_note_suffix(
+            body[:start], note, body[end:]
+        )
+
+    fair_m = None
+    for m in _FAIR_ORIENTIR_RE.finditer(body):
+        fair_m = m
+    if fair_m is not None:
+        amount = _amount_int(fair_m.group("amount"))
+        cap = _hint_cap_rub(gap)
+        if amount is not None and cap is not None and amount > cap:
+            # Replace from sentence start (prefer after newline) through EOL.
+            line_start = body.rfind("\n", 0, fair_m.start()) + 1
+            line_end = body.find("\n", fair_m.end())
+            if line_end < 0:
+                line_end = len(body)
+            return _join_prefix_note_suffix(
+                body[:line_start], note, body[line_end:]
+            )
+        return None
+
+    soft_m = _SOFT_EXPAND_RE.search(body)
+    if soft_m is not None:
+        line_start = body.rfind("\n", 0, soft_m.start()) + 1
+        # Also pull preceding «В бюджете…» on same paragraph if present.
+        para_start = body.rfind("\n\n", 0, soft_m.start())
+        start = 0 if para_start < 0 else para_start + 2
+        if re.search(_MISMATCH_LEAD_RE, body[start:soft_m.start()], flags=re.IGNORECASE):
+            line_start = start
+        line_end = body.find("\n", soft_m.end())
+        if line_end < 0:
+            line_end = len(body)
+        return _join_prefix_note_suffix(
+            body[:line_start], note, body[line_end:]
+        )
+    return None
+
+
+def ensure_budget_mismatch_note(
+    text: str, gap: dict | None, *, seed: str | None = None
+) -> str:
+    """Append or normalize soft scope sentence when gap present."""
     if not gap:
         return text
     body = (text or "").rstrip()
-    if response_has_budget_discuss_note(body):
+    if response_defers_price_or_days(body):
         return body
-    note = format_budget_mismatch_sentence(gap)
+    note = format_budget_mismatch_sentence(gap, seed=seed)
+    if response_has_budget_discuss_note(body):
+        rewritten = _normalize_mismatch_note_block(body, gap, seed=seed)
+        if rewritten is None:
+            return body
+        # Guard: never collapse a full draft into the note alone.
+        if len(body) >= 220 and len(rewritten) < max(120, len(body) // 3):
+            if note.lower() in body.lower():
+                return body
+            return f"{body}\n\n{note}"
+        return rewritten
     if not body:
         return note
     return f"{body}\n\n{note}"
+
+
+def _amount_int(raw: str) -> int | None:
+    digits = re.sub(r"[\s\u00a0]+", "", raw or "")
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
+def _fair_span_overlaps(start: int, end: int, fair_spans: list[tuple[int, int]]) -> bool:
+    for fs, fe in fair_spans:
+        if start < fe and end > fs:
+            return True
+    return False
+
+
+def _split_mismatch_tail(body: str) -> tuple[str, str]:
+    m = _MISMATCH_TAIL_RE.search(body)
+    if not m:
+        return body, ""
+    return body[: m.start()].rstrip(), body[m.start() :]
+
+
+def align_response_commercials(
+    text: str,
+    *,
+    price: int,
+    delivery_days: int | None,
+) -> str:
+    """Force asking price / срок in body to match form fields."""
+    body = (text or "").rstrip()
+    asking = int(price or 0)
+    if asking <= 0 and delivery_days is None:
+        return body
+    formatted = format_rub_amount(asking) if asking > 0 else ""
+    head, tail = _split_mismatch_tail(body)
+
+    if asking > 0 and tail:
+        fill_m = _MISMATCH_FILL_RE.search(tail)
+        if fill_m:
+            fill_val = _amount_int(fill_m.group("amount"))
+            if fill_val is not None and fill_val != asking:
+                tail = (
+                    tail[: fill_m.start("amount")]
+                    + formatted
+                    + tail[fill_m.end("amount") :]
+                )
+
+    if asking > 0:
+        fair_spans = [
+            (m.start("amount"), m.end("amount"))
+            for m in _FAIR_ORIENTIR_RE.finditer(head)
+            if _amount_int(m.group("amount")) != asking
+        ]
+        replaced = False
+        for pattern in (_ASKING_PRICE_RE, _OT_MVP_PRICE_RE, _OT_ASKING_PRICE_RE):
+            for m in pattern.finditer(head):
+                if _fair_span_overlaps(m.start("amount"), m.end("amount"), fair_spans):
+                    continue
+                current = _amount_int(m.group("amount"))
+                if current is None:
+                    continue
+                if current == asking:
+                    replaced = True
+                    break
+                head = (
+                    head[: m.start("amount")]
+                    + formatted
+                    + head[m.end("amount") :]
+                )
+                replaced = True
+                break
+            if replaced:
+                break
+        if not replaced:
+            price_line = f"Стоимость — {formatted} ₽."
+            head = f"{head.rstrip()}\n{price_line}" if head else price_line
+
+    if delivery_days is not None:
+        days = int(delivery_days)
+        srok = _SROK_RE.search(head)
+        if srok:
+            head = head[: srok.start(2)] + f"{days} дн" + head[srok.end(2) :]
+        else:
+            srok_line = f"Срок — {days} дн."
+            head = f"{head.rstrip()}\n{srok_line}" if head else srok_line
+
+    out = f"{head.rstrip()}{tail}" if tail else head.rstrip()
+    return out
 
 
 def budget_mismatch_issues(text: str, gap: dict | None) -> list[str]:
@@ -324,6 +676,10 @@ def budget_mismatch_issues(text: str, gap: dict | None) -> list[str]:
         return []
     issues: list[str] = []
     body = text or ""
+    if response_defers_price_or_days(body):
+        if _ZANIZHEN_RE.search(body):
+            issues.append("budget_mismatch:zanizhen_strategy")
+        return issues
     compact = re.sub(r"[\s\u00a0]+", "", body)
     fair = int(gap["fair_price"])
     fill = int(gap.get("fill_price") or gap["ceiling"])

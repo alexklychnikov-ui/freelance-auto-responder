@@ -104,7 +104,7 @@ async def test_project_help_does_not_use_raw_angle_brackets() -> None:
     # Invoke the registered help path via register + feed would hit network;
     # assert the static help strings used by handlers are HTML-safe.
     start_help = (
-        "Ручной: /project ссылка · /tz текст ТЗ без ссылки\n"
+        "Ручной: /project ссылка · /force id/URL мимо фильтра · /tz ТЗ\n"
     )
     project_help = "/project https://uslugi.yandex.ru/order/UUID\n"
     assert "<ссылка>" not in start_help
@@ -175,6 +175,59 @@ async def test_tz_awaiting_next_message() -> None:
     tz_handler.assert_awaited_once()
     assert tz_handler.await_args.args[1] == body
     text_handler.assert_not_awaited()
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_project_bare_kwork_id_triggers_manual_handler() -> None:
+    manual_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_manual_project=manual_handler,
+    )
+
+    await bot.dispatcher.feed_update(bot.bot, _make_update("/project 3266288"))
+
+    manual_handler.assert_awaited_once()
+    assert manual_handler.await_args.args[1:] == ("3266288", "kwork")
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_force_bare_kwork_id_triggers_force_handler() -> None:
+    force_handler = AsyncMock()
+    manual_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_manual_project=manual_handler,
+        on_force_project=force_handler,
+    )
+
+    await bot.dispatcher.feed_update(bot.bot, _make_update("/force 3266288"))
+
+    force_handler.assert_awaited_once()
+    assert force_handler.await_args.args[1:] == ("3266288", "kwork")
+    manual_handler.assert_not_awaited()
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_force_ignored_for_wrong_chat() -> None:
+    force_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="999", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_force_project=force_handler,
+    )
+
+    await bot.dispatcher.feed_update(bot.bot, _make_update("/force 3266288"))
+
+    force_handler.assert_not_awaited()
     await bot.close()
 
 

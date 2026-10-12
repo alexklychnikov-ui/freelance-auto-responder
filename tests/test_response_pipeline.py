@@ -24,6 +24,7 @@ from src.analyzer.response_pipeline import (
     force_logic_fail_for_questions,
     format_limit_message,
     soft_banned_issues,
+    task_match_issues,
     _buyer_first_name,
 )
 from tests.test_project_brief_checklist import (
@@ -62,6 +63,22 @@ def _project(*, buyer: str | None = None) -> ProjectFull:
         full_description="Нужен Telegram-бот на aiogram для заявок без онлайн-оплаты.",
         desired_budget="от 20000",
         buyer=buyer,
+    )
+
+
+def _project_torgi_evidence() -> ProjectFull:
+    """TZ domain matches _EVIDENCE_GOOD_DRAFT / torgi evidence bundle."""
+    return ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3252339",
+        url="https://kwork.ru/projects/3252339",
+        title="Парсер поиска извещений ГИС торги без ЛК",
+        full_description=(
+            "Нужен парсинг и поиск по извещениям torgi.gov.ru: "
+            "выдача документов и вложений без личного кабинета, MVP."
+        ),
+        desired_budget="от 30000",
     )
 
 
@@ -133,6 +150,106 @@ def test_soft_banned_ponimayu_template_opener() -> None:
     assert not soft_banned_issues(
         "Здравствуйте! Сделаю Telegram-бота под заявки менеджеру."
     )
+
+
+def test_soft_banned_vazhnee_ne_prosto_opener() -> None:
+    vazhnee = soft_banned_issues(
+        "Здравствуйте! В таком Telegram-боте важнее не просто отвечать на сообщения, "
+        "а выстроить сценарии под заявки."
+    )
+    assert "opener:важнее_не_просто" in vazhnee
+    assert "opener:в_таком_важн" in vazhnee
+
+    klyuchevoe = soft_banned_issues(
+        "Здравствуйте! Здесь ключевое — не просто бот, а стабильная доставка заявок."
+    )
+    assert "opener:ключевое_не_просто" in klyuchevoe
+    assert "opener:здесь_ключевое" in klyuchevoe
+
+    clean = soft_banned_issues(
+        "Здравствуйте! Настрою бота, который сразу принимает заявки и шлёт их менеджеру."
+    )
+    assert clean == []
+
+
+def test_soft_banned_vague_cta_gotov_obsudit() -> None:
+    vague = soft_banned_issues(
+        "Здравствуйте! Сделаю бота. Срок — 5 дней. Стоимость — от 20 000 ₽. "
+        "Готов обсудить."
+    )
+    assert any("готов обсудить" in i for i in vague)
+
+    davayte = soft_banned_issues(
+        "Здравствуйте! Сделаю бота. Давайте обсудим детали."
+    )
+    assert any("давайте обсудим" in i for i in davayte)
+
+    # «обсудим старт после …» — не пустой CTA-бан
+    discuss_start = soft_banned_issues(
+        "Здравствуйте! Настрою бота под заявки. "
+        "Обсудим старт после уточнения объёма."
+    )
+    assert not any("готов обсудить" in i or "давайте обсудим" in i for i in discuss_start)
+
+    clean = soft_banned_issues(
+        "Здравствуйте! Сделаю бота под ваши заявки. "
+        "Если пришлёте текущее ТЗ — быстро проверю архитектуру и скажу, "
+        "что выгоднее: доработка или с нуля."
+    )
+    assert clean == []
+
+
+def test_task_match_mismatch_figma_landing_vs_finance() -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="figma1",
+        url="https://kwork.ru/projects/figma1",
+        title="Создание лендинга по презентации из Figma",
+        full_description="Нужен лендинг по макету Figma: блоки, адаптив, форма заявки.",
+        desired_budget="от 15000",
+    )
+    draft = (
+        "Здравствуйте! Сделаю систему учёта финансов: доходы, расходы и отчёты для бухгалтерии.\n"
+        "Срок — 7 дней. Стоимость — от 15 000 ₽."
+    )
+    issues = task_match_issues(project, draft)
+    assert "tz:task_mismatch" in issues
+
+
+def test_task_match_bot_draft_ok() -> None:
+    issues = task_match_issues(_project(), SAMPLE_DRAFT)
+    assert "tz:task_mismatch" not in issues
+
+
+def test_task_match_erp_allows_corp_phrase_bans_dynamics() -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="erp1",
+        url="https://kwork.ru/projects/erp1",
+        title="Интеграция ERP и CRM",
+        full_description=(
+            "Нужна интеграция ERP/CRM/WMS и автоматизация бизнес-процессов "
+            "обмена заказами со складом."
+        ),
+        desired_budget="от 80000",
+    )
+    corp_ok = (
+        "Здравствуйте! Настрою интеграцию ERP и CRM под обмен заказами со складом — "
+        "есть опыт корпоративных интеграций.\n"
+        "Срок — 14 дней. Стоимость — от 80 000 ₽."
+    )
+    assert "tz:task_mismatch" not in task_match_issues(project, corp_ok)
+    assert not any("dynamics" in i for i in task_match_issues(project, corp_ok))
+
+    with_ax = (
+        "Здравствуйте! Настрою интеграцию ERP и CRM. "
+        "Работал с Microsoft Dynamics AX на похожих внедрениях.\n"
+        "Срок — 14 дней. Стоимость — от 80 000 ₽."
+    )
+    ax_issues = task_match_issues(project, with_ax)
+    assert "phrase:dynamics ax" in ax_issues
 
 
 def test_pipeline_happy_path_one_draft(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -814,6 +931,51 @@ def test_revise_parses_openai_response() -> None:
     assert user["current_text"] == "Старый отклик без срока."
 
 
+def test_revise_includes_verified_evidence_when_passed() -> None:
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {
+        "choices": [{"message": {"content": "Исправленный отклик с якорем 184729."}}]
+    }
+    mock_client.post.return_value = mock_resp
+
+    pipe = ResponsePipeline(_settings(), http_client=mock_client)
+    out = pipe.revise(
+        _project(),
+        "Старый отклик.",
+        "добавь детали по лоту",
+        evidence=_evidence_bundle_for_pipeline(),
+    )
+    assert "184729" in out or out
+    body = mock_client.post.call_args.kwargs["json"]
+    system = body["messages"][0]["content"]
+    assert "verified_evidence" in system
+    user = json.loads(body["messages"][1]["content"])
+    assert "verified_evidence" in user
+    assert user["verified_evidence"]["facts"]
+    assert all("quote" not in f for f in user["verified_evidence"]["facts"])
+    assert pipe._last_evidence is not None
+
+
+def test_revise_omits_verified_evidence_when_none() -> None:
+    mock_client = MagicMock()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.raise_for_status = MagicMock()
+    mock_resp.json.return_value = {
+        "choices": [{"message": {"content": "Правка без evidence."}}]
+    }
+    mock_client.post.return_value = mock_resp
+
+    pipe = ResponsePipeline(_settings(), http_client=mock_client)
+    pipe.revise(_project(), "Старый.", "убери цену", evidence=None)
+    user = json.loads(mock_client.post.call_args.kwargs["json"]["messages"][1]["content"])
+    assert "verified_evidence" not in user
+    assert pipe._last_evidence is None
+
+
 def test_yandex_347bc2fc_bad_fails_logic_even_if_critic_passes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1039,7 +1201,7 @@ def test_critique_logic_passes_with_anchors(
         }
 
     monkeypatch.setattr(pipe, "_openai_json", fake_json)
-    result = pipe._critique_logic(_EVIDENCE_GOOD_DRAFT, _project())
+    result = pipe._critique_logic(_EVIDENCE_GOOD_DRAFT, _project_torgi_evidence())
     assert result["verdict"] == "pass"
 
 

@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 from openpyxl import load_workbook
 
-from src.journal.writer import JOURNAL_COLUMNS, JournalWriter, extract_journal_project_id
+from src.journal.writer import (
+    JOURNAL_COLUMNS,
+    JournalWriter,
+    extract_journal_project_id,
+    relevance_tier,
+    response_kind_label,
+)
 from src.models import GptScoreResult, ProjectFull
 
 
@@ -26,6 +32,8 @@ def project() -> ProjectFull:
         url="https://kwork.ru/projects/100",
         title="Test project",
         full_description="desc",
+        desired_budget="15000",
+        max_budget="20000",
     )
 
 
@@ -48,6 +56,15 @@ def test_journal_template_has_columns(journal_path: Path) -> None:
     ws = wb.active
     headers = [ws.cell(row=1, column=c).value for c in range(1, len(JOURNAL_COLUMNS) + 1)]
     assert headers == JOURNAL_COLUMNS
+    assert len(JOURNAL_COLUMNS) == 15
+    assert JOURNAL_COLUMNS[9:15] == [
+        "Бюджет заказчика",
+        "Моя цена",
+        "Релевантность",
+        "Похожий кейс",
+        "Тип отклика",
+        "Причина отказа",
+    ]
     assert ws.column_dimensions["H"].width == 73
     assert ws.column_dimensions["I"].width == 73
     wb.close()
@@ -72,6 +89,55 @@ def test_journal_append_row(journal_path: Path, project: ProjectFull, score: Gpt
     assert ws.cell(row=2, column=5).value == "Telegram-бот"
     assert ws.cell(row=2, column=6).value == "Отправлен"
     wb.close()
+
+
+def test_append_prepared_fills_kpi_columns(
+    journal_path: Path, project: ProjectFull, score: GptScoreResult
+) -> None:
+    personal = (
+        "По задаче с Telegram-ботом сделаю приём заявок, админку и выгрузку в Google Sheets. "
+        "Сначала подключу webhook и авторизацию, затем формы и уведомления менеджеру. "
+        "Могу показать похожий кейс по боту для заявок в чате."
+    )
+    assert len(personal) > 200
+    writer = JournalWriter(journal_path)
+    writer.append_prepared(project, score, personal, price="12000", delivery_days=7)
+
+    wb = load_workbook(journal_path)
+    ws = wb.active
+    assert ws.cell(row=2, column=1).value == 1
+    assert ws.cell(row=2, column=6).value == "Подготовлен"
+    assert ws.cell(row=2, column=7).value == "Жду ответа"
+    assert ws.cell(row=2, column=10).value == "15000"
+    assert ws.cell(row=2, column=11).value == "12000"
+    assert ws.cell(row=2, column=12).value == "A"
+    assert ws.cell(row=2, column=13).value == "Да"
+    assert ws.cell(row=2, column=14).value == "Персональный"
+    assert ws.cell(row=2, column=15).value in (None, "")
+    wb.close()
+
+
+def test_relevance_tier_and_response_kind() -> None:
+    high = GptScoreResult(
+        score=8,
+        fit=True,
+        reason="ok",
+        matched_skills=["Python"],
+        risks=[],
+        suggested_project_type="AI/RAG",
+        competition_level="low",
+        recommendation="откликаться",
+    )
+    mid = high.model_copy(update={"score": 5, "fit": False, "matched_skills": []})
+    low = high.model_copy(update={"score": 3, "fit": False, "matched_skills": []})
+    assert relevance_tier(high) == "A"
+    assert relevance_tier(mid) == "B"
+    assert relevance_tier(low) == "C"
+    assert relevance_tier(low, acceptance_tier="quick_win") == "B"
+    assert response_kind_label("короткий текст") == "Шаблон"
+    assert response_kind_label("Сделаю парсер и demo в чате " + "детали " * 40) == (
+        "Персональный + demo"
+    )
 
 
 def test_journal_skips_merged_cells(

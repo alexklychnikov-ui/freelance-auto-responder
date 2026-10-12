@@ -170,6 +170,32 @@ async def _daemon_async() -> int:
             except asyncio.TimeoutError:
                 pass
 
+    extra_tasks: list[asyncio.Task[None]] = []
+
+    if settings.kwork_fast_scan_enabled:
+        process_worker_task = asyncio.create_task(
+            orchestrator.run_process_worker(shutdown)
+        )
+        extra_tasks.append(process_worker_task)
+
+        fast_interval_sec = max(1, int(settings.kwork_fast_scan_seconds))
+
+        async def kwork_fast_loop() -> None:
+            while not shutdown.is_set():
+                try:
+                    totals = await orchestrator.run_kwork_fast_scan_cycle()
+                    logger.info("kwork_fast_scan %s", totals)
+                except Exception:
+                    logger.exception("kwork fast scan cycle failed")
+                try:
+                    await asyncio.wait_for(
+                        shutdown.wait(), timeout=fast_interval_sec
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+        extra_tasks.append(asyncio.create_task(kwork_fast_loop()))
+
     inbox_task = asyncio.create_task(inbox_loop())
     scan_task = asyncio.create_task(scan_loop())
     try:
@@ -178,7 +204,9 @@ async def _daemon_async() -> int:
         inbox_task.cancel()
         scan_task.cancel()
         bot_task.cancel()
-        for task in (inbox_task, scan_task, bot_task):
+        for task in extra_tasks:
+            task.cancel()
+        for task in (inbox_task, scan_task, bot_task, *extra_tasks):
             try:
                 await task
             except asyncio.CancelledError:

@@ -18,9 +18,7 @@ from aiogram.types import (
     Message,
 )
 
-from src.adapters.flru_urls import extract_flru_project_id
-from src.adapters.kwork_urls import extract_kwork_project_id
-from src.adapters.yandex_urls import extract_yandex_order_id
+from src.telegram_bot.project_input import parse_project_command_arg
 from src.analyzer.project_tier import resolve_acceptance_tier, tier_label
 from src.config import get_settings
 from src.models import GptScoreResult, PendingOffer, ProjectFull
@@ -59,6 +57,10 @@ _CB_SOURCE = {
     "flru_orders": "flo",
     "flru_manual": "flm",
     "tz_manual": "tzm",
+    "kwork_dev_it": "kdi",
+    "kwork_c5": "kc5",
+    "kwork_c15": "kc15",
+    "kwork_manual": "kwm",
 }
 _CB_SOURCE_REV = {v: k for k, v in _CB_SOURCE.items()}
 _CB_SOURCE_REV.update({k: k for k in _CB_SOURCE})
@@ -70,6 +72,8 @@ CALLBACK_PREPARE_RETRY = "prepare_retry"
 CALLBACK_REGENERATE = "regen"
 CALLBACK_CORRECT = "corr"
 CALLBACK_OPEN = "open"
+CALLBACK_EARLY_GO = "ego"
+CALLBACK_EARLY_SKIP = "esk"
 
 
 def _chunk_text(text: str, max_len: int = 4000) -> list[str]:
@@ -167,6 +171,8 @@ def format_review_card(offer: PendingOffer) -> str:
     )
     if offer.url:
         body += f"🔗 {offer.url}\n"
+    if offer.budget_ceiling_warning:
+        body += f"\n{offer.budget_ceiling_warning}\n"
     body += (
         f"\n📊 Оценка GPT: {score.score}/10 — {score.reason}\n"
         f"✅ Стек: {skills}\n"
@@ -174,6 +180,29 @@ def format_review_card(offer: PendingOffer) -> str:
         f"📝 Кратко:\n{desc_preview}"
     )
     return header + body
+
+
+def build_early_listing_keyboard(
+    platform: str, source_key: str, project_id: str
+) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Откликнуться",
+                    callback_data=_callback_data(
+                        CALLBACK_EARLY_GO, platform, source_key, project_id
+                    ),
+                ),
+                InlineKeyboardButton(
+                    text="⏭ Пропустить",
+                    callback_data=_callback_data(
+                        CALLBACK_EARLY_SKIP, platform, source_key, project_id
+                    ),
+                ),
+            ]
+        ]
+    )
 
 
 def build_review_keyboard(offer: PendingOffer) -> InlineKeyboardMarkup:
@@ -338,13 +367,17 @@ class TelegramReviewBot:
         on_response_text: Any | None = None,
         on_export_journal: Any | None = None,
         on_scan_report: Any | None = None,
+        on_notebook_sync: Any | None = None,
         on_journal_confirm: Any | None = None,
         on_prepare_retry: Any | None = None,
         on_regenerate: Any | None = None,
         on_correct: Any | None = None,
         on_correct_instruction: Any | None = None,
         on_manual_project: Any | None = None,
+        on_force_project: Any | None = None,
         on_manual_tz: Any | None = None,
+        on_early_go: Any | None = None,
+        on_early_skip: Any | None = None,
     ) -> None:
         @self._dp.callback_query(F.data.startswith(f"{CALLBACK_APPROVE}:"))
         async def handle_approve(callback: CallbackQuery) -> None:
@@ -353,7 +386,6 @@ class TelegramReviewBot:
                 await callback.answer("Некорректный callback")
                 return
             _, platform, source_key, project_id = parsed
-            await callback.answer("Готовлю отклик для формы…")
             await on_approve(platform, source_key, project_id, callback)
 
         @self._dp.callback_query(F.data.startswith(f"{CALLBACK_REJECT}:"))
@@ -364,6 +396,28 @@ class TelegramReviewBot:
                 return
             _, platform, source_key, project_id = parsed
             await on_reject(platform, source_key, project_id, callback)
+
+        if on_early_go is not None:
+
+            @self._dp.callback_query(F.data.startswith(f"{CALLBACK_EARLY_GO}:"))
+            async def handle_early_go(callback: CallbackQuery) -> None:
+                parsed = parse_callback_data(callback.data or "")
+                if not parsed:
+                    await callback.answer("Некорректный callback")
+                    return
+                _, platform, source_key, project_id = parsed
+                await on_early_go(platform, source_key, project_id, callback)
+
+        if on_early_skip is not None:
+
+            @self._dp.callback_query(F.data.startswith(f"{CALLBACK_EARLY_SKIP}:"))
+            async def handle_early_skip(callback: CallbackQuery) -> None:
+                parsed = parse_callback_data(callback.data or "")
+                if not parsed:
+                    await callback.answer("Некорректный callback")
+                    return
+                _, platform, source_key, project_id = parsed
+                await on_early_skip(platform, source_key, project_id, callback)
 
         if on_journal_confirm is not None:
 
@@ -423,8 +477,8 @@ class TelegramReviewBot:
                 "Freelance Auto-Responder\n"
                 "Kwork: карточка → автозаполнение формы (VPS).\n"
                 "Яндекс / FL.ru: карточка → текст в TG → копируй вручную.\n"
-                "Ручной: /project ссылка · /tz текст ТЗ без ссылки\n"
-                "Excel: /journal · отчёт сканов: /report"
+                "Ручной: /project ссылка · /force id/URL мимо фильтра · /tz ТЗ\n"
+                "Excel: /journal · Notebook: /notebook [N] · отчёт: /report"
             )
 
         if on_manual_tz is not None:
@@ -448,32 +502,58 @@ class TelegramReviewBot:
 
             @self._dp.message(Command("project"))
             async def handle_project_command(message: Message) -> None:
+                if str(message.chat.id) != self.chat_id:
+                    return
                 self._tz_awaiting_chats.discard(str(message.chat.id))
                 self.clear_correct_awaiting(str(message.chat.id))
                 parts = (message.text or "").split(maxsplit=1)
                 if len(parts) < 2:
                     await message.answer(
-                        "Пришли ссылку:\n"
+                        "Пришли ссылку или id Kwork:\n"
                         "/project https://kwork.ru/projects/123456/view\n"
+                        "/project 3266288\n"
                         "/project https://uslugi.yandex.ru/order/UUID\n"
                         "/project https://www.fl.ru/projects/5514790/..."
                     )
                     return
-                flru_id = extract_flru_project_id(parts[1])
-                if flru_id:
-                    await on_manual_project(message, flru_id, "flru")
-                    return
-                yandex_id = extract_yandex_order_id(parts[1])
-                if yandex_id:
-                    await on_manual_project(message, yandex_id, "yandex_uslugi")
-                    return
-                project_id = extract_kwork_project_id(parts[1])
-                if not project_id:
+                parsed = parse_project_command_arg(parts[1])
+                if not parsed:
                     await message.answer(
                         "Не распознал ссылку Kwork, Яндекс Услуги или FL.ru"
                     )
                     return
-                await on_manual_project(message, project_id, "kwork")
+                project_id, platform = parsed
+                await on_manual_project(message, project_id, platform)
+
+        if on_force_project is not None:
+
+            @self._dp.message(Command("force"))
+            async def handle_force_command(message: Message) -> None:
+                if str(message.chat.id) != self.chat_id:
+                    return
+                self._tz_awaiting_chats.discard(str(message.chat.id))
+                self.clear_correct_awaiting(str(message.chat.id))
+                parts = (message.text or "").split(maxsplit=1)
+                if len(parts) < 2:
+                    await message.answer(
+                        "⚡ Force — загрузка проекта <b>мимо фильтра стека/score</b>, "
+                        "далее карточка на ревью в TG.\n\n"
+                        "Примеры:\n"
+                        "/force 3266288\n"
+                        "/force https://kwork.ru/projects/3266288/view\n"
+                        "/force https://uslugi.yandex.ru/order/UUID\n"
+                        "/force https://www.fl.ru/projects/5514790/...",
+                        parse_mode="HTML",
+                    )
+                    return
+                parsed = parse_project_command_arg(parts[1])
+                if not parsed:
+                    await message.answer(
+                        "Не распознал id/ссылку Kwork, Яндекс Услуги или FL.ru"
+                    )
+                    return
+                project_id, platform = parsed
+                await on_force_project(message, project_id, platform)
 
         @self._dp.message(Command("report"))
         async def handle_report(message: Message) -> None:
@@ -490,6 +570,25 @@ class TelegramReviewBot:
             if on_export_journal is None:
                 return
             await on_export_journal(message)
+
+        @self._dp.message(Command("notebook"))
+        async def handle_notebook(message: Message) -> None:
+            self._tz_awaiting_chats.discard(str(message.chat.id))
+            self.clear_correct_awaiting(str(message.chat.id))
+            if on_notebook_sync is None:
+                return
+            if str(message.chat.id) != self.chat_id:
+                return
+            parts = (message.text or "").split()
+            days = 10
+            if len(parts) >= 2:
+                try:
+                    days = int(parts[1])
+                except ValueError:
+                    await message.answer("Формат: /notebook [N] где N=1..90")
+                    return
+            days = max(1, min(days, 90))
+            await on_notebook_sync(message, days)
 
         if on_response_text is not None or on_correct_instruction is not None:
 
@@ -513,25 +612,16 @@ class TelegramReviewBot:
                 if on_manual_tz is not None and message.text:
                     chat_key = str(message.chat.id)
                     if chat_key in self._tz_awaiting_chats:
-                        flru_id = extract_flru_project_id(message.text)
-                        yandex_id = extract_yandex_order_id(message.text)
-                        project_id = extract_kwork_project_id(message.text)
+                        parsed = parse_project_command_arg(message.text)
                         self._tz_awaiting_chats.discard(chat_key)
-                        if not (flru_id or yandex_id or project_id):
+                        if parsed is None:
                             await on_manual_tz(message, message.text.strip())
                             return
                 if on_manual_project is not None and message.text:
-                    flru_id = extract_flru_project_id(message.text)
-                    if flru_id:
-                        await on_manual_project(message, flru_id, "flru")
-                        return
-                    yandex_id = extract_yandex_order_id(message.text)
-                    if yandex_id:
-                        await on_manual_project(message, yandex_id, "yandex_uslugi")
-                        return
-                    project_id = extract_kwork_project_id(message.text)
-                    if project_id:
-                        await on_manual_project(message, project_id, "kwork")
+                    parsed = parse_project_command_arg(message.text)
+                    if parsed:
+                        project_id, platform = parsed
+                        await on_manual_project(message, project_id, platform)
                         return
                 if on_response_text is not None:
                     await on_response_text(message)
@@ -767,6 +857,61 @@ class TelegramReviewBot:
 
     async def notify(self, text: str) -> None:
         await self._bot.send_message(chat_id=self.chat_id, text=text)
+
+    async def notify_early_listing(
+        self,
+        *,
+        platform: str,
+        source_key: str,
+        project_id: str,
+        title: str,
+        offers: int | None,
+        url: str,
+    ) -> int | None:
+        offers_text = str(offers) if offers is not None else "—"
+        text = (
+            "⚡ Новый Kwork\n"
+            f"<b>{html.escape(title)}</b>\n"
+            f"Откликов: {html.escape(offers_text)}\n"
+            f"Источник: {html.escape(source_key)}\n"
+            f"{html.escape(url)}"
+        )
+        msg = await self._bot.send_message(
+            chat_id=self.chat_id,
+            text=text,
+            reply_markup=build_early_listing_keyboard(
+                platform, source_key, project_id
+            ),
+            disable_web_page_preview=True,
+        )
+        return getattr(msg, "message_id", None)
+
+    async def edit_early_listing_result(
+        self,
+        message_id: int,
+        *,
+        title: str,
+        offers: int | None,
+        source_key: str,
+        url: str,
+        footer: str,
+    ) -> None:
+        offers_text = str(offers) if offers is not None else "—"
+        text = (
+            "⚡ Новый Kwork\n"
+            f"<b>{html.escape(title)}</b>\n"
+            f"Откликов: {html.escape(offers_text)}\n"
+            f"Источник: {html.escape(source_key)}\n"
+            f"{html.escape(url)}\n\n"
+            f"{html.escape(footer)}"
+        )
+        await self._bot.edit_message_text(
+            chat_id=self.chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=None,
+            disable_web_page_preview=True,
+        )
 
     async def send_photo(self, image: bytes, caption: str) -> None:
         await self._bot.send_photo(

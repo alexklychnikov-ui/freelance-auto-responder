@@ -11,3 +11,5 @@ pytest-asyncio>=0.24
 playwright>=1.49
 mcp>=1.8
 pypdf>=4.0
+gspread>=6.0
+google-auth>=2.0

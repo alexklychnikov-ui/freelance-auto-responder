@@ -72,8 +72,12 @@ class GptResponseGenerator:
         project: ProjectFull,
         current_text: str,
         instruction: str,
+        *,
+        evidence: Any | None = None,
     ) -> str:
-        return self._pipeline.revise(project, current_text, instruction)
+        return self._pipeline.revise(
+            project, current_text, instruction, evidence=evidence
+        )
 
     def generate(
         self,
@@ -88,6 +92,7 @@ class GptResponseGenerator:
         days_hint: int | None = None,
         budget_mismatch: dict[str, Any] | None = None,
         evidence: Any | None = None,
+        project_type: Any = None,
     ) -> str:
         _ = platform_label  # reserved for multi-platform prompts
         return self._pipeline.generate(
@@ -100,6 +105,7 @@ class GptResponseGenerator:
             days_hint=days_hint,
             budget_mismatch=budget_mismatch,
             evidence=evidence,
+            project_type=project_type,
         )
 
     async def generate_with_progress(
@@ -115,6 +121,7 @@ class GptResponseGenerator:
         days_hint: int | None = None,
         budget_mismatch: dict[str, Any] | None = None,
         evidence: Any | None = None,
+        project_type: Any = None,
     ) -> str:
         _ = platform_label
         return await self._pipeline.generate_with_progress(
@@ -127,5 +134,6 @@ class GptResponseGenerator:
             days_hint=days_hint,
             budget_mismatch=budget_mismatch,
             evidence=evidence,
+            project_type=project_type,
             threaded=True,
         )

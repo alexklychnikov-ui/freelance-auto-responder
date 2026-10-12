@@ -181,3 +181,65 @@ def test_evidence_service_stub() -> None:
     assert svc.collect_candidates(_project("нет ссылок")) == []
     out = svc.collect_candidates(_project(TZ_3252339), max_urls=3)
     assert len(out) >= 2
+
+
+def test_candidates_from_urls_fixed_role() -> None:
+    from src.evidence.discovery import candidates_from_urls
+
+    found = candidates_from_urls(
+        ["https://torgi.gov.ru/new/public", "https://torgi.gov.ru/new/public/"],
+        role="data_source",
+    )
+    assert len(found) == 1
+    assert found[0].role == "data_source"
+    assert found[0].priority == 100
+    assert "torgi.gov.ru" in found[0].input_ref
+
+
+def test_collect_extra_candidates_when_project_has_no_urls() -> None:
+    """Instruction URL alone must drive collect (no early not_required)."""
+    from pathlib import Path
+
+    from src.evidence.discovery import candidates_from_urls
+
+    fixtures = Path(__file__).resolve().parent / "fixtures" / "evidence"
+    gov_html = (fixtures / "3252339_torgi_gov_public.html").read_text(encoding="utf-8")
+    project = _project("Нужен парсер без ссылок в ТЗ")
+    assert discover(project, max_urls=3) == []
+
+    extra = candidates_from_urls(["https://torgi.gov.ru"], role="data_source")
+    bundle = EvidenceService().collect(
+        project,
+        fetch=False,
+        max_urls=3,
+        extra_candidates=extra,
+        injected_texts={"https://torgi.gov.ru": gov_html, "torgi.gov.ru": gov_html},
+    )
+    assert bundle.required is True
+    assert bundle.status != "not_required"
+    assert any(s.status == "verified" for s in bundle.sources)
+    assert bundle.facts
+    assert any("torgi.gov.ru" in (s.input_ref or "") for s in bundle.sources)
+
+
+def test_telegram_at_handle_becomes_tme_reference() -> None:
+    text = (
+        "Нужно скопировать телеграм бота @specflowbot — референс: "
+        "AI-интервью → готовое ТЗ в PDF."
+    )
+    found = extract_url_candidates(text, max_urls=3)
+    assert any(c.input_ref == "https://t.me/specflowbot" for c in found)
+    bot = next(c for c in found if c.input_ref == "https://t.me/specflowbot")
+    assert bot.role == "reference"
+    assert bot.priority == 60
+
+    cands = discover(_project(text), max_urls=3)
+    refs = {c.input_ref for c in cands if c.kind == "url"}
+    assert "https://t.me/specflowbot" in refs
+
+
+def test_telegram_handle_dedupes_with_tme_url() -> None:
+    text = "референс @specflowbot и https://t.me/specflowbot"
+    found = extract_url_candidates(text, max_urls=5)
+    tme = [c for c in found if "specflowbot" in c.input_ref]
+    assert len(tme) == 1

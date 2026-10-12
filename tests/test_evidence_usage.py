@@ -10,6 +10,7 @@ from src.evidence.models import (
     EvidenceInsight,
     EvidenceSource,
 )
+from src.evidence.discovery import reference_bot_usage_issues
 from src.evidence.usage import (
     EvidenceUsageValidator,
     compact_verified_evidence,
@@ -319,3 +320,33 @@ def test_short_numeric_anchors_do_not_satisfy_usage_gate() -> None:
 
     good = "В sitemap 8 URL и 3 страниц товаров — обойду по sitemap."
     assert evidence_usage_issues(good, bundle) == []
+
+
+def test_reference_bot_unused_gate() -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork",
+        project_id="3262969",
+        url="https://kwork.ru/projects/3262969",
+        title="Скопировать телеграм бота",
+        full_description=(
+            "Нужен аналог @specflowbot: AI-интервью и PDF с ТЗ."
+        ),
+    )
+    generic = (
+        "Здравствуйте!\n"
+        "Соберу похожий бот под ваш сценарий интервью.\n"
+        "Срок — 5 дней. Стоимость — от 13 000 ₽."
+    )
+    issues = reference_bot_usage_issues(project, generic)
+    assert "reference_bot:unused:specflowbot" in issues
+
+    named = (
+        "Здравствуйте!\n"
+        "Сделаю аналог SpecFlowBot: AI-интервью и выгрузку ТЗ в PDF.\n"
+        "Срок — 5 дней. Стоимость — от 13 000 ₽."
+    )
+    assert reference_bot_usage_issues(project, named) == []
+
+    at_named = named.replace("SpecFlowBot", "@specflowbot")
+    assert reference_bot_usage_issues(project, at_named) == []

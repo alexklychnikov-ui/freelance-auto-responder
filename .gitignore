@@ -2,6 +2,7 @@
 .env
 *.pem
 *.key
+secrets/
 
 # python
 venv/

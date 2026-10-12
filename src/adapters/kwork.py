@@ -14,6 +14,7 @@ from src.adapters.kwork_delivery import (
     snap_delivery_days,
 )
 from src.adapters.kwork_pricing import (
+    align_response_commercials,
     budget_gap,
     clamp_price_to_budget,
     ensure_budget_mismatch_note,
@@ -3265,7 +3266,13 @@ class KworkAdapter:
                     "ratio": round(fair_for_note / int(form_max), 4),
                 }
             if gap_from_form is not None:
-                text = ensure_budget_mismatch_note(text, gap_from_form)
+                text = ensure_budget_mismatch_note(
+                    text, gap_from_form, seed=str(project_id or "")
+                )
+
+        text = align_response_commercials(
+            text, price=int(price), delivery_days=delivery_days
+        )
 
         if not _prime_payment_ui(self.browser, str(price)):
             diag = _read_payment_diag(self.browser)

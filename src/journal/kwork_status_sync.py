@@ -32,6 +32,7 @@ def sync_journal_from_kwork_offers(
     offers: dict[str, KworkMyOfferStatus] | None = None,
     project_types: dict[str, str] | None = None,
     browser: BrowserClient | None = None,
+    update_existing: bool = False,
 ) -> KworkStatusSyncResult:
     settings = settings or get_settings()
     writer = JournalWriter(journal_path)
@@ -68,6 +69,9 @@ def sync_journal_from_kwork_offers(
         ptype = types.get(project_id)
         if project_id in journal_ids:
             result.matched += 1
+            if not update_existing:
+                result.skipped += 1
+                continue
             if writer.update_status_by_project_id(
                 project_id,
                 status=status,
@@ -91,8 +95,9 @@ def sync_journal_from_kwork_offers(
         journal_ids.add(project_id)
         result.appended += 1
 
-    writer.repair_all_rows(
-        titles={pid: (offer.title or "") for pid, offer in offers.items()},
-        project_types=types,
-    )
+    if update_existing:
+        writer.repair_all_rows(
+            titles={pid: (offer.title or "") for pid, offer in offers.items()},
+            project_types=types,
+        )
     return result

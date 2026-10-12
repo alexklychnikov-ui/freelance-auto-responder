@@ -29,7 +29,12 @@ from src.analyzer.response_text import (
     kwork_compliance_issues,
     payment_mismatch_issues,
 )
+from src.analyzer.response_vertical import (
+    resolve_response_vertical,
+    vertical_hints_for,
+)
 from src.config import Settings
+from src.evidence.discovery import reference_bot_usage_issues
 from src.evidence.usage import compact_verified_evidence, evidence_usage_issues
 from src.models import ProjectFull
 
@@ -52,7 +57,10 @@ REVISE_SYSTEM_PROMPT = """\
 Ты правишь готовый отклик по инструкциям фрилансера. \
 Абзацы разделяй РЕАЛЬНЫМИ переносами строк, никогда не пиши символы \\n или \\r как текст. \
 Красная строка = 4 пробела в начале абзаца (кроме первого, если так уже принято). \
-Не добавляй markdown. Верни ТОЛЬКО текст отклика."""
+Не добавляй markdown. Верни ТОЛЬКО текст отклика. \
+Если в user payload есть verified_evidence — вплети 1–2 проверенных факта/якоря в ответ; \
+не выдумывай API; не вставляй внешние http-ссылки в текст отклика; \
+следуй инструкции фрилансера."""
 
 MAX_REVISION_CYCLES = 2
 
@@ -147,6 +155,99 @@ _QUESTION_TOKEN_STOPWORDS = {
     "an",
 }
 
+# Extra stopwords for title salient tokens (task-match gate).
+_TITLE_TOKEN_STOPWORDS = _QUESTION_TOKEN_STOPWORDS | {
+    "создание",
+    "создать",
+    "сделать",
+    "разработка",
+    "разработать",
+    "проект",
+    "проекту",
+    "система",
+    "системы",
+    "нужен",
+    "нужна",
+    "нужно",
+    "нужны",
+    "требуется",
+    "нужна",
+    "просто",
+    "новый",
+    "новая",
+    "новое",
+    "ваши",
+    "вашей",
+    "вашего",
+    "заказ",
+    "заказа",
+    "помощь",
+    "помогите",
+    "ищу",
+    "looking",
+    "need",
+    "wanted",
+    "with",
+    "from",
+    "this",
+    "that",
+    "have",
+}
+
+# Domain / product markers already common in TZ (substring, lowercased).
+_DOMAIN_MARKERS = (
+    "telegram",
+    "телеграм",
+    "aiogram",
+    "woocommerce",
+    "wordpress",
+    "excel",
+    "csv",
+    "crm",
+    "erp",
+    "wms",
+    "парсинг",
+    "парсер",
+    "бот",
+    "figma",
+    "лендинг",
+    "landing",
+    "amocrm",
+    "bitrix",
+    "1с",
+    "1c",
+    "next.js",
+    "nextjs",
+    "портфолио",
+    "интеграц",
+    "парс",
+    "магазин",
+    "webhook",
+    "fastapi",
+    "postgresql",
+    "docker",
+    "openai",
+    "chatgpt",
+    "max бот",
+    "бизнес-процесс",
+    "бизнес процесс",
+)
+
+_ACTION_APPROACH_RE = re.compile(
+    r"(?:"
+    r"сделаю|настрою|реализую|разработаю|соберу|подключу|внедрю|"
+    r"автоматизирую|интегрирую|напишу|построю|создам|запущу|"
+    r"добавлю|выгружу|свяжу|парсю|соберу\s+данных|"
+    r"этап\s*\d|через\s+\w+|сначала\s+\w+"
+    r")",
+    re.I | re.U,
+)
+
+_DYNAMICS_PHRASE_RE = re.compile(
+    r"dynamics\s*ax|microsoft\s+dynamics|dynamicsax",
+    re.I,
+)
+
 # Bare openers — «Здравствуйте!» required; other greetings banned.
 _BANNED_OPENERS = (
     r"^добрый день",
@@ -178,6 +279,8 @@ _BANNED_PHRASES = (
     "наткнулся",
     "работаю более",
     "предлагаю обсудить детали и приступить",
+    "готов обсудить",
+    "давайте обсудим",
     "задача понятна",
     "я занимаюсь",
     "я специализируюсь",
@@ -268,47 +371,70 @@ DRAFT_SYSTEM_PROMPT = """\
 
 *** АЛГОРИТМ (СТРОГО) ***
 
-0. Ценность заказчика (см. выше) → база первой фразы.
-
-1. Обращение: ВСЕГДА начинай с «Здравствуйте!» — это первое слово отклика. \
+0. Ценность заказчика (см. выше) → база первой фразы. \
+Обращение: ВСЕГДА начинай с «Здравствуйте!» — это первое слово отклика. \
 Без имени заказчика, без «Добрый день». Не выдумывай имена.
 
-2. Первое предложение — самое важное. Сразу: решение / результат / выгода / \
-экспертная мысль по ЭТОМУ заказу. Чередуй способы (не один шаблон):
+1. Первое содержательное предложение после «Здравствуйте!» — докажи, что \
+прочитал ЭТОТ заказ: назови конкретную задачу/боль заказчика словами из ТЗ. \
+Без длинного вступления. Не «важнее не просто». Чередуй способы (не один шаблон):
 - через решение: «Настрою …, который …»
 - через результат: «После запуска … сможет …»
-- через выгоду: «Здесь ключевое — сократить …»
-- через экспертную мысль: «В таких проектах важнее …, чем просто …»
+- через выгоду: «Сокращу … за счёт …»
+- через экспертную мысль: «Сначала зафиксирую …, потом подключу …»
 НЕ через парафраз ТЗ («Понимаю, что вам…»). \
-Глагол действия ротируй; НЕ дефолт «Соберу». Если recent_openings с «Соберу» — другой глагол.
+Глагол действия ротируй; НЕ дефолт «Соберу». Если recent_openings с «Соберу» — другой глагол. \
+Если в ТЗ ERP / CRM / WMS / интеграц* / бизнес-процесс — можно одну короткую \
+фоновую фразу про опыт корп./интеграционной разработки; ЗАПРЕЩЕНО: Dynamics AX, \
+«N+ лет», био-список.
 
-3. Одно предложение — КАК решишь задачу. Не пересказывай ТЗ. Покажи понимание.
+2. Решение — 2–4 конкретных якоря в 1–2 предложениях прозой: что сделаешь / как / \
+стек если нужен / какой артефакт на выходе. Не markdown-список (Kwork банит списки). \
+Не пересказывай ТЗ. Экспертная рекомендация — только если реально полезна, иначе пропусти.
 
-4. Экспертная рекомендация — ОДНА короткая, только если реально полезна. \
-Иначе пропусти. Не выдумывай ради шаблона.
+3. Релевантный опыт — опционально: максимум 1–2 похожих кейса, коротко. \
+Не дамп GitHub / полный список проектов.
 
-5. Срок — всегда, хотя бы ориентир: «Срок — 5–7 дней.» (days_hint / default_days). \
-Если days_hint задан — используй его (одно число или узкий диапазон ±1 день), \
-не раздувай срок из‑за объёма каталога.
+4. Mini-proof — опционально одно короткое предложение про demo/кейс в чате площадки \
+(без http(s) URL / GitHub). Вплетай в середину/конец абзаца опыта, НЕ отдельным \
+абзацем и НЕ штампом в начале абзаца. \
+ЗАПРЕЩЕНО дословно/почти дословно: \
+«Могу показать похожий demo/кейс в чате Kwork.» / \
+«Могу показать близкий demo/кейс в чате Kwork.» \
+Ротируй формулировки, например: \
+«близкий пример пришлю в чате»; «разберу похожий кейс в переписке»; \
+«короткое demo по сопоставимому кейсу — в чате».
 
-6. Стоимость — всегда: «от … ₽» или диапазон. ЗАПРЕЩЕНО: «по договорённости», \
-«обсудим стоимость» без цифры. (price_hint / бюджет проекта.) Цена = price_hint \
-в коридоре заказа (желаемый), не рыночный fair и не допустимый максимум.
+5. Срок + цена — всегда. Срок: «Срок — 5–7 дней.» (days_hint / default_days); \
+если days_hint задан — используй его (одно число или узкий диапазон ±1 день), \
+не раздувай из‑за каталога. Цена: «от … ₽» или диапазон (price_hint / бюджет). \
+ЗАПРЕЩЕНО: «по договорённости», «обсудим стоимость» без цифры. \
+Цена = price_hint в коридоре заказа (желаемый), не fair и не максимум.
 
-7. CTA — мягкий следующий шаг. ЗАПРЕЩЕНО дословно: \
-«Предлагаю обсудить детали и приступить» (+ «…к работе»). Варианты (ротируй):
-- «Напишите, с чего удобнее начать — уточню срок и стоимость.»
-- «Готов разобрать объём по вашему ТЗ и зафиксировать этапы.»
+6. CTA — конкретный следующий шаг (не пустое «обсудим»). ЗАПРЕЩЕНО дословно: \
+«Предлагаю обсудить детали и приступить» (+ «…к работе»); \
+«готов обсудить»; «давайте обсудим» без конкретного действия. Варианты (ротируй):
+- «Если пришлёте текущее ТЗ/код — быстро проверю архитектуру и скажу, \
+что выгоднее: доработка или с нуля.»
+- «Напишите, с чего начать — зафиксируем объём и срок.»
 - «Если подход ок — напишите, согласуем старт.»
 - «Могу сначала набросать план работ под вашу базу/сценарии.»
-- «Дайте знать удобный следующий шаг — уточню оценку.»
 
-8. Если buyer_questions не пуст — ответь на КАЖДЫЙ пункт явно.
+7. Если buyer_questions не пуст — ответь на КАЖДЫЙ пункт явно.
 
-9. budget_mismatch: цена = price_hint / коридор заказа. Одной короткой фразой — \
+8. budget_mismatch: цена = price_hint / коридор заказа. Одной короткой фразой — \
 что входит в эту сумму (MVP / основной сценарий). Полный объём — только как \
-опциональное расширение (ориентир fair_price), не как цена отклика. \
-ЗАПРЕЩЕНО: «бюджет занижен», «обсудить сумму» как главный CTA, цена = только fair.
+опциональное расширение, не как цена отклика. Ориентир расширения: max_budget \
+или мягкая дооценка рядом с бюджетом; если fair_price в разы выше коридора \
+(×5–10) — НЕ пиши эту цифру клиенту, скажи что расширение обсудим отдельно \
+после уточнения объёма. \
+ЗАПРЕЩЕНО: «бюджет занижен», «обсудить сумму» как главный CTA, цена = только fair, \
+пугающие ориентиры в 5–10× от бюджета заказа.
+
+9. Референс Telegram-бот: если в ТЗ / project_brief есть @handle или t.me/… — \
+ОБЯЗАТЕЛЬНО назови этот handle в тексте (можно без @) и вплети ≥2 конкретные \
+фичи/поведения из ТЗ и/или verified_evidence (og description). \
+ЗАПРЕЩЕНО: «похожий бот» / «аналог бота» без имени референса.
 
 *** ЯЗЫК И ФОРМАТ ***
 - 5–7 предложений. Простой человеческий язык. Без воды, биографии, длинных вступлений.
@@ -321,7 +447,8 @@ DRAFT_SYSTEM_PROMPT = """\
 - Не перечисляй стек без необходимости.
 - Не задавай больше одного уточняющего вопроса.
 - Не рассказывай о себе и не перечисляй опыт списком.
-- Похожий кейс — максимум одна короткая фраза, только если уместно.
+- Похожий кейс — максимум 1–2 короткие фразы; mini-proof в чате — без штампа \
+«Могу показать … demo/кейс в чате Kwork» в начале абзаца.
 
 *** ЗАПРЕЩЕНО НАВСЕГДА ***
 - ознакомился с ТЗ / изучил заказ / наткнулся / заинтересовал проект / задача понятна
@@ -333,14 +460,22 @@ DRAFT_SYSTEM_PROMPT = """\
 - markdown-списки, URL / GitHub / портфолио-ссылки
 - созвоны, мессенджеры, контакты вне Kwork
 - «если интересно — пишите» / «когда удобно созвониться?»
+- пустой CTA: «готов обсудить» / «давайте обсудим» без конкретного действия
 - игнор buyer_questions; цена = только fair при budget_mismatch; «бюджет занижен»
 
 *** АНТИ-ШАБЛОН ***
 Смотри recent_responses / recent_openings / recent_closings. \
 Не повторяй первые/последние фразы. Не открывай снова с «Соберу». \
-Не заканчивай «Предлагаю обсудить детали и приступить.» \
-Не штампуй одно и то же «Сделаю…» / «Разработаю…» / «Для такого проекта важно…» \
-в каждом отклике. Живой текст, не шаблон нейросети.
+Не заканчивай «Предлагаю обсудить детали и приступить.» / «Готов обсудить.» \
+Не штампуй одно и то же «Сделаю…» / «Разработаю…» в каждом отклике. \
+Не штампуй «Могу показать похожий/близкий demo/кейс в чате Kwork» \
+как начало абзаца в каждом отклике — ротируй или вплетай иначе. \
+ЗАПРЕЩЕНО как первое содержательное предложение после «Здравствуйте!»:
+- «В так(ом|их) … важнее (не просто|…)»
+- «Здесь ключевое — (не просто|…)»
+- «Для такого проекта важно…»
+- generic «важнее не просто» / «ключевое — не просто»
+Живой текст, не шаблон нейросети.
 
 *** VERIFIED EVIDENCE (если verified_evidence в payload) ***
 Если есть verified_evidence:
@@ -352,6 +487,12 @@ DRAFT_SYSTEM_PROMPT = """\
 - не выдумывай API endpoints вне evidence
 - CTA — из реального пробела (missing param), если виден в evidence/ТЗ
 - без внешних http(s) URL в тексте
+- если evidence/ТЗ про Telegram-референс (@bot / t.me): назови handle и фичи из \
+og/claim, не обобщай до «похожий бот»
+
+*** VERTICAL HINTS (если vertical_hints в payload) ***
+Если в payload есть vertical_hints — усили акценты этого блока в решении/якорях. \
+Не игнорируй задачу ради вертикали: ТЗ и buyer_questions важнее вертикали.
 
 *** KWORK ***
 Только чат площадки. ~700–1600 знаков ≈ 5–7 предложений. Русский. Без markdown.
@@ -368,24 +509,38 @@ LOGIC_CRITIC_PROMPT = """\
 Fail: другое приветствие или нет «Здравствуйте!» в начале. Fail: «Имя, здравствуйте!»
 2) Первое содержательное предложение цепляет: решение/результат/выгода/экспертная мысль; \
 НЕ парафраз ТЗ; НЕ «Понимаю, что…». \
-Fail если первый глагол «Соберу» (или снова «Соберу» при recent_openings с «Соберу»).
-3) Есть короткое «как решим» без пересказа ТЗ
+Fail если первый глагол «Соберу» (или снова «Соберу» при recent_openings с «Соберу»). \
+Fail (первое содержательное предложение после hello): «важнее не просто»; \
+«ключевое — не просто»; «В так(ом|их) … важн…»; «Здесь ключевое…»; \
+«Для такого проекта важно…».
+3) Есть решение: 2–4 якоря (что/как/стек|артефакт) прозой, без пересказа ТЗ \
+и без markdown-списка
 4) Срок есть (ориентир days_hint); цена есть цифрой («от»/диапазон, ориентир \
 price_hint). Fail: «по договорённости», «обсудим стоимость» без суммы
-5) CTA есть. Fail: «Предлагаю обсудить детали и приступить» (+ «к работе»)
-6) Нет клише/био/перечня опыта; нет стопки стека без нужды; ≤1 уточняющий вопрос
-7) Нет нарушений Kwork (ссылки, созвоны, markdown-списки)
+5) CTA — конкретный следующий шаг. Fail: «Предлагаю обсудить детали и приступить» \
+(+ «к работе»); fail: CTA только «готов обсудить» / «давайте обсудим» без действия
+6) Нет клише/био/перечня опыта; нет стопки стека без нужды; ≤1 уточняющий вопрос. \
+При заявлении опыта — желателен mini-proof («могу показать demo/кейс в чате»); \
+если опыта нет в тексте — ок без proof. Soft: style_notes, если опыт заявлен без \
+предложения показать demo/кейс в чате (не жёсткий fail)
+7) Нет нарушений Kwork (ссылки, созвоны, markdown-списки); нет внешних http(s) URL
 8) Длина ~5–7 предложений / ~700–1600 знаков, по делу
 9) buyer_questions: у каждого пункта явный ответ, иначе fail + missing
 10) budget_mismatch: цена = price_hint / коридор заказа; коротко что входит в сумму \
-(основной сценарий); полный объём только как опция. Fail: «бюджет занижен»; \
-fail: только fair как цена отклика
+(основной сценарий); полный объём только как опция без пугающих ×5–10 fair. \
+Fail: «бюджет занижен»; fail: только fair как цена отклика
 11) Используются ключевые слова из ТЗ (если в заказе Telegram/WordPress/… — они в тексте, \
-если уместно); нет выдуманных технологий вне заказа
-12) Если в payload есть verified_evidence: fail при generic opener \
+если уместно); нет выдуманных технологий вне заказа. Fail: отклик мог бы подойти \
+к другому проекту (чужой домен/продукт) — task_mismatch.
+12) Чеклист смысла (fail если отсутствуют ≥2 из): задача заказчика названа; \
+конкретный способ решения; релевантный кейс или подход; цена+срок цифрами.
+13) Если в payload есть verified_evidence: fail при generic opener \
 (Реализую/Создам/Сделаю/Разработаю/Соберу, в т.ч. «Я …»); fail без ≥2 anchors \
 (или всех, если их меньше); fail при «открыл/проверил …» для status≠verified; \
 fail при внешних http(s) URL. Учитывай local_issues с префиксом evidence:
+14) Если в ТЗ есть @bot / t.me бот-референс: fail без имени handle и без ≥2 \
+конкретных фич референса (из ТЗ/evidence). Fail: «похожий бот» без имени. \
+Учитывай local_issues с префиксом reference_bot:
 
 Верни СТРОГО JSON:
 {
@@ -408,14 +563,23 @@ EXPERT_REVIEWER_PROMPT = """\
 Авто-revise_draft (must_fix):
 - «Понимаю, что…» / парафраз ТЗ вместо результата
 - opener «Соберу…» (особенно vs recent_openings)
-- CTA «Предлагаю обсудить детали и приступить» (+ «к работе»)
-- рассказ о себе / список опыта / стопка стека без нужды
+- CTA «Предлагаю обсудить детали и приступить» (+ «к работе»); \
+пустой CTA «готов обсудить» / «давайте обсудим» без конкретного действия
+- первое содержательное предложение после hello: «важнее не просто»; \
+«ключевое — не просто»; «В так(ом|их) … важн…»; «Здесь ключевое…»; \
+«Для такого проекта важно…»
+- task_mismatch / generic opener «под любой заказ» без предметной задачи ТЗ
+- рассказ о себе / список опыта / стопка стека без нужды; Dynamics AX name-drop
 - цена без цифры («по договорённости»)
 - выдуманные технологии не из заказа
 - шаблонность vs recent_openings/closings
 - budget_mismatch без listed/price_hint; «бюджет занижен»; fair как единственная цена
+- внешний http(s) URL / GitHub-ссылка в тексте (вместо mini-proof «в чате»)
 - verified_evidence в payload, но opener Реализую/Создам/Сделаю/Разработаю/Соберу \
 (в т.ч. «Я …»); нет ≥2 anchors; осмотр источника status≠verified; внешний URL
+
+Soft (можешь указать в feedback, не обязательно must_fix): опыт заявлен, \
+но нет mini-proof «могу показать demo/кейс в чате».
 
 verdict:
 - "pass" — можно сдавать
@@ -446,25 +610,33 @@ DEFAULT_DRAFT_SYSTEM_PROMPT = """\
 1. Обращение: ВСЕГДА начинай с «Здравствуйте!» — это первое слово отклика. \
 Без имени заказчика, без «Добрый день».
 
-2. Первое предложение — результат/решение словами из ТЗ. Сразу конкретные \
-сущности заказа (графики, QR, роли, табель — что есть в ТЗ). \
+2. Первое предложение — докажи чтение заказа: задача/боль словами из ТЗ \
+(графики, QR, роли, табель — что есть). Без длинного вступления. \
+Если в ТЗ ERP / CRM / WMS / интеграц* / бизнес-процесс — можно одну короткую \
+фоновую фразу про опыт корп./интеграций; без Dynamics AX и без «N+ лет». \
 ЗАПРЕЩЕНО: парафраз «Предлагаю разработать …, которая автоматизирует…»; \
 «Понимаю, что вам…»; вода без слов заказчика.
 
-3. Одно короткое КАК: этапы (этап 1 / этап 2), не пересказ всего ТЗ.
+3. Решение — 2–4 якоря прозой (что/как/стек|артефакт), не markdown-список. \
+Короткое КАК через этапы ок, без пересказа всего ТЗ.
 
-4. Срок — всегда цифрой (дни). Стоимость — всегда цифрой (₽).
+4. Опыт (опционально) — 1–2 похожих кейса коротко. Mini-proof: «могу показать \
+demo/кейс в чате» — без http(s) URL.
 
-5. Если buyer_questions не пуст — ответь на КАЖДЫЙ пункт явно: \
+5. Срок — всегда цифрой (дни). Стоимость — всегда цифрой (₽).
+
+6. Если buyer_questions не пуст — ответь на КАЖДЫЙ пункт явно: \
 стоимость, срок, что входит в стоимость, расходы после запуска.
 
-6. Что ВХОДИТ в цену — конкретно (этап, установка/деплой, инструкция, \
+7. Что ВХОДИТ в цену — конкретно (этап, установка/деплой, инструкция, \
 исходники, блоки ТЗ). ЗАПРЕЩЕНО откупаться «основные функции».
 
-7. Обязательные расходы после запуска — с цифрами (хостинг/VPS/домен, ₽/мес). \
+8. Обязательные расходы после запуска — с цифрами (хостинг/VPS/домен, ₽/мес). \
 ЗАПРЕЩЕНО: «хостинг можно обсудить» / «можно обсудить» без суммы.
 
-8. CTA — мягкий следующий шаг.
+9. CTA — конкретный следующий шаг (напр. «Напишите, с чего начать — \
+зафиксируем объём и срок.»). ЗАПРЕЩЕНО: «готов обсудить» / «давайте обсудим» \
+без действия; «Предлагаю обсудить детали и приступить».
 
 *** ЯЗЫК И ФОРМАТ ***
 - 4–7 предложений. Живой деловой язык. Без воды, биографии, саморекламы.
@@ -477,9 +649,11 @@ DEFAULT_DRAFT_SYSTEM_PROMPT = """\
 *** ЗАПРЕЩЕНО ***
 - «основные функции» как единственное содержание цены
 - «можно обсудить» без цифр про хостинг/расходы после запуска
+- «готов обсудить» / «давайте обсудим» как пустой CTA
 - парафраз ТЗ вместо результата
 - игнор buyer_questions
 - цена или срок без цифры
+- внешние http(s) URL в тексте
 
 *** VERIFIED EVIDENCE (если verified_evidence в payload) ***
 Если есть verified_evidence:
@@ -503,16 +677,22 @@ DEFAULT_LOGIC_CRITIC_PROMPT = """\
 1) Текст начинается с «Здравствуйте!». Fail: другое приветствие или нет hello.
 2) Первое содержательное предложение — результат/решение словами ТЗ; \
 НЕ парафраз «Предлагаю разработать … которая автоматизирует»; НЕ «Понимаю, что…».
-3) Короткое КАК через этапы, без пересказа ТЗ.
+3) Решение: 2–4 якоря прозой / короткое КАК через этапы, без пересказа ТЗ.
 4) Срок есть цифрой; цена есть цифрой. Fail: «по договорённости» без суммы.
 5) buyer_questions: у каждого пункта явный ответ (стоимость / срок / \
 что входит / расходы после запуска), иначе fail + missing.
 6) Что входит в цену — конкретно, не только «основные функции».
 7) Расходы после запуска — с цифрой (хостинг/VPS/домен, ₽/мес). \
 Fail: «хостинг обсудим» без числа.
-8) Нет воды, клише и выдуманных технологий. 4–7 предложений, без markdown.
-9) Если platform_policy.max_chars задан — fail при превышении (Яндекс: 1000).
-10) Если в payload есть verified_evidence: fail при generic opener \
+8) CTA — конкретный шаг. Fail: «готов обсудить» / «давайте обсудим» без действия. \
+Soft style_notes: опыт заявлен без mini-proof «в чате».
+9) Нет воды, клише и выдуманных технологий. 4–7 предложений, без markdown. \
+Нет внешних http(s) URL.
+10) Если platform_policy.max_chars задан — fail при превышении (Яндекс: 1000).
+11) Fail: отклик мог бы подойти к другому проекту (чужой домен/продукт). \
+Fail если отсутствуют ≥2 из: задача названа; конкретный способ; \
+релевантный кейс/подход; цена+срок.
+12) Если в payload есть verified_evidence: fail при generic opener \
 (Реализую/Создам/Сделаю/Разработаю/Соберу, в т.ч. «Я …»); fail без ≥2 anchors \
 (или всех, если их меньше); fail при осмотре источника status≠verified; \
 fail при внешних http(s) URL. Учитывай local_issues с префиксом evidence:
@@ -536,15 +716,20 @@ DEFAULT_EXPERT_REVIEWER_PROMPT = """\
 Авто-revise_draft (must_fix):
 - «Предлагаю разработать … которая автоматизирует» / парафраз ТЗ вместо результата
 - нет «Здравствуйте!» в начале
+- task_mismatch / generic opener без предметной задачи ТЗ; Dynamics AX name-drop
 - нет срока или цены цифрами
 - buyer_questions не закрыты по пунктам (стоимость / срок / что входит / расходы)
 - «основные функции» без конкретного состава цены
 - «можно обсудить» про хостинг/расходы без цифры
+- пустой CTA «готов обсудить» / «давайте обсудим» без конкретного действия
 - выдуманные технологии не из заказа
 - длина > platform_policy.max_chars (Яндекс Услуги: 1000)
 - вода и шаблонность
+- внешний http(s) URL вместо mini-proof в чате
 - verified_evidence в payload, но opener Реализую/Создам/Сделаю/Разработаю/Соберу \
 (в т.ч. «Я …»); нет ≥2 anchors; осмотр источника status≠verified; внешний URL
+
+Soft (в feedback ок): опыт заявлен без «могу показать demo/кейс в чате».
 
 verdict:
 - "pass" — можно сдавать
@@ -587,13 +772,23 @@ def _response_opener(text: str) -> str:
 
 def _content_after_greeting(text: str) -> str:
     """Strip «Здравствуйте!» / «Имя, здравствуйте!» so opener checks see content verb."""
-    stripped = _response_opener(text)
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    first, _, rest = raw.partition("\n")
+    stripped = first.strip()
     match = _NAMED_HELLO_RE.match(stripped)
     if match:
-        return stripped[match.end() :].lstrip()
-    if re.match(r"^здравствуйте", stripped, re.I):
-        return re.sub(r"^здравствуйте\s*[!.,]?\s*", "", stripped, count=1, flags=re.I)
-    return stripped
+        after = stripped[match.end() :].lstrip()
+    elif re.match(r"^здравствуйте", stripped, re.I):
+        after = re.sub(r"^здравствуйте\s*[!.,]?\s*", "", stripped, count=1, flags=re.I)
+    else:
+        after = stripped
+    if after and rest:
+        return f"{after}\n{rest}".strip()
+    if after:
+        return after
+    return rest.strip()
 
 
 def _missing_hello_issue(text: str) -> str | None:
@@ -617,12 +812,103 @@ def soft_banned_issues(text: str) -> list[str]:
             if re.search(pattern, opener.lower()):
                 issues.append(f"opener:{pattern}")
     body = _content_after_greeting(text)
-    if body.lower().startswith("соберу"):
+    body_lower = body.lower()
+    if body_lower.startswith("соберу"):
         issues.append("opener:^соберу")
+    if re.search(r"важнее\s+не\s+просто", body_lower):
+        issues.append("opener:важнее_не_просто")
+    if re.search(r"ключевое\s*[—\-]\s*не\s+просто", body_lower):
+        issues.append("opener:ключевое_не_просто")
+    head = body_lower[:120]
+    if re.search(r"^в\s+так(?:ом|их)\b.{0,80}?важн", head):
+        issues.append("opener:в_таком_важн")
+    if re.search(r"^здесь\s+ключевое", body_lower):
+        issues.append("opener:здесь_ключевое")
     lower_full = (text or "").lower()
     for phrase in _BANNED_PHRASES:
         if phrase in lower_full:
             issues.append(f"phrase:{phrase}")
+    return issues
+
+
+def _domain_markers_in(text: str) -> list[str]:
+    low = (text or "").lower()
+    return [m for m in _DOMAIN_MARKERS if m in low]
+
+
+def _token_mentioned(token: str, text: str) -> bool:
+    """MVP Russian-tolerant mention: full token or stem without last 1–2 chars."""
+    if not token or not text:
+        return False
+    if token in text:
+        return True
+    if len(token) >= 5 and token[:-1] in text:
+        return True
+    if len(token) >= 6 and token[:-2] in text:
+        return True
+    return False
+
+
+def _title_salient_tokens(title: str, *, limit: int = 4) -> list[str]:
+    normalized = _normalize_match_text(title)
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in normalized.split():
+        if len(token) < 4 or token in _TITLE_TOKEN_STOPWORDS:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        out.append(token)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def task_match_issues(project: ProjectFull, draft: str) -> list[str]:
+    """Deterministic gate: draft must match TZ domain; low false-positive MVP."""
+    issues: list[str] = []
+    title = project.title or ""
+    description = project.full_description or ""
+    tz_text = f"{title}\n{description}"
+    tz_low = tz_text.lower()
+    body = _content_after_greeting(draft)
+    body_norm = _normalize_match_text(body)
+    body_low = (body or "").lower()
+    full_low = (draft or "").lower()
+
+    if _DYNAMICS_PHRASE_RE.search(draft or ""):
+        issues.append("phrase:dynamics ax")
+
+    tz_markers = _domain_markers_in(tz_low)
+    draft_markers = [
+        m for m in tz_markers if m in body_low or m in full_low or m in body_norm
+    ]
+    title_salient = _title_salient_tokens(title)
+    title_hits = [t for t in title_salient if _token_mentioned(t, body_norm)]
+
+    # Enough signal: ≥1 title-salient OR ≥2 TZ domain markers in draft
+    # (or the only TZ marker, when TZ has exactly one).
+    enough = bool(title_hits) or len(draft_markers) >= 2 or (
+        len(tz_markers) == 1 and len(draft_markers) == 1
+    )
+    # Hard mismatch when TZ has clear markers and draft has none of them
+    # and no title-salient overlap (Figma/landing vs finance template).
+    if tz_markers and not draft_markers and not title_hits:
+        issues.append("tz:task_mismatch")
+    elif tz_markers and title_salient and not enough:
+        issues.append("tz:task_mismatch")
+
+    soft: list[str] = []
+    task_named = bool(title_hits or draft_markers)
+    if not task_named:
+        soft.append("checklist:task_named")
+    if not _ACTION_APPROACH_RE.search(body or ""):
+        soft.append("checklist:concrete_approach")
+    # ≥2 new checklist soft issues → fail path (soft_retry / revise).
+    if len(soft) >= 2:
+        issues.extend(soft)
+
     return issues
 
 
@@ -819,11 +1105,13 @@ class ResponsePipeline:
         days_hint: int | None = None,
         feedback: dict[str, Any] | str | None = None,
         budget_mismatch: dict[str, Any] | None = None,
+        project_type: Any = None,
     ) -> dict[str, Any]:
         buyer_name = _buyer_first_name(project.buyer)
         budget_digits = _price_from_project(project)
         platform = _normalize_platform(project.platform)
         policy = _platform_policy(platform)
+        vertical = resolve_response_vertical(project, project_type)
         payload: dict[str, Any] = {
             "task": "Напиши продающий отклик по алгоритму DraftWriter.",
             "platform": platform,
@@ -842,6 +1130,8 @@ class ResponsePipeline:
             "price_hint": price_hint or budget_digits,
             "days_hint": days_hint or self.settings.default_offer_days,
             "feedback": feedback,
+            "vertical": vertical,
+            "vertical_hints": vertical_hints_for(vertical),
         }
         if budget_mismatch:
             payload["budget_mismatch"] = budget_mismatch
@@ -862,10 +1152,12 @@ class ResponsePipeline:
         if platform == "kwork":
             issues += soft_banned_issues(draft)
             issues += [f"kwork:{v}" for v in kwork_compliance_issues(draft)]
+        issues += list(task_match_issues(project, draft))
         issues += list(buyer_checklist_issues(project, draft))
         issues += list(payment_mismatch_issues(project, draft))
         issues += budget_mismatch_issues(draft, budget_mismatch)
         issues += evidence_usage_issues(draft, self._last_evidence)
+        issues += reference_bot_usage_issues(project, draft)
         return issues
 
     def _repair_local_issues(
@@ -879,7 +1171,10 @@ class ResponsePipeline:
         if "budget_mismatch:no_scope_note" not in issues:
             return draft, issues
         repaired = finalize_response_text(
-            ensure_budget_mismatch_note(draft, budget_mismatch), project
+            ensure_budget_mismatch_note(
+                draft, budget_mismatch, seed=str(project.project_id or "")
+            ),
+            project,
         )
         if repaired == draft:
             return draft, issues
@@ -900,6 +1195,7 @@ class ResponsePipeline:
         days_hint: int | None = None,
         feedback: dict[str, Any] | str | None = None,
         budget_mismatch: dict[str, Any] | None = None,
+        project_type: Any = None,
         model: str | None = None,
     ) -> str:
         platform = _normalize_platform(project.platform)
@@ -913,6 +1209,7 @@ class ResponsePipeline:
             days_hint=days_hint,
             feedback=feedback,
             budget_mismatch=budget_mismatch,
+            project_type=project_type,
         )
         model = model or self.settings.model_for("draft")
         logger.info(
@@ -930,13 +1227,20 @@ class ResponsePipeline:
         text = finalize_response_text(text, project)
         local = self._local_issues(text, project, budget_mismatch)
         evidence_issues = [i for i in local if i.startswith("evidence:")]
-        banned = [i for i in local if not i.startswith("evidence:")]
-        if banned or evidence_issues:
+        ref_bot_issues = [i for i in local if i.startswith("reference_bot:")]
+        banned = [
+            i
+            for i in local
+            if not i.startswith("evidence:") and not i.startswith("reference_bot:")
+        ]
+        if banned or evidence_issues or ref_bot_issues:
             logger.info(
-                "response_pipeline draft soft_retry project_id=%s banned=%s evidence=%s",
+                "response_pipeline draft soft_retry project_id=%s banned=%s "
+                "evidence=%s reference_bot=%s",
                 project.project_id,
                 banned,
                 evidence_issues,
+                ref_bot_issues,
             )
             retry = dict(payload)
             note = (
@@ -949,7 +1253,8 @@ class ResponsePipeline:
                 note += (
                     " При budget_mismatch: цена = price_hint / бюджет заказа; "
                     "одной фразой что входит в сумму (основной сценарий). "
-                    "Полный объём — только как опция расширения. "
+                    "Полный объём — только как опция; не пугай ориентиром ×5–10 от бюджета "
+                    "(лучше max_budget / обсудим расширение отдельно). "
                     "Не пиши «бюджет занижен» и не ставь рыночную цену как единственную."
                 )
             if evidence_issues:
@@ -959,11 +1264,25 @@ class ResponsePipeline:
                     "Сделаю/Разработаю/Соберу); вставь ≥2 anchors и следствие из insight; "
                     "не утверждай осмотр источников со status≠verified."
                 )
+            if ref_bot_issues:
+                handles = [
+                    i.rsplit(":", 1)[-1]
+                    for i in ref_bot_issues
+                    if i.startswith("reference_bot:unused:")
+                ]
+                named = ", ".join(f"@{h}" for h in handles) if handles else "референс-бота"
+                note += (
+                    f" В ТЗ есть референс {named}: обязательно назови handle в тексте "
+                    "(можно без @) и опиши ≥2 конкретные фичи/поведения из ТЗ или "
+                    "verified_evidence. Не пиши «похожий бот» без имени."
+                )
             feedback_payload: dict[str, Any] = {"note": note}
             if banned:
                 feedback_payload["banned_detected"] = banned
             if evidence_issues:
                 feedback_payload["evidence_usage_issues"] = evidence_issues
+            if ref_bot_issues:
+                feedback_payload["reference_bot_issues"] = ref_bot_issues
             retry["feedback"] = feedback_payload
             text = self._openai_text(
                 system=prompts["draft"],
@@ -1121,14 +1440,20 @@ class ResponsePipeline:
         project: ProjectFull,
         current_text: str,
         instruction: str,
+        *,
+        evidence: Any | None = None,
     ) -> str:
-        user = {
+        self._last_evidence = evidence
+        user: dict[str, Any] = {
             "task": "Исправь отклик по инструкции фрилансера.",
             "current_text": current_text,
             "instruction": instruction,
             "title": project.title,
             "tz_snippet": (project.full_description or "")[:800],
         }
+        verified = compact_verified_evidence(evidence)
+        if verified is not None:
+            user["verified_evidence"] = verified
         return self._openai_text(
             system=REVISE_SYSTEM_PROMPT,
             user=user,
@@ -1149,6 +1474,7 @@ class ResponsePipeline:
         days_hint: int | None = None,
         budget_mismatch: dict[str, Any] | None = None,
         evidence: Any | None = None,
+        project_type: Any = None,
     ) -> str:
         self._last_evidence = evidence
 
@@ -1170,6 +1496,7 @@ class ResponsePipeline:
                 days_hint=days_hint,
                 budget_mismatch=budget_mismatch,
                 evidence=evidence,
+                project_type=project_type,
                 threaded=False,
             )
 
@@ -1188,6 +1515,7 @@ class ResponsePipeline:
             days_hint=days_hint,
             budget_mismatch=budget_mismatch,
             evidence=evidence,
+            project_type=project_type,
         )
 
     @staticmethod
@@ -1216,6 +1544,7 @@ class ResponsePipeline:
         price_hint: int | str | None = None,
         days_hint: int | None = None,
         budget_mismatch: dict[str, Any] | None = None,
+        project_type: Any = None,
     ) -> Generator[tuple[str, Any], Any, str]:
         """Single revision loop; drivers execute the yielded notify/call steps."""
         draft_kwargs: dict[str, Any] = {
@@ -1224,6 +1553,7 @@ class ResponsePipeline:
             "price_hint": price_hint,
             "days_hint": days_hint,
             "budget_mismatch": budget_mismatch,
+            "project_type": project_type,
         }
         logic_kwargs: dict[str, Any] = {
             "budget_mismatch": budget_mismatch,
@@ -1376,6 +1706,7 @@ class ResponsePipeline:
         days_hint: int | None = None,
         budget_mismatch: dict[str, Any] | None = None,
         evidence: Any | None = None,
+        project_type: Any = None,
     ) -> str:
         self._last_evidence = evidence
         steps = self._pipeline_steps(
@@ -1386,6 +1717,7 @@ class ResponsePipeline:
             price_hint=price_hint,
             days_hint=days_hint,
             budget_mismatch=budget_mismatch,
+            project_type=project_type,
         )
         sent: Any = None
         try:
@@ -1413,6 +1745,7 @@ class ResponsePipeline:
         budget_mismatch: dict[str, Any] | None = None,
         threaded: bool = True,
         evidence: Any | None = None,
+        project_type: Any = None,
     ) -> str:
         self._last_evidence = evidence
 
@@ -1429,6 +1762,7 @@ class ResponsePipeline:
             price_hint=price_hint,
             days_hint=days_hint,
             budget_mismatch=budget_mismatch,
+            project_type=project_type,
         )
         sent: Any = None
         try:

@@ -126,6 +126,7 @@ def _sync_kwork_offer_statuses(journal_path: Path) -> int:
     sync_result = sync_journal_from_kwork_offers(
         journal_path,
         settings=get_settings(),
+        update_existing=True,
     )
     if sync_result.error:
         print(f"WARN: сверка /offers не выполнена: {sync_result.error}")

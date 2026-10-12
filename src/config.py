@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,15 @@ class Settings(BaseSettings):
     pending_timeout_hours: int = 24
     operator_timezone: str = "Asia/Irkutsk"
 
+    # Journal.xlsx → Google Notebook (local Google API; VPS only writes job JSON)
+    notebook_spreadsheet_id: str = (
+        "1EU0vEbEqxsMtMkMxNS6Drj00smbikG2gbrv3EU8zo94"
+    )
+    notebook_tz: str = "Asia/Irkutsk"
+    notebook_min_date: str = "2026-09-01"
+    notebook_job_path: str = "data/notebook_sync_request.json"
+    notebook_default_days: int = 10
+
     evidence_research_enabled: bool = False
     evidence_max_urls: int = 3
     evidence_timeout_seconds: float = 60.0
@@ -119,6 +129,11 @@ class Settings(BaseSettings):
     kwork_inbox_mirror_enabled: bool = True
     kwork_inbox_seen_db: str = "data/kwork_inbox_seen.db"
     kwork_inbox_poll_seconds: int = 90
+    kwork_fast_scan_enabled: bool = True
+    kwork_fast_scan_seconds: int = 90
+    process_concurrency: int = 1
+    early_ping_seen_db: str = "data/early_ping_seen.db"
+    early_listings_dir: str = "data/early_listings"
 
     yandex_storage_state: str = ""
     yandex_max_daily_responses: int = 7
@@ -162,6 +177,13 @@ class Settings(BaseSettings):
         if login and password:
             return login, password
         return None
+
+    def notebook_min_date_value(self) -> date:
+        raw = (self.notebook_min_date or "").strip()
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            return date(2026, 9, 1)
 
 
 def load_sources(config_path: str | Path | None = None) -> list[SourceConfig]:

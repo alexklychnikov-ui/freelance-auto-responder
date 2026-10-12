@@ -381,3 +381,87 @@ async def test_generate_notifies_evidence_summary(
     assert summary_calls
     assert "sources" in summary_calls[-1] or "facts" in summary_calls[-1]
     assert "mirror down" in summary_calls[-1]
+
+
+@pytest.mark.asyncio
+async def test_correct_collects_evidence_when_instruction_has_url(
+    settings: Settings, project_full: ProjectFull, score: GptScoreResult
+) -> None:
+    settings.evidence_research_enabled = True
+    settings.prepare_only_no_submit = False
+    bundle = EvidenceBundle(
+        status="complete",
+        required=True,
+        project_hash=project_content_hash(project_full),
+        sources=[],
+        facts=[
+            EvidenceFact(
+                id="f1",
+                source_id="s1",
+                claim="лот",
+                quote="184729",
+                eligible_for_response=True,
+            )
+        ],
+    )
+    mock_ev = MagicMock()
+    mock_ev.collect = MagicMock(return_value=bundle)
+
+    orch = _make_orch(settings, project_full, score, evidence_service=mock_ev)
+    orch.response_generator.revise = MagicMock(return_value="Правленый отклик с 184729.")
+    offer = _offer(project_full, score)
+    offer.status = "prepared"
+    offer.response_text = "Старый отклик."
+    orch.review_service.store.save(offer)
+
+    await orch.handle_correct_response(
+        offer.platform,
+        offer.source_key,
+        offer.project_id,
+        "учти https://torgi.gov.ru в ответе",
+    )
+
+    mock_ev.collect.assert_called_once()
+    call_kwargs = mock_ev.collect.call_args.kwargs
+    assert call_kwargs.get("extra_candidates")
+    assert any(
+        "torgi.gov.ru" in c.input_ref for c in call_kwargs["extra_candidates"]
+    )
+    revise_kwargs = orch.response_generator.revise.call_args.kwargs
+    assert revise_kwargs.get("evidence") is not None
+    saved = orch.review_service.store.load(
+        offer.platform, offer.source_key, offer.project_id
+    )
+    assert saved is not None
+    assert saved.evidence is not None
+    assert saved.evidence.status == "complete"
+
+
+@pytest.mark.asyncio
+async def test_correct_skips_evidence_collect_without_url(
+    settings: Settings, project_full: ProjectFull, score: GptScoreResult
+) -> None:
+    settings.evidence_research_enabled = True
+    settings.prepare_only_no_submit = False
+    mock_ev = MagicMock()
+    mock_ev.collect = MagicMock(
+        side_effect=AssertionError("collect must not run without URL")
+    )
+
+    orch = _make_orch(settings, project_full, score, evidence_service=mock_ev)
+    orch.response_generator.revise = MagicMock(return_value="Правленый без ссылок.")
+    offer = _offer(project_full, score)
+    offer.status = "prepared"
+    offer.response_text = "Старый отклик."
+    orch.review_service.store.save(offer)
+
+    await orch.handle_correct_response(
+        offer.platform,
+        offer.source_key,
+        offer.project_id,
+        "убери цену и срок",
+    )
+
+    mock_ev.collect.assert_not_called()
+    revise_kwargs = orch.response_generator.revise.call_args.kwargs
+    assert revise_kwargs.get("evidence") is None

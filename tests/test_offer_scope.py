@@ -71,7 +71,7 @@ def test_normal_bot_keeps_low_mix() -> None:
         max_budget="до 45 000 ₽",
     )
     assert listed_price_mix_for_scope(project, volume=None) == 0.15
-    assert suggest_delivery_days_for_scope(project, volume=None) is None
+    assert suggest_delivery_days_for_scope(project, volume=None) == 5
 
 
 def test_large_catalog_delivery_days_not_inflated() -> None:
@@ -80,3 +80,51 @@ def test_large_catalog_delivery_days_not_inflated() -> None:
     assert days == 5
     small = suggest_delivery_days_for_scope(project, volume=100)
     assert small == 3
+
+
+def test_integration_tz_days_not_two() -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3260072",
+        url="https://kwork.ru/projects/3260072",
+        title="Интеграция CRM и API",
+        full_description=(
+            "Нужна интеграция CRM с внешним API, OCR документов "
+            "и автоматизация обмена."
+        ),
+        desired_budget="до 20 000 ₽",
+        max_budget="до 60 000 ₽",
+    )
+    days = suggest_delivery_days_for_scope(project, volume=None)
+    assert days is not None
+    assert days >= 5
+    assert days != 2
+
+
+def test_many_modules_integration_gets_ten() -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="2",
+        url="https://kwork.ru/projects/2",
+        title="Микросервисная интеграция",
+        full_description="Несколько модулей API и CRM автоматизация.",
+        desired_budget="до 30 000 ₽",
+        max_budget="до 90 000 ₽",
+    )
+    assert suggest_delivery_days_for_scope(project, volume=None) == 10
+
+
+def test_landing_defaults_to_five() -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3",
+        url="https://kwork.ru/projects/3",
+        title="Лендинг под ключ",
+        full_description="Нужен landing / сайт веб-MVP на 5 блоков.",
+        desired_budget="до 10 000 ₽",
+        max_budget="до 30 000 ₽",
+    )
+    assert suggest_delivery_days_for_scope(project, volume=None) == 5
