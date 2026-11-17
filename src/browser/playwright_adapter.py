@@ -22,6 +22,11 @@ _YANDEX_IPV4_HOSTS = (
     "yastatic.net",
     "mc.yandex.ru",
     "export.yandex.ru",
+    # FL.ru: Chromium Happy Eyeballs / dual-stack hangs on some VPS paths
+    "www.fl.ru",
+    "fl.ru",
+    "cdn.fl.ru",
+    "static.fl.ru",
 )
 
 _TRANSIENT_NAV_MARKERS = (

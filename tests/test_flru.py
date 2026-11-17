@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 from src.adapters.flru import (
     FlruAdapter,
     _clean_submitted_description,
+    cookie_header_from_storage,
     flru_page_looks_logged_out,
     is_flru_project_closed,
     parse_listing_from_html,
@@ -136,7 +137,34 @@ def test_listing_url_appends_for_all() -> None:
     assert adapter._listing_url() == "https://www.fl.ru/projects/?kind=1&for_all=1"
 
 
-def test_scan_new_ensures_for_all_checkbox() -> None:
+def test_cookie_header_from_storage(tmp_path) -> None:
+    path = tmp_path / "flru_storage.json"
+    path.write_text(
+        '{"cookies":[{"name":"sid","value":"1","domain":".fl.ru"},'
+        '{"name":"ya","value":"2","domain":".yandex.ru"}],"origins":[]}',
+        encoding="utf-8",
+    )
+    assert cookie_header_from_storage(path) == "sid=1"
+    assert cookie_header_from_storage(None) == ""
+
+
+def test_scan_new_prefers_http(monkeypatch) -> None:
+    html = (FIXTURES / "flru_listing.html").read_text(encoding="utf-8")
+    monkeypatch.setattr(
+        "src.adapters.flru.fetch_flru_html", lambda *a, **k: html
+    )
+    browser = MagicMock()
+    adapter = _make_adapter(browser=browser)
+    cards = adapter.scan_new()
+    assert any(c.project_id == PID for c in cards)
+    browser.navigate.assert_not_called()
+
+
+def test_scan_new_ensures_for_all_checkbox(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "src.adapters.flru.fetch_flru_html",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("http down")),
+    )
     browser = MagicMock()
     browser.evaluate.side_effect = [
         "https://www.fl.ru/projects/?kind=1&for_all=1",  # _ensure_logged_in

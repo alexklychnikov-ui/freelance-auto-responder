@@ -1,11 +1,15 @@
 """FL.ru adapter — scan + read only (manual reply MVP, like Yandex Uslugi)."""
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any
+
+import httpx
 
 from src.adapters.flru_urls import FLRU_ORIGIN, ensure_flru_for_all, flru_project_url
 from src.browser.base import BrowserClient
@@ -244,6 +248,99 @@ def _is_login_url(url: str) -> bool:
     return False
 
 
+_FLRU_HTTP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def cookie_header_from_storage(storage_state_path: str | Path | None) -> str:
+    """Build Cookie header for fl.ru from Playwright storage_state."""
+    if not storage_state_path:
+        return ""
+    path = Path(storage_state_path)
+    if not path.exists():
+        return ""
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    parts: list[str] = []
+    for c in state.get("cookies") or []:
+        if not isinstance(c, dict):
+            continue
+        dom = str(c.get("domain") or "")
+        if "fl.ru" not in dom:
+            continue
+        name = str(c.get("name") or "").strip()
+        if not name:
+            continue
+        parts.append(f"{name}={c.get('value', '')}")
+    return "; ".join(parts)
+
+
+def fetch_flru_html(
+    url: str,
+    *,
+    storage_state_path: str | Path | None = None,
+    timeout_s: float = 40.0,
+    use_cookies: bool = True,
+) -> str:
+    """HTTP GET fl.ru HTML (Chromium page.goto often hangs on /projects/*)."""
+    headers = {
+        "User-Agent": _FLRU_HTTP_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    }
+    if use_cookies:
+        cookie = cookie_header_from_storage(storage_state_path)
+        if cookie:
+            headers["Cookie"] = cookie
+    with httpx.Client(timeout=timeout_s, follow_redirects=True) as client:
+        resp = client.get(url, headers=headers)
+        final = str(resp.url)
+        if _is_login_url(final):
+            raise FlruAuthError(
+                "not_logged_in: HTTP редирект на login — "
+                "запусти deploy/flru_login_interactive.py"
+            )
+        resp.raise_for_status()
+        return resp.text
+
+
+def fetch_flru_html_resilient(
+    url: str,
+    *,
+    storage_state_path: str | Path | None = None,
+    timeout_s: float = 40.0,
+    prefer_anonymous: bool = False,
+) -> str:
+    """GET listing/project HTML; anonymous first when cookies stall on VPS."""
+    order = (False, True) if prefer_anonymous else (True, False)
+    last_exc: BaseException | None = None
+    for use_cookies in order:
+        try:
+            return fetch_flru_html(
+                url,
+                storage_state_path=storage_state_path,
+                timeout_s=timeout_s,
+                use_cookies=use_cookies,
+            )
+        except FlruAuthError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "flru_http_get_failed cookies=%s err=%s",
+                use_cookies,
+                str(exc)[:160],
+            )
+            continue
+    assert last_exc is not None
+    raise last_exc
+
+
 ENSURE_FOR_ALL_FILTER_JS = """
 () => {
   const el = document.querySelector('#ui-checkbox-check-for-all');
@@ -452,29 +549,13 @@ class FlruAdapter:
                 browser.wait_ms(2000)
             logger.info("flru_for_all_filter_applied source=%s", self.source_key)
 
-    def scan_new(self) -> list[ProjectPreview]:
-        browser = self._get_browser()
-        skip_closed = bool(self.filters.get("skip_closed", True))
-        try:
-            browser.navigate(self._listing_url())
-            if hasattr(browser, "wait_ms"):
-                browser.wait_ms(2500)
-            self._ensure_logged_in(browser)
-            self._ensure_for_all_filter(browser)
-            raw_cards = browser.evaluate(LISTING_EXTRACTOR_JS)
-            if not isinstance(raw_cards, list) or not raw_cards:
-                snapshot = browser.snapshot()
-                raw_cards = parse_listing_from_html(
-                    snapshot, skip_closed=skip_closed
-                )
-        except FlruAuthError:
-            raise
-        except Exception as exc:
-            logger.exception("flru_scan_failed source=%s", self.source_key)
-            raise FlruAuthError(f"flru_scan_failed: {exc}") from exc
-
+    def _previews_from_cards(
+        self, raw_cards: list[dict[str, Any]] | list[Any] | None
+    ) -> list[ProjectPreview]:
         previews: list[ProjectPreview] = []
         for item in raw_cards or []:
+            if not isinstance(item, dict):
+                continue
             pid = str(item.get("project_id") or "").strip()
             if not _PROJECT_ID_RE.fullmatch(pid):
                 continue
@@ -490,12 +571,129 @@ class FlruAdapter:
                     responses_count=item.get("responses_count"),
                 )
             )
-        logger.info("flru_scan source=%s cards=%d", self.source_key, len(previews))
         return previews
+
+    def _scan_via_http(self, *, skip_closed: bool) -> list[ProjectPreview]:
+        # for_all feed is public; session cookies from this VPS often hang TLS.
+        prefer_anon = bool(self.filters.get("for_all", True))
+        html = fetch_flru_html_resilient(
+            self._listing_url(),
+            storage_state_path=self._storage_path(),
+            prefer_anonymous=prefer_anon,
+        )
+        raw_cards = parse_listing_from_html(html, skip_closed=skip_closed)
+        return self._previews_from_cards(raw_cards)
+
+    def _scan_via_browser(self, *, skip_closed: bool) -> list[ProjectPreview]:
+        browser = self._get_browser()
+        browser.navigate(self._listing_url())
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(2500)
+        self._ensure_logged_in(browser)
+        self._ensure_for_all_filter(browser)
+        raw_cards = browser.evaluate(LISTING_EXTRACTOR_JS)
+        if not isinstance(raw_cards, list) or not raw_cards:
+            snapshot = browser.snapshot()
+            raw_cards = parse_listing_from_html(
+                snapshot, skip_closed=skip_closed
+            )
+        return self._previews_from_cards(
+            raw_cards if isinstance(raw_cards, list) else []
+        )
+
+    def scan_new(self) -> list[ProjectPreview]:
+        skip_closed = bool(self.filters.get("skip_closed", True))
+        # Chromium page.goto hangs on /projects/* (stays about:blank);
+        # httpx/curl still get 200 — prefer HTTP for listing.
+        try:
+            previews = self._scan_via_http(skip_closed=skip_closed)
+            if previews:
+                logger.info(
+                    "flru_scan source=%s cards=%d via=http",
+                    self.source_key,
+                    len(previews),
+                )
+                return previews
+            logger.warning(
+                "flru_scan_http_empty source=%s — fallback browser",
+                self.source_key,
+            )
+        except FlruAuthError:
+            raise
+        except Exception as http_exc:
+            logger.warning(
+                "flru_scan_http_failed source=%s err=%s — fallback browser",
+                self.source_key,
+                str(http_exc)[:200],
+            )
+
+        try:
+            previews = self._scan_via_browser(skip_closed=skip_closed)
+        except FlruAuthError:
+            raise
+        except Exception as exc:
+            logger.exception("flru_scan_failed source=%s", self.source_key)
+            raise FlruAuthError(f"flru_scan_failed: {exc}") from exc
+
+        logger.info(
+            "flru_scan source=%s cards=%d via=browser",
+            self.source_key,
+            len(previews),
+        )
+        return previews
+
+    def _project_full_from_raw(self, pid: str, url: str, raw: dict[str, Any]) -> ProjectFull:
+        if raw.get("closed"):
+            raise FlruProjectClosed(
+                "flru_project_closed: исполнитель уже определён"
+            )
+        title = str(raw.get("title") or "").strip()
+        desc = str(raw.get("full_description") or "").strip()
+        return ProjectFull(
+            platform=self.platform_id,
+            source_key=self.source_key,
+            project_id=pid,
+            url=url,
+            title=title or f"Проект {pid}",
+            full_description=desc,
+            desired_budget=raw.get("desired_budget"),
+            max_budget=raw.get("max_budget") or raw.get("desired_budget"),
+            offers_count=raw.get("offers_count"),
+            buyer=raw.get("buyer"),
+            time_left=raw.get("time_left"),
+        )
+
+    def _read_full_via_http(self, pid: str, url: str) -> ProjectFull:
+        html = fetch_flru_html_resilient(
+            url,
+            storage_state_path=self._storage_path(),
+            prefer_anonymous=True,
+        )
+        raw = parse_project_from_html(html, project_id=pid)
+        return self._project_full_from_raw(pid, url, raw)
 
     def read_full(self, project_id: str) -> ProjectFull:
         pid = str(project_id).strip()
         url = flru_project_url(pid)
+        try:
+            full = self._read_full_via_http(pid, url)
+            if str(full.title or "").strip() and str(full.full_description or "").strip():
+                logger.info("flru_read project_id=%s via=http", pid)
+                return full
+            logger.warning(
+                "flru_read_http_thin project_id=%s — fallback browser", pid
+            )
+        except FlruProjectClosed:
+            raise
+        except FlruAuthError:
+            raise
+        except Exception as http_exc:
+            logger.warning(
+                "flru_read_http_failed project_id=%s err=%s — fallback browser",
+                pid,
+                str(http_exc)[:200],
+            )
+
         browser = self._get_browser()
         try:
             browser.navigate(url)
@@ -513,26 +711,10 @@ class FlruAdapter:
             logger.exception("flru_read_failed project_id=%s", pid)
             raise RuntimeError(f"flru_read_failed: {exc}") from exc
 
-        if raw.get("closed"):
-            raise FlruProjectClosed(
-                "flru_project_closed: исполнитель уже определён"
-            )
-
-        title = str(raw.get("title") or "").strip()
-        desc = str(raw.get("full_description") or "").strip()
-        return ProjectFull(
-            platform=self.platform_id,
-            source_key=self.source_key,
-            project_id=pid,
-            url=url,
-            title=title or f"Проект {pid}",
-            full_description=desc,
-            desired_budget=raw.get("desired_budget"),
-            max_budget=raw.get("max_budget") or raw.get("desired_budget"),
-            offers_count=raw.get("offers_count"),
-            buyer=raw.get("buyer"),
-            time_left=raw.get("time_left"),
-        )
+        if not isinstance(raw, dict):
+            raise RuntimeError("flru_read_failed: empty project payload")
+        logger.info("flru_read project_id=%s via=browser", pid)
+        return self._project_full_from_raw(pid, url, raw)
 
     def submit_response(
         self, project_id: str, text: str, price: str | None

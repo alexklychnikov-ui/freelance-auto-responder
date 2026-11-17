@@ -165,6 +165,53 @@ def pick_commercial_price(market: int, offer: int) -> int:
     return m if m > 0 else max(0, o)
 
 
+def extract_response_price_rub(text: str) -> int | None:
+    """Explicit asking price from response body.
+
+    Prefers Этап 1 / package lines over a trailing «Стоимость — 8 000»
+    that align() may have appended from the no-budget fallback.
+    """
+    body = text or ""
+    for pattern in (_STAGE1_PRICE_RE, _ASKING_PRICE_RE):
+        m = pattern.search(body)
+        if not m:
+            continue
+        amount = _amount_int(m.group("amount"))
+        if amount is None or amount <= 0:
+            continue
+        return amount
+    return None
+
+
+def project_has_listed_budget(project: ProjectFull) -> bool:
+    return (
+        parse_desired_budget_rub(project) is not None
+        or parse_budget_ceiling_rub(project) is not None
+    )
+
+
+def prefer_response_price_when_no_budget(
+    project: ProjectFull,
+    fill: int,
+    response_text: str,
+) -> int:
+    """Keep response asking price when listing budgets are missing.
+
+    Stops prepare/correct from resurrecting the 8000 fallback after the
+    user (or revise) already put a lower explicit price in the text.
+    When a ceiling exists, always clamp.
+    """
+    fill_i = int(fill or 0)
+    if project_has_listed_budget(project):
+        return clamp_price_to_budget(fill_i, project)
+    extracted = extract_response_price_rub(response_text)
+    if extracted is not None and extracted > 0:
+        return extracted
+    if fill_i > 0:
+        return max(MIN_OFFER_PRICE_RUB, fill_i)
+    return MIN_OFFER_PRICE_RUB
+
+
 def pick_listed_offer_price(
     project: ProjectFull,
     *,
@@ -395,7 +442,17 @@ _DEFER_PRICE_DAYS_RE = re.compile(
 )
 
 _ASKING_PRICE_RE = re.compile(
-    r"(?P<label>(?:стоимост\w*|цен\w*)\s*[—\-–:]\s*(?:от\s*)?)"
+    r"(?P<label>"
+    r"(?:(?:стоимост\w*|цен\w*)\s*[—\-–:]\s*(?:от\s*)?)"
+    r"|(?:в\s+стоимость\s+)"
+    r")"
+    r"(?P<amount>\d(?:[\d\s\u00a0]*\d)?)\s*(?P<unit>₽|руб\.?)",
+    flags=re.IGNORECASE,
+)
+
+# «Этап 1: 5 дней и 85000 ₽» / «Этап 1: 85000 ₽»
+_STAGE1_PRICE_RE = re.compile(
+    r"(?P<label>этап\s*1\s*:[^\n₽]{0,80}?(?:и\s+)?)"
     r"(?P<amount>\d(?:[\d\s\u00a0]*\d)?)\s*(?P<unit>₽|руб\.?)",
     flags=re.IGNORECASE,
 )
@@ -634,7 +691,12 @@ def align_response_commercials(
             if _amount_int(m.group("amount")) != asking
         ]
         replaced = False
-        for pattern in (_ASKING_PRICE_RE, _OT_MVP_PRICE_RE, _OT_ASKING_PRICE_RE):
+        for pattern in (
+            _STAGE1_PRICE_RE,
+            _ASKING_PRICE_RE,
+            _OT_MVP_PRICE_RE,
+            _OT_ASKING_PRICE_RE,
+        ):
             for m in pattern.finditer(head):
                 if _fair_span_overlaps(m.start("amount"), m.end("amount"), fair_spans):
                     continue

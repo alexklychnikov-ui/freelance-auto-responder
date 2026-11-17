@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from src.adapters.kwork_pricing import (
     align_response_commercials,
     apply_competitive_price,
@@ -8,11 +10,13 @@ from src.adapters.kwork_pricing import (
     clamp_price_to_budget,
     customer_expansion_hint_rub,
     ensure_budget_mismatch_note,
+    extract_response_price_rub,
     format_budget_mismatch_sentence,
     parse_budget_ceiling_rub,
     parse_desired_budget_rub,
     pick_commercial_price,
     pick_listed_offer_price,
+    prefer_response_price_when_no_budget,
     response_defers_price_or_days,
     response_has_budget_discuss_note,
     suggest_offer_price,
@@ -234,6 +238,79 @@ def test_budget_gap_uses_form_max_when_project_ceiling_missing() -> None:
     assert "1 500" in note
     assert "занижен" not in note.lower()
     assert "обсудить сумму" not in note.lower()
+
+
+def test_prefer_response_price_when_no_budget_keeps_500() -> None:
+    """Correct/prepare must not resurrect fill=8000 when response already says 500."""
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3270732",
+        url="https://kwork.ru/projects/3270732",
+        title="Script",
+        full_description="long enough description " * 5,
+        desired_budget=None,
+        max_budget=None,
+    )
+    text = "Сделаю правки по ТЗ.\nСтоимость — 500 ₽.\nСрок — 1 дн."
+    assert extract_response_price_rub(text) == 500
+    assert prefer_response_price_when_no_budget(project, 8000, text) == 500
+    # With ceiling present — clamp, do not prefer response over ceiling
+    with_ceiling = project.model_copy(update={"max_budget": "до 500 ₽"})
+    assert prefer_response_price_when_no_budget(with_ceiling, 8000, text) == 500
+    assert prefer_response_price_when_no_budget(with_ceiling, 400, text) == 500
+
+
+def test_stage1_price_preferred_over_8000_footer() -> None:
+    """FL no-budget: «Этап 1: … и 85000 ₽» must win over appended 8000."""
+    project = ProjectFull(
+        platform="flru",
+        source_key="flru_orders",
+        project_id="5529396",
+        url="https://www.fl.ru/projects/5529396/x.html",
+        title="Юр ИИ",
+        full_description="long enough description " * 5,
+        desired_budget="по договоренности",
+        max_budget="по договоренности",
+    )
+    core = (
+        "Этап 1: 5 дней и 85000 ₽, Этап 2: 7 дней и 120000 ₽, "
+        "полная версия: 12 дней и 205000 ₽. В стоимость Этапа 1 входит сборка."
+    )
+    broken = core + "\n    Стоимость — 8 000 ₽.\n    Срок — 5 дн."
+    assert extract_response_price_rub(core) == 85_000
+    assert extract_response_price_rub(broken) == 85_000
+    assert prefer_response_price_when_no_budget(project, 8000, broken) == 85_000
+    out = align_response_commercials(core, price=85_000, delivery_days=5)
+    assert "8 000" not in out
+    assert "85000" in out.replace(" ", "").replace("\u00a0", "")
+
+
+def test_v_stoimost_package_price_not_overwritten_by_8000() -> None:
+    """FL «по договорённости»: LLM «В стоимость 180000» must win over fill=8000."""
+    project = ProjectFull(
+        platform="flru",
+        source_key="flru_orders",
+        project_id="5528712",
+        url="https://www.fl.ru/projects/5528712/ai-agent.html",
+        title="AI агент",
+        full_description="long enough description " * 5,
+        desired_budget="по договоренности",
+        max_budget="по договоренности",
+    )
+    core = (
+        "Соберу MVP. В стоимость 180000 ₽ входит: экран сканирования, "
+        "карточка гостя, деплой; срок 21 день."
+    )
+    assert extract_response_price_rub(core) == 180_000
+    assert prefer_response_price_when_no_budget(project, 8000, core) == 180_000
+    out = align_response_commercials(core, price=180_000, delivery_days=21)
+    compact = out.replace(" ", "").replace("\u00a0", "")
+    assert "180000" in compact
+    assert "Стоимость—8" not in compact and "стоимость8" not in compact.lower()
+    # Broken path that produced dual prices: align@8000 must rewrite package amount
+    broken = align_response_commercials(core, price=8000, delivery_days=21)
+    assert re.search(r"В\s+стоимость\s+8[\s\u00a0]*000\s*₽", broken, flags=re.I)
 
 
 def test_customer_expansion_hint_hides_wild_fair() -> None:
