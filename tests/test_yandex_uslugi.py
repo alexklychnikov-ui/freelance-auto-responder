@@ -10,9 +10,11 @@ from src.adapters.yandex_uslugi import (
     YandexUslugiAdapter,
     _is_executor_cab_missing,
     _is_login_url,
+    is_yandex_executor_cab_chrome,
     parse_listing_from_html,
     parse_order_from_html,
     parse_submitted_offer_from_text,
+    sanitize_yandex_order_description,
 )
 from src.config import Settings
 
@@ -24,6 +26,29 @@ UUID2 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 def test_is_login_url_passport() -> None:
     assert _is_login_url("https://passport.yandex.ru/auth")
     assert not _is_login_url("https://uslugi.yandex.ru/cab/orders")
+
+
+def test_reject_executor_cab_chrome_as_description() -> None:
+    chrome = (
+        "Главная страница Яндекс Исполнителей Главная страница Яндекса "
+        "Ваши заказы Поиск заказов Мой профиль Продвижение Подписки "
+        "Настройки Уведомлений 1 Выйти из аккаунта"
+    )
+    assert is_yandex_executor_cab_chrome(chrome)
+    assert sanitize_yandex_order_description(chrome) == ""
+    real = (
+        "Нужен Telegram-бот на aiogram: заявки, админка, уведомления. "
+        "Бюджет до 15 000 ₽."
+    )
+    assert not is_yandex_executor_cab_chrome(real)
+    assert sanitize_yandex_order_description(real) == real
+    mixed = (
+        "Ваши заказы\nПоиск заказов\nМой профиль\n"
+        "Доработка сайта, сделать то чего не хватает на 3dzabor.pro, Joomla."
+    )
+    cleaned = sanitize_yandex_order_description(mixed)
+    assert "3dzabor" in cleaned
+    assert "Ваши заказы" not in cleaned
 
 
 def test_is_executor_cab_missing_registration() -> None:

@@ -55,8 +55,10 @@ def strip_github_links(text: str) -> str:
     cleaned = _GITHUB_URL_RE.sub("", text)
     cleaned = re.sub(r"\(\s*\)", "", cleaned)
     cleaned = re.sub(r"GitHub\s*:\s*", "", cleaned, flags=re.I)
-    cleaned = re.sub(r"\s{2,}", " ", cleaned)
-    cleaned = re.sub(r"\s+([,.])", r"\1", cleaned)
+    # Keep paragraph breaks — only collapse horizontal whitespace runs.
+    cleaned = re.sub(r"[^\S\n]{2,}", " ", cleaned)
+    cleaned = re.sub(r"[^\S\n]*\n[^\S\n]*", "\n", cleaned)
+    cleaned = re.sub(r"[^\S\n]+([,.])", r"\1", cleaned)
     return cleaned.strip()
 
 
@@ -105,7 +107,8 @@ def ensure_hello_greeting(text: str) -> str:
     body = _OTHER_GREETING_RE.sub("", body, count=1).lstrip()
     if not body:
         return "Здравствуйте!"
-    return f"Здравствуйте! {body}"
+    # Own paragraph so later paragraphizer keeps greeting separate.
+    return f"Здравствуйте!\n{body}"
 
 
 _BUYER_NOISE = frozenset(
@@ -194,33 +197,89 @@ def unescape_literal_newlines(text: str) -> str:
     return raw
 
 
+_HELLO_ONLY_RE = re.compile(r"^здравствуйте\s*[!.]?$", re.I)
+_COMMERCIAL_LINE_RE = re.compile(
+    r"^(?:стоимость|срок|цен[аы])\s*[—\-–:]",
+    re.I,
+)
+
+
+def _sentence_parts(raw: str) -> list[str]:
+    return [p.strip() for p in re.split(r"(?<=[.!?…])\s+", raw) if p.strip()]
+
+
+def _group_logical_blocks(parts: list[str]) -> list[str]:
+    """Greeting / essence / details / commercials / CTA as separate blocks."""
+    if not parts:
+        return []
+    if len(parts) == 1:
+        return parts
+
+    blocks: list[str] = []
+    i = 0
+    if _HELLO_ONLY_RE.match(parts[0]):
+        blocks.append(parts[0])
+        i = 1
+    rest = parts[i:]
+    if not rest:
+        return blocks
+
+    commercials = [p for p in rest if _COMMERCIAL_LINE_RE.match(p)]
+    content = [p for p in rest if not _COMMERCIAL_LINE_RE.match(p)]
+    if not content:
+        blocks.append(" ".join(commercials))
+        return blocks
+
+    if len(content) == 1:
+        blocks.append(content[0])
+    elif len(content) == 2:
+        blocks.append(content[0])
+        blocks.append(content[1])
+    else:
+        # essence | details | CTA
+        blocks.append(content[0])
+        mid = content[1:-1]
+        if len(mid) == 1:
+            blocks.append(mid[0])
+        else:
+            half = max(1, len(mid) // 2)
+            blocks.append(" ".join(mid[:half]))
+            if mid[half:]:
+                blocks.append(" ".join(mid[half:]))
+        blocks.append(content[-1])
+
+    if commercials:
+        # Price/srok as their own block, just before the closing CTA.
+        cta = blocks.pop()
+        blocks.append(" ".join(commercials))
+        blocks.append(cta)
+    return blocks
+
+
 def ensure_response_paragraphs(text: str) -> str:
-    """Paragraphs: single \\n between blocks, each starts with 4-space red line."""
+    """Blank line between logical blocks; each starts with 4-space red line."""
     raw = unescape_literal_newlines(text or "").strip()
     if not raw:
         return raw
-    raw = re.sub(r"\n{2,}", "\n", raw).strip()
 
+    # Existing line breaks → keep as paragraph candidates (blank or single).
     if "\n" in raw:
-        blocks = [ln.strip() for ln in raw.split("\n") if ln.strip()]
-    else:
-        parts = [p.strip() for p in re.split(r"(?<=[.!?…])\s+", raw) if p.strip()]
-        if len(parts) <= 2:
-            blocks = parts
+        rough = [ln.strip() for ln in re.split(r"\n+", raw) if ln.strip()]
+        # One fat line still a wall → sentence-split that chunk.
+        if len(rough) == 1:
+            parts = _sentence_parts(rough[0])
+            blocks = _group_logical_blocks(parts)
+        elif len(rough) >= 4:
+            # Already broken enough — keep as-is (greeting/body/details/cta).
+            blocks = rough
         else:
-            blocks = [parts[0]]
-            mid = parts[1:-2] if len(parts) >= 4 else parts[1:-1]
-            if mid:
-                if len(mid) <= 2:
-                    blocks.append(" ".join(mid))
-                else:
-                    half = max(1, len(mid) // 2)
-                    blocks.append(" ".join(mid[:half]))
-                    blocks.append(" ".join(mid[half:]))
-            tail = parts[-2:] if len(parts) >= 4 else parts[-1:]
-            blocks.append(" ".join(tail))
+            # Few lines: re-group by sentences across the whole body for balance.
+            parts = _sentence_parts(" ".join(rough))
+            blocks = _group_logical_blocks(parts) if len(parts) >= 3 else rough
+    else:
+        blocks = _group_logical_blocks(_sentence_parts(raw))
 
-    return "\n".join(_with_red_line(b) for b in blocks if b)
+    return "\n\n".join(_with_red_line(b) for b in blocks if b)
 
 
 # Stock mini-proof openers the model overuses at paragraph start.
@@ -272,6 +331,27 @@ def diversify_mini_proof(text: str, *, seed: str | None = None) -> str:
     return _MINI_PROOF_STOCK_RE.sub(_sub, body, count=1)
 
 
+_YANDEX_USLUGI_MAX_CHARS = 1000
+
+
+def clamp_yandex_response_length(text: str, limit: int = _YANDEX_USLUGI_MAX_CHARS) -> str:
+    """Hard cap for Яндекс Услуги form (1000 chars incl. spaces/newlines)."""
+    body = text or ""
+    if len(body) <= limit:
+        return body
+    cut = body[:limit]
+    floor = int(limit * 0.55)
+    for sep in ("\n\n", "\n"):
+        idx = cut.rfind(sep)
+        if idx >= floor:
+            return cut[:idx].rstrip()
+    for sep in (". ", "! ", "? "):
+        idx = cut.rfind(sep)
+        if idx >= floor:
+            return cut[: idx + 1].rstrip()
+    return cut.rstrip()
+
+
 def finalize_response_text(text: str, project: ProjectFull | None = None) -> str:
     cleaned = unescape_literal_newlines(text)
     cleaned = strip_response_markdown(cleaned)
@@ -285,7 +365,10 @@ def finalize_response_text(text: str, project: ProjectFull | None = None) -> str
     if project is not None:
         cleaned = ensure_response_paragraphs(cleaned)
     # Keep leading indent (красная строка) on the first paragraph.
-    return cleaned.rstrip()
+    cleaned = cleaned.rstrip()
+    if project is not None and project.platform == "yandex_uslugi":
+        cleaned = clamp_yandex_response_length(cleaned)
+    return cleaned
 
 def kwork_compliance_issues(text: str) -> list[str]:
     issues: list[str] = []
@@ -328,5 +411,5 @@ def append_missing_checklist_answers(
         )
     if not extras:
         return text
-    indented = "\n".join(_with_red_line(x) for x in extras)
-    return text.rstrip() + "\n" + indented
+    indented = "\n\n".join(_with_red_line(x) for x in extras)
+    return text.rstrip() + "\n\n" + indented

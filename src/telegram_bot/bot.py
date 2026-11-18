@@ -171,6 +171,8 @@ def format_review_card(offer: PendingOffer) -> str:
     )
     if offer.url:
         body += f"🔗 {offer.url}\n"
+    if getattr(project, "requires_paid_response", None) is True:
+        body += "\n⚠️ Нужен платный отклик (заказ без «Для всех»)\n"
     if offer.budget_ceiling_warning:
         body += f"\n{offer.budget_ceiling_warning}\n"
     body += (
@@ -375,6 +377,7 @@ class TelegramReviewBot:
         on_correct_instruction: Any | None = None,
         on_manual_project: Any | None = None,
         on_force_project: Any | None = None,
+        on_kwork_toggle: Any | None = None,
         on_manual_tz: Any | None = None,
         on_early_go: Any | None = None,
         on_early_skip: Any | None = None,
@@ -478,6 +481,7 @@ class TelegramReviewBot:
                 "Kwork: карточка → автозаполнение формы (VPS).\n"
                 "Яндекс / FL.ru: карточка → текст в TG → копируй вручную.\n"
                 "Ручной: /project ссылка · /force id/URL мимо фильтра · /tz ТЗ\n"
+                "Kwork авто: /kworkoff · /kworkon\n"
                 "Excel: /journal · Notebook: /notebook [N] · отчёт: /report"
             )
 
@@ -554,6 +558,24 @@ class TelegramReviewBot:
                     return
                 project_id, platform = parsed
                 await on_force_project(message, project_id, platform)
+
+        if on_kwork_toggle is not None:
+
+            @self._dp.message(Command("kworkoff"))
+            async def handle_kworkoff_command(message: Message) -> None:
+                if str(message.chat.id) != self.chat_id:
+                    return
+                self._tz_awaiting_chats.discard(str(message.chat.id))
+                self.clear_correct_awaiting(str(message.chat.id))
+                await on_kwork_toggle(message, True)
+
+            @self._dp.message(Command("kworkon"))
+            async def handle_kworkon_command(message: Message) -> None:
+                if str(message.chat.id) != self.chat_id:
+                    return
+                self._tz_awaiting_chats.discard(str(message.chat.id))
+                self.clear_correct_awaiting(str(message.chat.id))
+                await on_kwork_toggle(message, False)
 
         @self._dp.message(Command("report"))
         async def handle_report(message: Message) -> None:
@@ -867,14 +889,20 @@ class TelegramReviewBot:
         title: str,
         offers: int | None,
         url: str,
+        requires_paid_response: bool | None = None,
     ) -> int | None:
         offers_text = str(offers) if offers is not None else "—"
+        label = PLATFORM_LABELS.get(platform, platform)
+        paid_line = ""
+        if requires_paid_response is True:
+            paid_line = "\n⚠️ Нужен платный отклик (не «Для всех»)"
         text = (
-            "⚡ Новый Kwork\n"
+            f"⚡ Новый {label}\n"
             f"<b>{html.escape(title)}</b>\n"
             f"Откликов: {html.escape(offers_text)}\n"
             f"Источник: {html.escape(source_key)}\n"
             f"{html.escape(url)}"
+            f"{paid_line}"
         )
         msg = await self._bot.send_message(
             chat_id=self.chat_id,
@@ -890,6 +918,7 @@ class TelegramReviewBot:
         self,
         message_id: int,
         *,
+        platform: str = "kwork",
         title: str,
         offers: int | None,
         source_key: str,
@@ -897,8 +926,9 @@ class TelegramReviewBot:
         footer: str,
     ) -> None:
         offers_text = str(offers) if offers is not None else "—"
+        label = PLATFORM_LABELS.get(platform, platform)
         text = (
-            "⚡ Новый Kwork\n"
+            f"⚡ Новый {label}\n"
             f"<b>{html.escape(title)}</b>\n"
             f"Откликов: {html.escape(offers_text)}\n"
             f"Источник: {html.escape(source_key)}\n"

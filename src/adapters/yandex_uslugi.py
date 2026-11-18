@@ -80,35 +80,102 @@ ORDER_EXTRACTOR_JS = """
   const UUID =
     /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
   const pathId = (location.pathname.match(UUID) || [])[0] || null;
+  const chromeLine = (t) =>
+    /^(?:ваши\\s+заказы|поиск\\s+заказов|мой\\s+профиль|продвижение|подписки|настройки|уведомлен|главная\\s+страница|исполнители|выйти\\s+из\\s+аккаунта)$/i.test(
+      norm(t)
+    ) ||
+    /главная\\s+страница\\s+яндекс\\s+исполнител/i.test(t || '');
+  const stopLine = (t) =>
+    /^(?:по\\s+договор[её]нности|стоим(?:ость|ости)|бюджет|срок|работа\\s+выполняется|заказчик|клиент|откликнутьс|не\\s+интересует)/i.test(
+      norm(t)
+    );
+
+  const h1 =
+    [...document.querySelectorAll('h1')].find((el) => {
+      const t = norm(el.textContent);
+      return t && !chromeLine(t) && t.length >= 3;
+    }) || document.querySelector('h1');
   const title =
-    norm(document.querySelector('h1')?.textContent) ||
+    norm(h1?.textContent) ||
     norm(document.querySelector('[class*="title"], [class*="Title"]')?.textContent) ||
     norm(document.title).replace(/\\s*[|·—-].*$/, '');
 
-  const h1 = document.querySelector('h1');
-  const root =
-    document.querySelector('main, [role="main"], article') ||
-    h1?.closest('section, article, [class*="order"], [class*="Order"]') ||
-    h1?.parentElement ||
-    document.body;
+  // Prefer h1-anchored card. Bare <main> on executor SPA is often nav shell only.
+  const pickRoot = () => {
+    if (h1) {
+      let el = h1.parentElement;
+      for (let i = 0; i < 8 && el; i++) {
+        const t = norm(el.innerText || '');
+        if (t.length >= 80 && !chromeLine(t.slice(0, 60))) return el;
+        const closer = el.closest(
+          'section, article, [class*="order"], [class*="Order"], [class*="card"], [class*="Card"]'
+        );
+        if (closer && closer !== el) {
+          const ct = norm(closer.innerText || '');
+          if (ct.length >= 80) return closer;
+        }
+        el = el.parentElement;
+      }
+      if (h1.parentElement) return h1.parentElement;
+    }
+    for (const sel of ['article', '[role="main"]', 'main']) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      const t = norm(el.innerText || '');
+      if (t.length >= 80 && !/ваши\\s+заказы.*поиск\\s+заказов.*мой\\s+профиль/i.test(t.slice(0, 200))) {
+        return el;
+      }
+    }
+    return document.body;
+  };
+  const root = pickRoot();
 
   const inNoise = (el) =>
     !!el?.closest(
-      'aside, [class*="sidebar"], [class*="Sidebar"], [class*="otherOrder"], [class*="OtherOrder"], [class*="other-order"], [class*="recommend"], [class*="Recommend"], [class*="similar"], [class*="Similar"]'
+      'aside, nav, header, [class*="sidebar"], [class*="Sidebar"], [class*="otherOrder"], [class*="OtherOrder"], [class*="other-order"], [class*="recommend"], [class*="Recommend"], [class*="similar"], [class*="Similar"]'
     );
 
   const descCandidates = [
     ...root.querySelectorAll(
-      '[class*="description"], [class*="Description"], [class*="text"], article, main p'
+      '[class*="description"], [class*="Description"], [class*="text"], article p, main p, p'
     ),
   ].filter((el) => !inNoise(el));
   let full_description = '';
   for (const el of descCandidates) {
     const t = norm(el.textContent);
+    if (chromeLine(t)) continue;
     if (t.length > full_description.length) full_description = t;
   }
+  if (full_description.length < 40 && h1) {
+    // Line walk after h1 until budget/terms chrome.
+    const lines = (root.innerText || '')
+      .split(/\\n+/)
+      .map((x) => x.trim())
+      .filter(Boolean);
+    const titleN = norm(title);
+    let start = lines.findIndex((ln) => norm(ln) === titleN);
+    if (start < 0) start = 0;
+    const parts = [];
+    for (let i = start + 1; i < lines.length; i++) {
+      const ln = lines[i];
+      if (chromeLine(ln)) continue;
+      if (stopLine(ln) && parts.length) break;
+      if (stopLine(ln) && !parts.length) continue;
+      // Skip category crumbs like «Компьютеры и IT · Разработка сайтов»
+      if (/^[^.]{3,80}\\s*·\\s*[^.]{3,80}$/.test(ln) && ln.length < 100) continue;
+      if (/поиск\\s+исполнителей|создан\\s+\\d/i.test(ln)) continue;
+      parts.push(ln);
+      if (parts.join('\\n').length > 500) break;
+    }
+    full_description = parts.join('\\n').trim();
+  }
   if (full_description.length < 40) {
-    full_description = norm(root.innerText || '').slice(0, 8000);
+    const raw = (root.innerText || '')
+      .split(/\\n+/)
+      .map((x) => x.trim())
+      .filter((ln) => ln && !chromeLine(ln))
+      .join('\\n');
+    full_description = norm(raw).slice(0, 8000);
   }
 
   const isNegotiable = (t) =>
@@ -271,6 +338,58 @@ _ORDER_MONEY_RE = re.compile(
 )
 _CHAR_LIMIT_RE = re.compile(r"\d[\d\s]*\s*символ", re.I)
 
+# Executor-cabinet nav chrome often leaks into order description when scrape
+# falls back to body.innerText (logged-in shell: «Ваши заказы», «Продвижение»…).
+_YANDEX_CAB_CHROME_MARKERS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"Ваши\s+заказы", re.I),
+    re.compile(r"Поиск\s+заказов", re.I),
+    re.compile(r"Мой\s+профиль", re.I),
+    re.compile(r"Продвижение", re.I),
+    re.compile(r"Подписки", re.I),
+    re.compile(r"Выйти\s+из\s+аккаунта", re.I),
+    re.compile(r"Главная\s+страница\s+Яндекс\s+Исполнител", re.I),
+)
+
+
+def is_yandex_executor_cab_chrome(text: str) -> bool:
+    """True when text is mostly the Yandex Executors cabinet chrome, not TZ."""
+    raw = re.sub(r"\s+", " ", (text or "").strip())
+    if len(raw) < 40:
+        return False
+    hits = sum(1 for pat in _YANDEX_CAB_CHROME_MARKERS if pat.search(raw))
+    return hits >= 3
+
+
+def sanitize_yandex_order_description(desc: str) -> str:
+    """Drop executor-cab chrome masquerading as order description."""
+    body = (desc or "").strip()
+    if not body:
+        return ""
+    # Strip leading chrome lines when real TZ follows (SPA often prepends nav).
+    lines = [ln.strip() for ln in re.split(r"[\r\n]+", body) if ln.strip()]
+    chrome_line = re.compile(
+        r"^(?:"
+        r"ваши\s+заказы|поиск\s+заказов|мой\s+профиль|продвижение|подписки|"
+        r"настройки|уведомлен|главная\s+страница|исполнители|выйти\s+из\s+аккаунта"
+        r")$",
+        re.I,
+    )
+    while lines and (
+        chrome_line.match(lines[0])
+        or re.search(r"главная\s+страница\s+яндекс\s+исполнител", lines[0], re.I)
+    ):
+        lines.pop(0)
+    body = "\n".join(lines).strip() if lines else body
+    body = re.sub(r"\s+", " ", body).strip() if "\n" not in body else body.strip()
+    if is_yandex_executor_cab_chrome(body):
+        logger.warning(
+            "yandex_desc_rejected_cab_chrome len=%s head=%r",
+            len(body),
+            body[:120],
+        )
+        return ""
+    return body
+
 
 def _budgets_from_order_html(scoped_html: str) -> tuple[str | None, str | None]:
     """Extract desired/max budget from order card HTML only (no page-wide scrape)."""
@@ -374,7 +493,7 @@ def parse_order_from_html(html: str, order_id: str | None = None) -> dict[str, A
     return {
         "project_id": pid,
         "title": title,
-        "full_description": desc[:8000],
+        "full_description": sanitize_yandex_order_description(desc[:8000]),
         "desired_budget": desired,
         "max_budget": max_b,
         "buyer": buyer,
@@ -696,7 +815,7 @@ class YandexUslugiAdapter:
             browser.navigate(url)
             self._ensure_logged_in(browser)
             if hasattr(browser, "wait_ms"):
-                browser.wait_ms(1500)
+                browser.wait_ms(3000)
             raw = browser.evaluate(ORDER_EXTRACTOR_JS)
             if not isinstance(raw, dict) or not str(raw.get("title") or "").strip():
                 snapshot = browser.snapshot()
@@ -709,7 +828,9 @@ class YandexUslugiAdapter:
             raise RuntimeError(f"yandex_read_failed: {exc}") from exc
 
         title = str(raw.get("title") or "").strip()
-        desc = str(raw.get("full_description") or "").strip()
+        desc = sanitize_yandex_order_description(
+            str(raw.get("full_description") or "").strip()
+        )
         return ProjectFull(
             platform=self.platform_id,
             source_key=self.source_key,

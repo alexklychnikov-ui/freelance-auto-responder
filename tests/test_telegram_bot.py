@@ -105,6 +105,7 @@ async def test_project_help_does_not_use_raw_angle_brackets() -> None:
     # assert the static help strings used by handlers are HTML-safe.
     start_help = (
         "Ручной: /project ссылка · /force id/URL мимо фильтра · /tz ТЗ\n"
+        "Kwork авто: /kworkoff · /kworkon\n"
     )
     project_help = "/project https://uslugi.yandex.ru/order/UUID\n"
     assert "<ссылка>" not in start_help
@@ -228,6 +229,56 @@ async def test_force_ignored_for_wrong_chat() -> None:
     await bot.dispatcher.feed_update(bot.bot, _make_update("/force 3266288"))
 
     force_handler.assert_not_awaited()
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_kworkoff_triggers_toggle_handler() -> None:
+    toggle_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_kwork_toggle=toggle_handler,
+    )
+
+    await bot.dispatcher.feed_update(bot.bot, _make_update("/kworkoff"))
+
+    toggle_handler.assert_awaited_once()
+    assert toggle_handler.await_args.args[1] is True
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_kworkon_triggers_toggle_handler() -> None:
+    toggle_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_kwork_toggle=toggle_handler,
+    )
+
+    await bot.dispatcher.feed_update(bot.bot, _make_update("/kworkon"))
+
+    toggle_handler.assert_awaited_once()
+    assert toggle_handler.await_args.args[1] is False
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_kworkoff_ignored_for_wrong_chat() -> None:
+    toggle_handler = AsyncMock()
+    bot = TelegramReviewBot(token="123456:TEST", chat_id="999", bot=Bot(token="123456:TEST"))
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_kwork_toggle=toggle_handler,
+    )
+
+    await bot.dispatcher.feed_update(bot.bot, _make_update("/kworkoff"))
+
+    toggle_handler.assert_not_awaited()
     await bot.close()
 
 
@@ -540,3 +591,59 @@ async def test_mark_review_skipped_disables_html_parse() -> None:
     assert kwargs["reply_markup"] is None
     assert "Пропущено" in callback.message.edit_text.await_args.args[0]
     await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_notify_early_listing_uses_platform_label() -> None:
+    mock_bot = MagicMock()
+    mock_bot.send_message = AsyncMock(
+        return_value=MagicMock(message_id=42)
+    )
+    mock_bot.edit_message_text = AsyncMock()
+    tg = TelegramReviewBot(token="123456:TEST", chat_id="123", bot=mock_bot)
+
+    await tg.notify_early_listing(
+        platform="yandex_uslugi",
+        source_key="yandex_uslugi_it",
+        project_id="uuid-1",
+        title="Job",
+        offers=3,
+        url="https://example.com/1",
+    )
+    text = mock_bot.send_message.await_args.kwargs["text"]
+    assert "⚡ Новый Яндекс Услуги" in text
+
+    await tg.notify_early_listing(
+        platform="flru",
+        source_key="flru_orders",
+        project_id="99",
+        title="FL",
+        offers=None,
+        url="https://fl.ru/1",
+    )
+    text = mock_bot.send_message.await_args.kwargs["text"]
+    assert "⚡ Новый FL.ru" in text
+
+    await tg.notify_early_listing(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="1",
+        title="K",
+        offers=1,
+        url="https://kwork.ru/1",
+    )
+    text = mock_bot.send_message.await_args.kwargs["text"]
+    assert "⚡ Новый Kwork" in text
+
+    await tg.edit_early_listing_result(
+        42,
+        platform="yandex_uslugi",
+        title="Job",
+        offers=3,
+        source_key="yandex_uslugi_it",
+        url="https://example.com/1",
+        footer="⏭ Skip",
+    )
+    edit_text = mock_bot.edit_message_text.await_args.kwargs["text"]
+    assert "⚡ Новый Яндекс Услуги" in edit_text
+    assert "⏭ Skip" in edit_text

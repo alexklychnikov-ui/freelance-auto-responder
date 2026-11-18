@@ -17,6 +17,10 @@ __pycache__/
 data/seen_projects.db
 data/kwork_storage.json
 data/kwork_browser_profile/
+data/tg_user.session
+data/tg_user.session-journal
+*.session
+data/tg_user_watch_seen.db
 data/prepared_responses/
 data/pending_offers/
 data/*.xlsx

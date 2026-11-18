@@ -8,6 +8,7 @@ aiosqlite>=0.20
 python-dotenv>=1.0
 pytest>=8.0
 pytest-asyncio>=0.24
+telethon>=1.36
 playwright>=1.49
 mcp>=1.8
 pypdf>=4.0

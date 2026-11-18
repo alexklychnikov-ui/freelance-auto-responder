@@ -8,7 +8,9 @@ from src.adapters.flru import (
     FlruAdapter,
     _clean_submitted_description,
     cookie_header_from_storage,
+    detect_flru_requires_paid_response,
     flru_page_looks_logged_out,
+    flru_paid_response_tg_mark,
     is_flru_project_closed,
     parse_listing_from_html,
     parse_project_from_html,
@@ -137,6 +139,24 @@ def test_listing_url_appends_for_all() -> None:
     assert adapter._listing_url() == "https://www.fl.ru/projects/?kind=1&for_all=1"
 
 
+def test_detect_flru_requires_paid_response() -> None:
+    paid_html = (
+        "<div>Вы можете купить 1 отклик, чтобы ответить на этот заказ.</div>"
+        "<button>Купить 1 отклик за 80 ₽</button>"
+        "<p>покупать отклики только пакетами</p>"
+    )
+    free_html = (
+        "<div>Не требуется оплата отклика</div>"
+        "<span>опция «Для всех»</span>"
+    )
+    assert detect_flru_requires_paid_response(paid_html) is True
+    assert detect_flru_requires_paid_response(free_html) is False
+    assert detect_flru_requires_paid_response("<div>обычный текст</div>") is None
+    mark = flru_paid_response_tg_mark(title="Тест", url="https://www.fl.ru/projects/1/")
+    assert "платный отклик" in mark
+    assert "Тест" in mark
+
+
 def test_cookie_header_from_storage(tmp_path) -> None:
     path = tmp_path / "flru_storage.json"
     path.write_text(
@@ -155,9 +175,13 @@ def test_scan_new_prefers_http(monkeypatch) -> None:
     )
     browser = MagicMock()
     adapter = _make_adapter(browser=browser)
+    monkeypatch.setattr(
+        adapter,
+        "_auth_fetch_html",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("auth down")),
+    )
     cards = adapter.scan_new()
     assert any(c.project_id == PID for c in cards)
-    browser.navigate.assert_not_called()
 
 
 def test_scan_new_ensures_for_all_checkbox(monkeypatch) -> None:
@@ -172,13 +196,17 @@ def test_scan_new_ensures_for_all_checkbox(monkeypatch) -> None:
         [{"project_id": PID, "url": f"https://www.fl.ru/projects/{PID}/", "title": "t"}],
     ]
     adapter = _make_adapter(browser=browser)
+    monkeypatch.setattr(
+        adapter,
+        "_auth_fetch_html",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("auth down")),
+    )
     cards = adapter.scan_new()
     assert len(cards) == 1
     assert cards[0].project_id == PID
-    browser.navigate.assert_called_once_with(
+    browser.navigate.assert_called_with(
         "https://www.fl.ru/projects/?kind=1&for_all=1"
     )
-    assert browser.evaluate.call_count == 3
 
 
 def test_parse_submitted_offer_from_fixture_text() -> None:

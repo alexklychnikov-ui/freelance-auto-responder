@@ -139,7 +139,7 @@ def test_format_scan_reports_message_legacy(store: ScanReportStore) -> None:
         store.list_recent(1),
         timezone_name="Asia/Irkutsk",
     )
-    assert "Проверено: 4" in text
+    assert "Лента: 15" in text
     assert "не стек: 1" in text
     assert "не бюджет: 2" in text
     assert "10:30" in text
@@ -164,12 +164,35 @@ def test_format_scan_reports_message_with_platforms() -> None:
         },
     )
     text = format_scan_reports_message([report], timezone_name="Asia/Irkutsk")
-    assert "• Kwork — проверено 2 (лента 50)" in text
-    assert "• Яндекс Услуги — проверено 0 (лента 10)" in text
-    assert "• FL.ru — проверено 0 (лента 6)" in text
-    assert "Итого: проверено 2 (лента 66)" in text
+    assert "• Kwork — лента 50" in text
+    assert "• Яндекс Услуги — лента 10" in text
+    assert "• FL.ru — лента 6" in text
+    assert "Итого: лента 66" in text
     assert "в TG 2" in text
     kwork_pos = text.index("• Kwork")
     yandex_pos = text.index("• Яндекс Услуги")
     flru_pos = text.index("• FL.ru")
     assert kwork_pos < yandex_pos < flru_pos
+
+
+def test_format_scan_reports_message_platform_down() -> None:
+    report = ScanReport(
+        scanned_at="2026-10-28T05:00:00+00:00",
+        seen=42,
+        checked=42,
+        rejected_stack=0,
+        rejected_budget=0,
+        notified=2,
+        by_platform={
+            "kwork": ScanCycleStats(seen=12, notified=1),
+            "yandex_uslugi": ScanCycleStats(
+                errors=1, error="not_logged_in: нет сессии Яндекс Услуги"
+            ),
+            "flru": ScanCycleStats(seen=30, notified=1),
+        },
+    )
+    text = format_scan_reports_message([report], timezone_name="Asia/Irkutsk")
+    assert "Отвал: Яндекс Услуги" in text
+    assert "DOWN" in text
+    assert "not_logged_in" in text
+    assert "⚠️" in text

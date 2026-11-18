@@ -23,6 +23,7 @@ from src.adapters.kwork_pricing import (
     format_rub_amount,
     parse_budget_ceiling_rub,
     pick_listed_offer_price,
+    prefer_response_price_when_no_budget,
     price_exceeds_budget_ceiling,
 )
 from src.adapters.offer_scope import (
@@ -51,7 +52,11 @@ from src.adapters.yandex_uslugi import YandexAuthError, YandexUslugiAdapter
 from src.analyzer.examples_loader import load_response_examples
 from src.analyzer.gpt_offer_estimator import GptOfferEstimator
 from src.analyzer.gpt_response_generator import GptResponseGenerator
-from src.analyzer.response_text import append_missing_checklist_answers, finalize_response_text
+from src.analyzer.response_text import (
+    append_missing_checklist_answers,
+    ensure_response_paragraphs,
+    finalize_response_text,
+)
 from src.analyzer.gpt_scorer import GptScorer
 from src.analyzer.lightrag_client import LightRagClient
 from src.analyzer.project_brief import build_project_brief
@@ -76,8 +81,13 @@ from src.evidence.summary import evidence_summary_html
 from src.evidence.usage import evidence_usage_issues
 from src.models import PendingOffer, ProjectFull, ProjectPreview
 from src.responses.prepared_store import PreparedResponse, PreparedResponseStore
+from src.adapters.tg_user_watch import TgUserAuthError
 from src.pipeline.flru_inbox_poller import poll_flru_inbox
 from src.pipeline.kwork_inbox_poller import poll_kwork_inbox
+from src.pipeline.tg_user_watch_poller import poll_tg_user_watch
+from src.pipeline.yandex_inbox_poller import poll_yandex_inbox
+from src.platform_health import mark_platform_up, should_send_platform_down_alert
+from src.runtime_toggles import is_kwork_paused, set_kwork_paused
 from src.store.early_listings import EarlyListing, EarlyListingStore
 from src.store.early_ping_seen import EarlyPingSeenStore
 from src.store.kwork_inbox_seen import KworkInboxSeenStore
@@ -96,6 +106,42 @@ def _is_closed_project_error(exc: BaseException) -> bool:
         return True
     msg = str(exc).lower()
     return "flru_project_closed" in msg or "project_closed" in msg
+
+
+def _manual_outcome_tg_text(
+    *, platform_label: str, project_id: str, url: str, outcome: str
+) -> str | None:
+    """Human message after /project|/force when no review card was sent."""
+    if outcome == "notified":
+        return None
+    pid = html.escape(project_id)
+    link = html.escape(url, quote=True) if url else ""
+    tail = f"\n{link}" if link else ""
+    if outcome == "extract_fail":
+        return (
+            f"⚠️ {platform_label} <code>{pid}</code>: не удалось прочитать карточку "
+            f"(пустое/служебное описание). Пришли ТЗ текстом через /tz или ссылку ещё раз."
+            f"{tail}"
+        )
+    if outcome == "stack_reject":
+        return (
+            f"⏭ {platform_label} <code>{pid}</code>: стек не подходит "
+            f"(для обхода фильтра — /force).{tail}"
+        )
+    if outcome == "budget_reject":
+        return f"⏭ {platform_label} <code>{pid}</code>: бюджет выше потолка.{tail}"
+    if outcome == "timeout":
+        return f"⚠️ {platform_label} <code>{pid}</code>: таймаут обработки.{tail}"
+    if outcome == "closed":
+        return f"⏭ {platform_label} <code>{pid}</code>: проект закрыт.{tail}"
+    if outcome == "already_done":
+        return f"ℹ️ {platform_label} <code>{pid}</code>: уже обработан.{tail}"
+    if outcome == "error":
+        return f"⚠️ {platform_label} <code>{pid}</code>: ошибка обработки.{tail}"
+    return (
+        f"⚠️ {platform_label} <code>{pid}</code>: обработка завершилась "
+        f"({html.escape(outcome)}), карточки отклика нет.{tail}"
+    )
 
 
 def _normalize_compare_title(value: str) -> str:
@@ -168,6 +214,12 @@ class PipelineOrchestrator:
         self.flru_inbox_seen = KworkInboxSeenStore(
             settings.flru_inbox_seen_db or "data/flru_inbox_seen.db"
         )
+        self.yandex_inbox_seen = KworkInboxSeenStore(
+            settings.yandex_inbox_seen_db or "data/yandex_inbox_seen.db"
+        )
+        self.tg_user_watch_seen = KworkInboxSeenStore(
+            settings.tg_user_watch_seen_db or "data/tg_user_watch_seen.db"
+        )
         self.early_ping_seen = EarlyPingSeenStore(
             settings.early_ping_seen_db or "data/early_ping_seen.db"
         )
@@ -194,6 +246,7 @@ class PipelineOrchestrator:
         self.review_service.set_notebook_sync_handler(self.request_notebook_sync)
         self.review_service.set_manual_project_handler(self.handle_manual_project)
         self.review_service.set_force_project_handler(self.handle_force_project)
+        self.review_service.set_kwork_toggle_handler(self.handle_kwork_pause)
         self.review_service.set_manual_tz_handler(self.handle_manual_tz)
 
     def close(self) -> None:
@@ -314,6 +367,12 @@ class PipelineOrchestrator:
             )
             return {"project_id": project_id, "outcome": "error"}
 
+        await self._notify_manual_outcome(
+            platform_label="Kwork",
+            project_id=project_id,
+            url=preview.url or "",
+            outcome=str(outcome),
+        )
         return {"project_id": project_id, "outcome": outcome}
 
     async def poll_flru_inbox(self) -> dict[str, int]:
@@ -347,6 +406,15 @@ class PipelineOrchestrator:
     async def poll_kwork_inbox(self) -> dict[str, int]:
         if not self.settings.kwork_inbox_mirror_enabled:
             return {"bootstrapped": 0, "checked": 0, "fetched": 0, "notified": 0, "errors": 0}
+        if is_kwork_paused(self.settings):
+            logger.info("kwork_inbox_poll skipped: kwork paused")
+            return {
+                "bootstrapped": 0,
+                "checked": 0,
+                "fetched": 0,
+                "notified": 0,
+                "errors": 0,
+            }
         creds = None
         if pair := self.settings.kwork_credentials():
             creds = KworkCredentials(login=pair[0], password=pair[1])
@@ -377,6 +445,62 @@ class PipelineOrchestrator:
                 "errors": 1,
             }
 
+    async def poll_yandex_inbox(self) -> dict[str, int]:
+        if not self.settings.yandex_inbox_mirror_enabled:
+            return {"bootstrapped": 0, "checked": 0, "fetched": 0, "notified": 0, "errors": 0}
+        try:
+            return await poll_yandex_inbox(
+                settings=self.settings,
+                store=self.yandex_inbox_seen,
+                notify=self.review_service.tg_bot.notify,
+            )
+        except YandexAuthError as exc:
+            logger.error("yandex_inbox_auth_failed: %s", exc)
+            return {
+                "bootstrapped": 0,
+                "checked": 0,
+                "fetched": 0,
+                "notified": 0,
+                "errors": 1,
+            }
+        except Exception:
+            logger.exception("yandex_inbox_poll_failed")
+            return {
+                "bootstrapped": 0,
+                "checked": 0,
+                "fetched": 0,
+                "notified": 0,
+                "errors": 1,
+            }
+
+    async def poll_tg_user_watch(self) -> dict[str, int]:
+        if not self.settings.tg_user_watch_enabled:
+            return {"bootstrapped": 0, "checked": 0, "fetched": 0, "notified": 0, "errors": 0}
+        try:
+            return await poll_tg_user_watch(
+                settings=self.settings,
+                store=self.tg_user_watch_seen,
+                notify=self.review_service.tg_bot.notify,
+            )
+        except TgUserAuthError as exc:
+            logger.error("tg_user_watch_auth_failed: %s", exc)
+            return {
+                "bootstrapped": 0,
+                "checked": 0,
+                "fetched": 0,
+                "notified": 0,
+                "errors": 1,
+            }
+        except Exception:
+            logger.exception("tg_user_watch_poll_failed")
+            return {
+                "bootstrapped": 0,
+                "checked": 0,
+                "fetched": 0,
+                "notified": 0,
+                "errors": 1,
+            }
+
     async def run_scan_cycle(self) -> dict[str, int]:
         totals = {"seen": 0, "new": 0, "skipped": 0, "scored": 0, "notified": 0}
         cycle_stats = ScanCycleStats()
@@ -391,11 +515,17 @@ class PipelineOrchestrator:
             flru_inbox_stats = await self.poll_flru_inbox()
             logger.info("flru_inbox_poll %s", flru_inbox_stats)
 
+        if self.settings.yandex_inbox_mirror_enabled:
+            yandex_inbox_stats = await self.poll_yandex_inbox()
+            logger.info("yandex_inbox_poll %s", yandex_inbox_stats)
+
+        # tg_user_watch: only scheduler.inbox_loop (avoid dual-poll duplicate pings)
+
         for source in get_enabled_sources(self.settings.sources_config_path):
-            if (
-                self.settings.kwork_fast_scan_enabled
-                and source.platform == "kwork"
-            ):
+            if self.settings.early_scan_enabled_for(source.platform):
+                continue
+            if source.platform == "kwork" and is_kwork_paused(self.settings):
+                logger.info("scan_cycle skip kwork source=%s: paused", source.id)
                 continue
             source_stats = ScanCycleStats()
             try:
@@ -610,6 +740,15 @@ class PipelineOrchestrator:
         return totals
 
     def enqueue_process(self, source: SourceConfig, preview: Any) -> bool:
+        if (
+            getattr(preview, "platform", None) == "kwork"
+            or getattr(source, "platform", None) == "kwork"
+        ) and is_kwork_paused(self.settings):
+            logger.info(
+                "process_queue skip enqueue kwork paused project_id=%s",
+                getattr(preview, "project_id", "?"),
+            )
+            return False
         key = (preview.platform, preview.source_key, str(preview.project_id))
         if key in self._process_queued_keys:
             return False
@@ -636,6 +775,15 @@ class PipelineOrchestrator:
     async def _run_queued_process(
         self, source: SourceConfig, preview: Any
     ) -> None:
+        if (
+            getattr(preview, "platform", None) == "kwork"
+            or getattr(source, "platform", None) == "kwork"
+        ) and is_kwork_paused(self.settings):
+            logger.info(
+                "process_queue skip run kwork paused project_id=%s",
+                getattr(preview, "project_id", "?"),
+            )
+            return
         status = self.repository.get_status(
             preview.platform, preview.source_key, preview.project_id
         )
@@ -761,6 +909,7 @@ class PipelineOrchestrator:
         try:
             await self.review_service.tg_bot.edit_early_listing_result(
                 listing.telegram_message_id,
+                platform=listing.platform,
                 title=listing.title,
                 offers=listing.offers_count,
                 source_key=listing.source_key,
@@ -774,32 +923,107 @@ class PipelineOrchestrator:
                 listing.telegram_message_id,
             )
 
-    async def run_kwork_fast_scan_cycle(self) -> dict[str, int]:
+    async def _alert_platform_down(
+        self, platform: str, source_id: str, message: str
+    ) -> None:
+        label = {
+            "kwork": "Kwork",
+            "yandex_uslugi": "Яндекс Услуги",
+            "flru": "FL.ru",
+        }.get(platform, platform)
+        if not should_send_platform_down_alert(self.settings, platform):
+            logger.warning(
+                "platform_down_alert_throttled platform=%s source=%s msg=%s",
+                platform,
+                source_id,
+                message[:200],
+            )
+            return
+        await self.review_service.tg_bot.notify(
+            f"🚨 <b>{html.escape(label)} отвалилась</b>\n"
+            f"Источник: <code>{html.escape(source_id)}</code>\n"
+            f"{html.escape(message[:400])}\n"
+            f"Повторный алерт не чаще чем раз в 30 мин. /report — статус."
+        )
+
+    async def run_early_scan_cycle(self) -> dict[str, int]:
         totals = {
             "seen": 0,
             "new": 0,
             "pinged": 0,
             "enqueued": 0,
             "skipped": 0,
+            "errors": 0,
         }
+        by_platform: dict[str, ScanCycleStats] = {}
         tg = self.review_service.tg_bot
+        kwork_paused = is_kwork_paused(self.settings)
+
+        def _plat_stats(platform: str) -> ScanCycleStats:
+            stats = by_platform.get(platform)
+            if stats is None:
+                stats = ScanCycleStats()
+                by_platform[platform] = stats
+            return stats
 
         for source in get_enabled_sources(self.settings.sources_config_path):
-            if source.platform != "kwork":
+            if not self.settings.early_scan_enabled_for(source.platform):
                 continue
+            if source.platform == "kwork" and kwork_paused:
+                logger.info(
+                    "early_scan skip kwork source=%s: paused", source.id
+                )
+                continue
+            plat_stats = _plat_stats(source.platform)
             try:
                 previews = await asyncio.to_thread(self._scan_listings, source)
             except KworkAuthError as exc:
-                logger.error("Kwork auth failed for %s: %s", source.id, exc)
-                await tg.notify(f"⚠️ Kwork login failed ({source.id}): {exc}")
+                msg = str(exc)
+                logger.error("Kwork auth failed for %s: %s", source.id, msg)
+                plat_stats.errors += 1
+                plat_stats.error = msg[:300]
+                totals["errors"] += 1
+                await self._alert_platform_down(source.platform, source.id, msg)
                 continue
+            except YandexAuthError as exc:
+                msg = str(exc)
+                logger.warning(
+                    "Yandex early_scan failed for %s: %s", source.id, msg[:300]
+                )
+                plat_stats.errors += 1
+                plat_stats.error = msg[:300]
+                totals["errors"] += 1
+                await self._alert_platform_down(source.platform, source.id, msg)
+                continue
+            except FlruAuthError as exc:
+                msg = str(exc)
+                logger.warning(
+                    "FL.ru early_scan failed for %s: %s", source.id, msg[:300]
+                )
+                plat_stats.errors += 1
+                plat_stats.error = msg[:300]
+                totals["errors"] += 1
+                await self._alert_platform_down(source.platform, source.id, msg)
+                continue
+
+            if mark_platform_up(self.settings, source.platform):
+                label = {
+                    "kwork": "Kwork",
+                    "yandex_uslugi": "Яндекс Услуги",
+                    "flru": "FL.ru",
+                }.get(source.platform, source.platform)
+                await tg.notify(f"✅ {label} снова в строю (скан ок)")
 
             bootstrap = self._is_bootstrap(source)
             known_streak = 0
             new_in_source = 0
+            source_seen = 0
+            source_pinged = 0
 
             for preview in previews:
                 totals["seen"] += 1
+                source_seen += 1
+                plat_stats.seen += 1
                 known = self.repository.is_known(
                     preview.platform, preview.source_key, preview.project_id
                 )
@@ -867,6 +1091,9 @@ class PipelineOrchestrator:
                             title=preview.title or "",
                             offers=offers if isinstance(offers, int) else None,
                             url=preview.url or "",
+                            requires_paid_response=getattr(
+                                preview, "requires_paid_response", None
+                            ),
                         )
                         self.early_listings.save(
                             EarlyListing(
@@ -883,15 +1110,22 @@ class PipelineOrchestrator:
                             )
                         )
                         totals["pinged"] += 1
+                        source_pinged += 1
+                        plat_stats.notified += 1
 
-            max_id = max(
-                (int(p.project_id) for p in previews if p.project_id.isdigit()),
-                default=0,
-            )
+            digit_ids = [
+                int(p.project_id) for p in previews if p.project_id.isdigit()
+            ]
+            if digit_ids:
+                last_known = str(max(digit_ids))
+            elif previews:
+                last_known = str(previews[-1].project_id)
+            else:
+                last_known = None
             self.repository.set_scan_state(
                 source_key=source.id,
                 platform=source.platform,
-                last_known_project_id=str(max_id) if max_id else None,
+                last_known_project_id=last_known,
                 last_new_project_at=(
                     datetime.now(timezone.utc).replace(microsecond=0).isoformat()
                     if new_in_source
@@ -900,18 +1134,30 @@ class PipelineOrchestrator:
             )
 
             logger.info(
-                "kwork_fast_scan platform=%s source=%s seen=%d new=%d pinged=%d "
+                "early_scan platform=%s source=%s seen=%d new=%d pinged=%d "
                 "enqueued=%d skipped=%d",
                 source.platform,
                 source.id,
-                totals["seen"],
-                totals["new"],
-                totals["pinged"],
+                source_seen,
+                new_in_source,
+                source_pinged,
                 totals["enqueued"],
                 totals["skipped"],
             )
 
+        cycle_stats = ScanCycleStats(
+            seen=totals["seen"],
+            checked=totals["seen"],
+            notified=totals["pinged"],
+            errors=totals["errors"],
+        )
+        if by_platform:
+            self.scan_reports.save(cycle_stats, by_platform=by_platform)
+
         return totals
+
+    async def run_kwork_fast_scan_cycle(self) -> dict[str, int]:
+        return await self.run_early_scan_cycle()
 
     async def handle_early_go(
         self,
@@ -1101,6 +1347,33 @@ class PipelineOrchestrator:
     ) -> str:
         title = (full.title or "").strip()
         desc = (full.full_description or "").strip()
+        if (
+            full.platform == "flru"
+            and full.requires_paid_response is True
+        ):
+            from src.adapters.flru import flru_paid_response_tg_mark
+
+            msg = flru_paid_response_tg_mark(title=title or full.project_id, url=full.url)
+            logger.info(
+                "flru_paid_response_skip project_id=%s manual=%s",
+                full.project_id,
+                manual,
+            )
+            try:
+                await self.review_service.tg_bot.notify(msg)
+            except Exception:
+                logger.warning(
+                    "flru_paid_response_notify_failed project_id=%s",
+                    full.project_id,
+                    exc_info=True,
+                )
+            self.repository.update_status(
+                full.platform,
+                full.source_key,
+                full.project_id,
+                "skipped",
+            )
+            return "paid_response_required"
         if not title or len(desc) < 20:
             logger.warning(
                 "extract_fail project_id=%s title=%r desc_len=%s",
@@ -1245,7 +1518,16 @@ class PipelineOrchestrator:
         if offer.source_key == TZ_MANUAL_SOURCE_KEY:
             return offer.project
         brief = build_project_brief(offer.project)
-        if len(brief) >= 80 and len(offer.project.full_description or "") >= 40:
+        budgets_missing = not (offer.project.desired_budget or "").strip() and not (
+            offer.project.max_budget or ""
+        ).strip()
+        # Long description alone is not enough — missing budgets must re-scrape
+        # (flat «Цена N ₽» cards otherwise keep None/None → fill=8000).
+        if (
+            not budgets_missing
+            and len(brief) >= 80
+            and len(offer.project.full_description or "") >= 40
+        ):
             return offer.project
         source = self._resolve_source_config(offer.source_key)
         if source is None:
@@ -1880,9 +2162,11 @@ class PipelineOrchestrator:
         seed: str | None = None,
     ) -> str:
         body = ensure_budget_mismatch_note(text, gap, seed=seed)
-        return align_response_commercials(
+        body = align_response_commercials(
             body, price=int(price), delivery_days=int(delivery_days)
         )
+        # Align may append Стоимость/Срок — re-break into readable paragraphs.
+        return ensure_response_paragraphs(body)
 
     def _resolve_listed_fill(
         self,
@@ -1891,6 +2175,7 @@ class PipelineOrchestrator:
         fair_price: int = 0,
         offer_price: int = 0,
         volume: int | None = None,
+        response_text: str | None = None,
     ) -> tuple[int, dict | None, int]:
         gap_fair = int(fair_price or 0) or int(offer_price or 0)
         mix = listed_price_mix_for_scope(project, volume=volume)
@@ -1900,6 +2185,12 @@ class PipelineOrchestrator:
         listed = pick_listed_offer_price(
             project, fair=int(fair_price or 0), mix=mix
         )
+        listed = prefer_response_price_when_no_budget(
+            project, listed, response_text or ""
+        )
+        if gap is not None:
+            gap = dict(gap)
+            gap["fill_price"] = int(listed)
         return listed, gap, gap_fair
 
     async def _send_manual_copy(
@@ -1960,6 +2251,7 @@ class PipelineOrchestrator:
             fair_price=fair_price,
             offer_price=offer_price,
             volume=volume,
+            response_text=response_text,
         )
         delivery_days = self._scoped_delivery_days(offer, terms.delivery_days)
 
@@ -2042,6 +2334,7 @@ class PipelineOrchestrator:
             fair_price=fair_price,
             offer_price=offer_price,
             volume=volume,
+            response_text=response_text,
         )
         price = str(fill_price)
         delivery_days = self._scoped_delivery_days(offer, terms.delivery_days)
@@ -2156,6 +2449,7 @@ class PipelineOrchestrator:
                             fair_price=fair_price,
                             offer_price=offer_price,
                             volume=volume,
+                            response_text=response_text,
                         )
                         price = str(fill_price)
                         delivery_days = self._scoped_delivery_days(
@@ -2271,14 +2565,25 @@ class PipelineOrchestrator:
             await callback.answer("Отклик не найден", show_alert=True)
             return
         if item.journal_confirmed:
+            try:
+                await self.review_service.tg_bot.mark_journal_confirmed(callback)
+            except Exception:
+                logger.exception(
+                    "journal_confirm_mark_ui_failed project_id=%s", project_id
+                )
             await callback.answer("Уже в журнале", show_alert=True)
             return
         if item.project_id in self.journal.project_ids_in_journal():
             item.journal_confirmed = True
             item.journal_exported = True
             self.prepared_store.save(item)
-            await self.review_service.tg_bot.mark_journal_confirmed(callback)
-            await callback.answer("Уже в журнале")
+            try:
+                await self.review_service.tg_bot.mark_journal_confirmed(callback)
+            except Exception:
+                logger.exception(
+                    "journal_confirm_mark_ui_failed project_id=%s", project_id
+                )
+            await callback.answer("Уже в журнале", show_alert=True)
             return
 
         item.journal_confirmed = True
@@ -2427,14 +2732,32 @@ class PipelineOrchestrator:
         item.journal_exported = True
         self.prepared_store.save(item)
 
-        offer = self.review_service.store.load(platform, source_key, project_id)
+        try:
+            offer = self.review_service.store.load(platform, source_key, project_id)
+        except Exception:
+            logger.exception(
+                "journal_confirm_pending_load_failed project_id=%s", project_id
+            )
+            offer = None
         if offer is not None:
             offer.status = "submitted"
             self.review_service.store.save(offer)
-        self.repository.update_status(platform, source_key, project_id, "submitted")
+        try:
+            self.repository.update_status(
+                platform, source_key, project_id, "submitted"
+            )
+        except Exception:
+            logger.exception(
+                "journal_confirm_status_update_failed project_id=%s", project_id
+            )
 
-        await self.review_service.tg_bot.mark_journal_confirmed(callback)
-        await callback.answer("Записано в журнал")
+        try:
+            await self.review_service.tg_bot.mark_journal_confirmed(callback)
+        except Exception:
+            logger.exception(
+                "journal_confirm_mark_ui_failed project_id=%s", project_id
+            )
+        await callback.answer("Записано в журнал", show_alert=True)
         journal_note = (
             f"📒 Журнал: строка {row} · {html.escape(item.title)}\n"
             "На ПК: /journal в TG — пришлёт актуальный journal.xlsx с VPS."
@@ -2696,6 +3019,12 @@ class PipelineOrchestrator:
                 f"⚠️ Не удалось обработать заказ Яндекс {oid}: {exc}"
             )
             return {"project_id": oid, "outcome": "error"}
+        await self._notify_manual_outcome(
+            platform_label="Яндекс Услуги",
+            project_id=oid,
+            url=preview.url or "",
+            outcome=str(outcome),
+        )
         return {"project_id": oid, "outcome": outcome}
 
     async def process_manual_flru_project(self, project_id: str) -> dict[str, str]:
@@ -2732,7 +3061,31 @@ class PipelineOrchestrator:
                 f"⚠️ Не удалось обработать проект FL.ru {pid}: {exc}"
             )
             return {"project_id": pid, "outcome": "error"}
+        await self._notify_manual_outcome(
+            platform_label="FL.ru",
+            project_id=pid,
+            url=preview.url or "",
+            outcome=str(outcome),
+        )
         return {"project_id": pid, "outcome": outcome}
+
+    async def _notify_manual_outcome(
+        self,
+        *,
+        platform_label: str,
+        project_id: str,
+        url: str,
+        outcome: str,
+    ) -> None:
+        text = _manual_outcome_tg_text(
+            platform_label=platform_label,
+            project_id=project_id,
+            url=url,
+            outcome=outcome,
+        )
+        if text is None:
+            return
+        await self.review_service.tg_bot.notify(text)
 
     async def handle_manual_project(
         self, message: Any, project_id: str, platform: str | None = None
@@ -2784,6 +3137,11 @@ class PipelineOrchestrator:
             parse_mode="HTML",
         )
         await self.process_manual_kwork_project(pid)
+
+    async def handle_kwork_pause(self, message: Any, paused: bool) -> None:
+        state = set_kwork_paused(self.settings, paused=paused)
+        label = "ВЫКЛ" if state else "ВКЛ"
+        await message.answer(f"Kwork авто: {label}")
 
     def _infer_manual_platform(self, pid: str, message: Any) -> str:
         if re.fullmatch(

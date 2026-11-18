@@ -261,6 +261,30 @@ def test_prefer_response_price_when_no_budget_keeps_500() -> None:
     assert prefer_response_price_when_no_budget(with_ceiling, 400, text) == 500
 
 
+def test_stoimost_with_qualifier_not_replaced_by_8000_footer() -> None:
+    project = ProjectFull(
+        platform="flru",
+        source_key="flru_orders",
+        project_id="5529717",
+        url="https://www.fl.ru/projects/5529717/x.html",
+        title="Поиск перевозчиков",
+        full_description="long enough description " * 5,
+        desired_budget="по договоренности",
+        max_budget="по договоренности",
+    )
+    core = (
+        "Предлагаю MVP. Стоимость первой рабочей версии — 140000 ₽, срок — 14 дн. "
+        "Расходы после запуска: VPS 2000–4000 ₽/мес; "
+        "себестоимость одного поиска обычно выходит 5–25 ₽."
+    )
+    assert extract_response_price_rub(core) == 140_000
+    assert prefer_response_price_when_no_budget(project, 8000, core) == 140_000
+    out = align_response_commercials(core, price=140_000, delivery_days=14)
+    assert "8 000" not in out
+    assert "140000" in out.replace(" ", "").replace("\u00a0", "")
+    assert out.count("Стоимость —") == 0
+
+
 def test_stage1_price_preferred_over_8000_footer() -> None:
     """FL no-budget: «Этап 1: … и 85000 ₽» must win over appended 8000."""
     project = ProjectFull(

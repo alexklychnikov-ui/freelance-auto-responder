@@ -29,6 +29,8 @@ class ScanCycleStats:
     rejected_stack: int = 0
     rejected_budget: int = 0
     notified: int = 0
+    errors: int = 0
+    error: str = ""
 
     def merge(self, other: ScanCycleStats) -> None:
         self.seen += other.seen
@@ -36,16 +38,23 @@ class ScanCycleStats:
         self.rejected_stack += other.rejected_stack
         self.rejected_budget += other.rejected_budget
         self.notified += other.notified
+        self.errors += other.errors
+        if other.error and not self.error:
+            self.error = other.error
 
 
-def stats_to_dict(stats: ScanCycleStats) -> dict[str, int]:
-    return {
+def stats_to_dict(stats: ScanCycleStats) -> dict[str, int | str]:
+    out: dict[str, int | str] = {
         "seen": stats.seen,
         "checked": stats.checked,
         "rejected_stack": stats.rejected_stack,
         "rejected_budget": stats.rejected_budget,
         "notified": stats.notified,
+        "errors": stats.errors,
     }
+    if stats.error:
+        out["error"] = stats.error[:300]
+    return out
 
 
 def stats_from_dict(data: dict) -> ScanCycleStats:
@@ -55,6 +64,8 @@ def stats_from_dict(data: dict) -> ScanCycleStats:
         rejected_stack=int(data.get("rejected_stack", 0)),
         rejected_budget=int(data.get("rejected_budget", 0)),
         notified=int(data.get("notified", 0)),
+        errors=int(data.get("errors", 0) or 0),
+        error=str(data.get("error") or "")[:300],
     )
 
 

@@ -443,7 +443,7 @@ _DEFER_PRICE_DAYS_RE = re.compile(
 
 _ASKING_PRICE_RE = re.compile(
     r"(?P<label>"
-    r"(?:(?:стоимост\w*|цен\w*)\s*[—\-–:]\s*(?:от\s*)?)"
+    r"(?:\b(?:стоимост\w*|цен\w*)(?:\s+[^\n\d—\-–:₽]{1,48}?)?\s*[—\-–:]\s*(?:от\s*)?)"
     r"|(?:в\s+стоимость\s+)"
     r")"
     r"(?P<amount>\d(?:[\d\s\u00a0]*\d)?)\s*(?P<unit>₽|руб\.?)",

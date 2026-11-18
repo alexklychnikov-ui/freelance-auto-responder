@@ -37,6 +37,7 @@ CorrectInstructionHandler = Callable[
 ]
 ManualProjectHandler = Callable[[Message, str, str | None], Awaitable[None]]
 ForceProjectHandler = ManualProjectHandler
+KworkToggleHandler = Callable[[Message, bool], Awaitable[None]]
 ManualTzHandler = Callable[[Message, str], Awaitable[None]]
 
 
@@ -60,6 +61,7 @@ class ReviewService:
         on_correct_instruction: CorrectInstructionHandler | None = None,
         on_manual_project: ManualProjectHandler | None = None,
         on_force_project: ForceProjectHandler | None = None,
+        on_kwork_toggle: KworkToggleHandler | None = None,
         on_manual_tz: ManualTzHandler | None = None,
         on_early_go: EarlyDecisionHandler | None = None,
         on_early_skip: EarlyDecisionHandler | None = None,
@@ -80,6 +82,7 @@ class ReviewService:
         self._on_correct_instruction = on_correct_instruction
         self._on_manual_project = on_manual_project
         self._on_force_project = on_force_project
+        self._on_kwork_toggle = on_kwork_toggle
         self._on_manual_tz = on_manual_tz
         self._on_early_go = on_early_go
         self._on_early_skip = on_early_skip
@@ -97,6 +100,7 @@ class ReviewService:
             on_correct_instruction=self._handle_correct_instruction,
             on_manual_project=self._handle_manual_project,
             on_force_project=self._handle_force_project,
+            on_kwork_toggle=self._handle_kwork_toggle,
             on_manual_tz=self._handle_manual_tz,
             on_early_go=self._handle_early_go,
             on_early_skip=self._handle_early_skip,
@@ -139,6 +143,9 @@ class ReviewService:
 
     def set_force_project_handler(self, handler: ForceProjectHandler) -> None:
         self._on_force_project = handler
+
+    def set_kwork_toggle_handler(self, handler: KworkToggleHandler) -> None:
+        self._on_kwork_toggle = handler
 
     def set_manual_tz_handler(self, handler: ManualTzHandler) -> None:
         self._on_manual_tz = handler
@@ -475,6 +482,14 @@ class ReviewService:
         if str(message.chat.id) != str(self.tg_bot.chat_id):
             return
         await self._on_force_project(message, project_id, platform=platform)
+
+    async def _handle_kwork_toggle(self, message: Message, paused: bool) -> None:
+        if self._on_kwork_toggle is None:
+            await message.answer("Команды /kworkoff /kworkon недоступны")
+            return
+        if str(message.chat.id) != str(self.tg_bot.chat_id):
+            return
+        await self._on_kwork_toggle(message, paused)
 
     async def _handle_manual_tz(self, message: Message, text: str) -> None:
         if self._on_manual_tz is None:

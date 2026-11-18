@@ -39,7 +39,13 @@ class PendingStore:
         path = self._path_for(platform, source_key, project_id)
         if not path.exists():
             return None
-        return PendingOffer.model_validate_json(path.read_text(encoding="utf-8"))
+        try:
+            return PendingOffer.model_validate_json(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning(
+                "pending_corrupt file=%s err=%s", path.name, exc
+            )
+            return None
 
     def delete(self, platform: str, source_key: str, project_id: str) -> None:
         path = self._path_for(platform, source_key, project_id)

@@ -131,18 +131,33 @@ class Settings(BaseSettings):
     kwork_inbox_poll_seconds: int = 90
     kwork_fast_scan_enabled: bool = True
     kwork_fast_scan_seconds: int = 90
+    yandex_early_scan_enabled: bool = True
+    flru_early_scan_enabled: bool = True
     process_concurrency: int = 1
     early_ping_seen_db: str = "data/early_ping_seen.db"
     early_listings_dir: str = "data/early_listings"
 
     yandex_storage_state: str = ""
     yandex_max_daily_responses: int = 7
+    yandex_inbox_mirror_enabled: bool = True
+    yandex_inbox_seen_db: str = "data/yandex_inbox_seen.db"
+    yandex_inbox_poll_seconds: int = 90
 
     flru_storage_state: str = ""
     flru_max_daily_responses: int = 10
     flru_inbox_mirror_enabled: bool = True
     flru_inbox_seen_db: str = "data/flru_inbox_seen.db"
     flru_inbox_poll_seconds: int = 90
+
+    # Telegram USER session (Telethon) — VIP private-group watcher
+    tg_user_api_id: int = 0
+    tg_user_api_hash: str = ""
+    tg_user_watch_enabled: bool = False
+    tg_user_session_path: str = "data/tg_user.session"
+    tg_user_watch_invite: str = ""
+    tg_user_watch_poll_seconds: int = 150
+    tg_user_watch_seen_db: str = "data/tg_user_watch_seen.db"
+    tg_user_proxy: str = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -177,6 +192,23 @@ class Settings(BaseSettings):
         if login and password:
             return login, password
         return None
+
+    def early_scan_enabled_for(self, platform: str) -> bool:
+        key = (platform or "").strip().lower()
+        if key == "kwork":
+            return self.kwork_fast_scan_enabled
+        if key == "yandex_uslugi":
+            return self.yandex_early_scan_enabled
+        if key == "flru":
+            return self.flru_early_scan_enabled
+        return False
+
+    def any_early_scan_enabled(self) -> bool:
+        return (
+            self.kwork_fast_scan_enabled
+            or self.yandex_early_scan_enabled
+            or self.flru_early_scan_enabled
+        )
 
     def notebook_min_date_value(self) -> date:
         raw = (self.notebook_min_date or "").strip()

@@ -213,6 +213,18 @@ PROJECT_EXTRACTOR_JS = """
     );
     return fmtDo(m ? m[1] : null);
   };
+  // Flat card price «Цена 500 ₽» (no «до») — prefer .wants-card__price node
+  const budgetFlatCena = () => {
+    const priceEl = root.querySelector('.wants-card__price, [class*="wants-card__price"]');
+    const fromEl = priceEl ? norm(priceEl.textContent) : '';
+    const src = fromEl || pageText;
+    const m = src.match(
+      /(?:^|[^а-яёa-z0-9])цена\\s+(?!до\\b)([\\d\\s\\u00a0]+)\\s*(?:₽|руб\\.?)/i
+    );
+    if (!m) return null;
+    const n = norm(m[1]);
+    return n ? (n + ' ₽') : null;
+  };
   // Explicit «Допустимый: до 45 000 ₽» — must not fall through to first «до X» (желаемый)
   const budgetDopustimy = () => {
     let m = pageText.match(
@@ -224,6 +236,7 @@ PROJECT_EXTRACTOR_JS = """
     );
     return fmtDo(m ? m[1] : null);
   };
+  const flatCenaBudget = budgetFlatCena();
 
   const offersRaw = root.querySelector('.offers-count, [data-offers]');
   let offers = null;
@@ -280,6 +293,7 @@ PROJECT_EXTRACTOR_JS = """
         })()
       || budgetAfter('желаем(?:ый|ого)?\\\\s+бюджет')
       || budgetDoOnly()
+      || flatCenaBudget
       || null,
     max_budget:
       norm(root.querySelector('.max-budget, [data-max-budget]')?.textContent || '')
@@ -292,6 +306,7 @@ PROJECT_EXTRACTOR_JS = """
           return m ? fmtDo(m[1]) : null;
         })()
       // no budgetDoOnly here — first «до X» is желаемый and steals ceiling
+      || flatCenaBudget
       || null,
     offers_count: offers,
     buyer,
@@ -2834,6 +2849,11 @@ def parse_project_from_html(html: str, project_id: str | None = None) -> dict[st
             re.I,
         )
         max_b = f"до {m.group(1).strip()} ₽" if m else None
+    if not desired and not max_b:
+        flat = _parse_flat_cena_price(root, plain)
+        if flat:
+            desired = flat
+            max_b = flat
     if not desired and max_b:
         desired = max_b
 
@@ -3011,8 +3031,14 @@ def merge_preview_into_full(
         bt = preview.budget_text.strip()
         normalized = bt if "₽" in bt else f"{bt} ₽"
         data["desired_budget"] = normalized
-        # Listing cards usually show the ceiling as «до X ₽»
-        if re.search(r"\bдо\b", normalized, flags=re.IGNORECASE):
+        # Listing cards usually show the ceiling as «до X ₽» or flat «Цена N ₽»
+        if re.search(r"\bдо\b", normalized, flags=re.IGNORECASE) or re.search(
+            r"(?:^|[^а-яёa-z0-9])цена\s+(?!до\b)",
+            normalized,
+            flags=re.IGNORECASE,
+        ):
+            data["max_budget"] = normalized
+        elif re.search(r"\d", normalized):
             data["max_budget"] = normalized
     # Keep explicit page description (preview has no full_description)
     if page_desc:
@@ -3028,6 +3054,39 @@ def _first_group(pattern: str, text: str) -> str | None:
 def _optional_text(pattern: str, text: str) -> str | None:
     value = _first_group(pattern, text)
     return value.strip() if value else None
+
+
+_FLAT_CENA_RE = re.compile(
+    r"(?:^|[^а-яёa-z0-9])цена\s+(?!до\b)([\d\s\u00a0]+)\s*(?:₽|руб\.?)",
+    flags=re.IGNORECASE,
+)
+
+
+def _parse_flat_cena_price(html: str, plain: str | None = None) -> str | None:
+    """Parse flat «Цена 500 ₽» (no «до»); prefer .wants-card__price node text."""
+    node = _first_group(
+        r'class="[^"]*wants-card__price[^"]*"[^>]*>(.*?)</(?:div|span|p)>',
+        html,
+    )
+    if node:
+        node_plain = re.sub(r"<[^>]+>", " ", node)
+        node_plain = re.sub(r"\s+", " ", node_plain).strip()
+        m = _FLAT_CENA_RE.search(node_plain)
+        if m:
+            return f"{m.group(1).strip()} ₽"
+        # Node may be just «Цена 500 ₽» or amount-only inside the class
+        m2 = re.search(
+            r"([\d\s\u00a0]+)\s*(?:₽|руб\.?)",
+            node_plain.replace("\u00a0", " "),
+            flags=re.IGNORECASE,
+        )
+        if m2 and not re.search(r"\bдо\b", node_plain, flags=re.IGNORECASE):
+            return f"{m2.group(1).strip()} ₽"
+    src = plain if plain is not None else re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
+    m = _FLAT_CENA_RE.search(src)
+    if not m:
+        return None
+    return f"{m.group(1).strip()} ₽"
 
 
 def _parse_published(value: str | None) -> datetime | None:

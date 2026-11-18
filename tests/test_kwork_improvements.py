@@ -103,6 +103,37 @@ def test_parse_project_budget_cena_do_colon() -> None:
     assert "1 500" in (data["desired_budget"] or "")
 
 
+def test_parse_project_budget_flat_cena_wants_card_price() -> None:
+    """3270732-like: flat «Цена 500 ₽» in .wants-card__price (no желаемый/до)."""
+    from src.adapters.kwork_pricing import pick_listed_offer_price
+
+    html = """
+    <html><body>
+    <h1>Доработка скрипта</h1>
+    <div class="wants-card__description-text">
+      Нужно поправить скрипт выгрузки и задеплоить на сервер заказчика.
+    </div>
+    <div class="wants-card__price">Цена 500 ₽</div>
+    <div>Предложений: 3</div>
+  </body></html>
+    """
+    data = parse_project_from_html(html, project_id="3270732")
+    assert "500" in (data["desired_budget"] or "")
+    assert "500" in (data["max_budget"] or "")
+    assert "до 1 500" not in (data["desired_budget"] or "")
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_dev_it",
+        project_id="3270732",
+        url="https://kwork.ru/projects/3270732",
+        title=data["title"],
+        full_description=data["full_description"] or "",
+        desired_budget=data["desired_budget"],
+        max_budget=data["max_budget"],
+    )
+    assert pick_listed_offer_price(project) == 500
+
+
 def test_merge_preview_into_full() -> None:
     full = ProjectFull(
         platform="kwork",

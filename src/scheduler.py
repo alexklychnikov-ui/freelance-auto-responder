@@ -123,6 +123,10 @@ async def _daemon_async() -> int:
         inbox_poll_secs.append(max(1, int(settings.kwork_inbox_poll_seconds)))
     if settings.flru_inbox_mirror_enabled:
         inbox_poll_secs.append(max(1, int(settings.flru_inbox_poll_seconds)))
+    if settings.yandex_inbox_mirror_enabled:
+        inbox_poll_secs.append(max(1, int(settings.yandex_inbox_poll_seconds)))
+    if settings.tg_user_watch_enabled:
+        inbox_poll_secs.append(max(1, int(settings.tg_user_watch_poll_seconds)))
     inbox_poll_sec = max(1, min(inbox_poll_secs)) if inbox_poll_secs else 90
 
     def _request_shutdown(*_args: object) -> None:
@@ -153,6 +157,18 @@ async def _daemon_async() -> int:
                     logger.info("flru_inbox_poll %s", flru_stats)
                 except Exception:
                     logger.exception("flru inbox poll failed")
+            if settings.yandex_inbox_mirror_enabled:
+                try:
+                    yandex_stats = await orchestrator.poll_yandex_inbox()
+                    logger.info("yandex_inbox_poll %s", yandex_stats)
+                except Exception:
+                    logger.exception("yandex inbox poll failed")
+            if settings.tg_user_watch_enabled:
+                try:
+                    tg_user_stats = await orchestrator.poll_tg_user_watch()
+                    logger.info("tg_user_watch_poll %s", tg_user_stats)
+                except Exception:
+                    logger.exception("tg user watch poll failed")
             try:
                 await asyncio.wait_for(shutdown.wait(), timeout=inbox_poll_sec)
             except asyncio.TimeoutError:
@@ -172,7 +188,7 @@ async def _daemon_async() -> int:
 
     extra_tasks: list[asyncio.Task[None]] = []
 
-    if settings.kwork_fast_scan_enabled:
+    if settings.any_early_scan_enabled():
         process_worker_task = asyncio.create_task(
             orchestrator.run_process_worker(shutdown)
         )
@@ -180,13 +196,13 @@ async def _daemon_async() -> int:
 
         fast_interval_sec = max(1, int(settings.kwork_fast_scan_seconds))
 
-        async def kwork_fast_loop() -> None:
+        async def early_scan_loop() -> None:
             while not shutdown.is_set():
                 try:
-                    totals = await orchestrator.run_kwork_fast_scan_cycle()
-                    logger.info("kwork_fast_scan %s", totals)
+                    totals = await orchestrator.run_early_scan_cycle()
+                    logger.info("early_scan %s", totals)
                 except Exception:
-                    logger.exception("kwork fast scan cycle failed")
+                    logger.exception("early scan cycle failed")
                 try:
                     await asyncio.wait_for(
                         shutdown.wait(), timeout=fast_interval_sec
@@ -194,7 +210,7 @@ async def _daemon_async() -> int:
                 except asyncio.TimeoutError:
                     pass
 
-        extra_tasks.append(asyncio.create_task(kwork_fast_loop()))
+        extra_tasks.append(asyncio.create_task(early_scan_loop()))
 
     inbox_task = asyncio.create_task(inbox_loop())
     scan_task = asyncio.create_task(scan_loop())

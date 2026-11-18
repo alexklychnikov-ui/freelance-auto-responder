@@ -12,6 +12,7 @@ from typing import Any
 import httpx
 
 from src.adapters.flru_urls import FLRU_ORIGIN, ensure_flru_for_all, flru_project_url
+from src.adapters.flru_inbox import INBOX_URL
 from src.browser.base import BrowserClient
 from src.browser.factory import close_browser_client, get_browser_client
 from src.config import Settings
@@ -20,6 +21,46 @@ from src.models import ProjectFull, ProjectPreview, ReplyEvent, SubmitResult
 logger = logging.getLogger(__name__)
 
 _PROJECT_ID_RE = re.compile(r"^\d{5,9}$")
+
+# Logged-in project HTML: paid modal vs «Для всех» / no-pay badge.
+_PAID_RESPONSE_RE = re.compile(
+    r"купить\s*1\s*отклик|покупать\s+отклики\s+только\s+пакетами|"
+    r"вы\s+можете\s+купить\s+\d+\s+отклик",
+    re.I,
+)
+_FREE_RESPONSE_RE = re.compile(
+    r"не\s+требуется\s+оплат|"
+    r"опци(?:я|и)\s*[«\"]?\s*для\s+всех|"
+    r"проекты?\s*[«\"]?\s*для\s+всех",
+    re.I,
+)
+
+
+def detect_flru_requires_paid_response(html: str) -> bool | None:
+    """True = нужен платный отклик; False = «Для всех»; None = неизвестно."""
+    if not html:
+        return None
+    if _PAID_RESPONSE_RE.search(html):
+        return True
+    if _FREE_RESPONSE_RE.search(html):
+        return False
+    # Soft free marker on auth pages without the buy modal.
+    if re.search(r"для\s+всех", html, flags=re.I) and not re.search(
+        r"купить\s+отклик", html, flags=re.I
+    ):
+        return False
+    return None
+
+
+def flru_paid_response_tg_mark(*, title: str, url: str) -> str:
+    safe_title = (title or "").strip() or "проект"
+    return (
+        "⚠️ FL.ru · нужен платный отклик\n"
+        f"📌 {safe_title}\n"
+        f"🔗 {url}\n"
+        "Заказ без «Для всех» — без оплаты отклика ответить нельзя. "
+        "Пайплайн не гоняю."
+    )
 
 # FL.ru: баннер «Заказчик выбрал исполнителя» ≠ старое «Исполнитель определён»
 _CLOSED_RE = re.compile(
@@ -452,6 +493,7 @@ def parse_project_from_html(html: str, project_id: str | None = None) -> dict[st
     offers = extract_project_offers_count(html)
 
     closed = is_flru_project_page_closed(html)
+    paid = detect_flru_requires_paid_response(html)
 
     return {
         "project_id": pid,
@@ -463,6 +505,7 @@ def parse_project_from_html(html: str, project_id: str | None = None) -> dict[st
         "offers_count": offers,
         "time_left": None,
         "closed": closed,
+        "requires_paid_response": paid,
     }
 
 
@@ -550,7 +593,10 @@ class FlruAdapter:
             logger.info("flru_for_all_filter_applied source=%s", self.source_key)
 
     def _previews_from_cards(
-        self, raw_cards: list[dict[str, Any]] | list[Any] | None
+        self,
+        raw_cards: list[dict[str, Any]] | list[Any] | None,
+        *,
+        requires_paid_response: bool | None = None,
     ) -> list[ProjectPreview]:
         previews: list[ProjectPreview] = []
         for item in raw_cards or []:
@@ -559,6 +605,9 @@ class FlruAdapter:
             pid = str(item.get("project_id") or "").strip()
             if not _PROJECT_ID_RE.fullmatch(pid):
                 continue
+            paid = item.get("requires_paid_response")
+            if paid is None:
+                paid = requires_paid_response
             previews.append(
                 ProjectPreview(
                     platform=self.platform_id,
@@ -569,12 +618,59 @@ class FlruAdapter:
                     budget_text=item.get("budget_text"),
                     published_at=_parse_published(item.get("published_at")),
                     responses_count=item.get("responses_count"),
+                    requires_paid_response=paid
+                    if isinstance(paid, bool) or paid is None
+                    else None,
                 )
             )
         return previews
 
+    def _auth_fetch_html(self, url: str) -> str:
+        """Logged-in fetch via /messages/ (page.goto /projects/* hangs on VPS)."""
+        browser = self._get_browser()
+        cur = self._current_url(browser)
+        if "fl.ru/messages" not in cur.lower():
+            browser.navigate(INBOX_URL)
+            if hasattr(browser, "wait_ms"):
+                browser.wait_ms(1200)
+        self._ensure_logged_in(browser)
+        payload = json.dumps(url)
+        result = browser.evaluate(
+            f"""async () => {{
+              const r = await fetch({payload}, {{
+                credentials: 'include',
+                redirect: 'follow',
+              }});
+              const text = await r.text();
+              return {{ status: r.status, final: String(r.url || ''), text }};
+            }}"""
+        )
+        if not isinstance(result, dict):
+            raise RuntimeError("flru_auth_fetch_bad_payload")
+        final = str(result.get("final") or "")
+        if _is_login_url(final):
+            raise FlruAuthError(
+                "not_logged_in: auth fetch → login — "
+                "запусти deploy/flru_login_interactive.py"
+            )
+        text = result.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise RuntimeError(
+                f"flru_auth_fetch_empty status={result.get('status')}"
+            )
+        return text
+
+    def _scan_via_auth_fetch(self, *, skip_closed: bool) -> list[ProjectPreview]:
+        # Auth + for_all listing excludes paid-response projects.
+        html = self._auth_fetch_html(self._listing_url())
+        raw_cards = parse_listing_from_html(html, skip_closed=skip_closed)
+        free_default = True if bool(self.filters.get("for_all", True)) else None
+        return self._previews_from_cards(
+            raw_cards, requires_paid_response=False if free_default else None
+        )
+
     def _scan_via_http(self, *, skip_closed: bool) -> list[ProjectPreview]:
-        # for_all feed is public; session cookies from this VPS often hang TLS.
+        # Guest for_all=1 does NOT filter paid projects — mark unknown.
         prefer_anon = bool(self.filters.get("for_all", True))
         html = fetch_flru_html_resilient(
             self._listing_url(),
@@ -582,7 +678,7 @@ class FlruAdapter:
             prefer_anonymous=prefer_anon,
         )
         raw_cards = parse_listing_from_html(html, skip_closed=skip_closed)
-        return self._previews_from_cards(raw_cards)
+        return self._previews_from_cards(raw_cards, requires_paid_response=None)
 
     def _scan_via_browser(self, *, skip_closed: bool) -> list[ProjectPreview]:
         browser = self._get_browser()
@@ -597,14 +693,37 @@ class FlruAdapter:
             raw_cards = parse_listing_from_html(
                 snapshot, skip_closed=skip_closed
             )
+        free_default = True if bool(self.filters.get("for_all", True)) else None
         return self._previews_from_cards(
-            raw_cards if isinstance(raw_cards, list) else []
+            raw_cards if isinstance(raw_cards, list) else [],
+            requires_paid_response=False if free_default else None,
         )
 
     def scan_new(self) -> list[ProjectPreview]:
         skip_closed = bool(self.filters.get("skip_closed", True))
-        # Chromium page.goto hangs on /projects/* (stays about:blank);
-        # httpx/curl still get 200 — prefer HTTP for listing.
+        # Prefer auth fetch from /messages/: guest HTTP ignores for_all filter.
+        try:
+            previews = self._scan_via_auth_fetch(skip_closed=skip_closed)
+            if previews:
+                logger.info(
+                    "flru_scan source=%s cards=%d via=auth_fetch",
+                    self.source_key,
+                    len(previews),
+                )
+                return previews
+            logger.warning(
+                "flru_scan_auth_empty source=%s — fallback http",
+                self.source_key,
+            )
+        except FlruAuthError:
+            raise
+        except Exception as auth_exc:
+            logger.warning(
+                "flru_scan_auth_failed source=%s err=%s — fallback http",
+                self.source_key,
+                str(auth_exc)[:200],
+            )
+
         try:
             previews = self._scan_via_http(skip_closed=skip_closed)
             if previews:
@@ -649,6 +768,9 @@ class FlruAdapter:
             )
         title = str(raw.get("title") or "").strip()
         desc = str(raw.get("full_description") or "").strip()
+        paid = raw.get("requires_paid_response")
+        if not isinstance(paid, bool):
+            paid = None
         return ProjectFull(
             platform=self.platform_id,
             source_key=self.source_key,
@@ -661,7 +783,15 @@ class FlruAdapter:
             offers_count=raw.get("offers_count"),
             buyer=raw.get("buyer"),
             time_left=raw.get("time_left"),
+            requires_paid_response=paid,
         )
+
+    def _read_full_via_auth_fetch(self, pid: str, url: str) -> ProjectFull:
+        html = self._auth_fetch_html(url)
+        raw = parse_project_from_html(html, project_id=pid)
+        if raw.get("requires_paid_response") is None:
+            raw["requires_paid_response"] = detect_flru_requires_paid_response(html)
+        return self._project_full_from_raw(pid, url, raw)
 
     def _read_full_via_http(self, pid: str, url: str) -> ProjectFull:
         html = fetch_flru_html_resilient(
@@ -676,9 +806,36 @@ class FlruAdapter:
         pid = str(project_id).strip()
         url = flru_project_url(pid)
         try:
+            full = self._read_full_via_auth_fetch(pid, url)
+            if str(full.title or "").strip() and str(full.full_description or "").strip():
+                logger.info(
+                    "flru_read project_id=%s via=auth_fetch paid=%s",
+                    pid,
+                    full.requires_paid_response,
+                )
+                return full
+            logger.warning(
+                "flru_read_auth_thin project_id=%s — fallback http", pid
+            )
+        except FlruProjectClosed:
+            raise
+        except FlruAuthError:
+            raise
+        except Exception as auth_exc:
+            logger.warning(
+                "flru_read_auth_failed project_id=%s err=%s — fallback http",
+                pid,
+                str(auth_exc)[:200],
+            )
+
+        try:
             full = self._read_full_via_http(pid, url)
             if str(full.title or "").strip() and str(full.full_description or "").strip():
-                logger.info("flru_read project_id=%s via=http", pid)
+                logger.info(
+                    "flru_read project_id=%s via=http paid=%s",
+                    pid,
+                    full.requires_paid_response,
+                )
                 return full
             logger.warning(
                 "flru_read_http_thin project_id=%s — fallback browser", pid
@@ -696,15 +853,20 @@ class FlruAdapter:
 
         browser = self._get_browser()
         try:
-            browser.navigate(url)
-            if hasattr(browser, "wait_ms"):
-                browser.wait_ms(2000)
-            self._ensure_logged_in(browser)
-            raw = browser.evaluate(PROJECT_EXTRACTOR_JS)
-            if not isinstance(raw, dict) or not str(raw.get("title") or "").strip():
-                snapshot = browser.snapshot()
-                raw = parse_project_from_html(snapshot, project_id=pid)
-            self._ensure_logged_in(browser)
+            # Avoid hung goto /projects/* — reuse auth fetch when possible.
+            try:
+                html = self._auth_fetch_html(url)
+                raw = parse_project_from_html(html, project_id=pid)
+            except Exception:
+                browser.navigate(url)
+                if hasattr(browser, "wait_ms"):
+                    browser.wait_ms(2000)
+                self._ensure_logged_in(browser)
+                raw = browser.evaluate(PROJECT_EXTRACTOR_JS)
+                if not isinstance(raw, dict) or not str(raw.get("title") or "").strip():
+                    snapshot = browser.snapshot()
+                    raw = parse_project_from_html(snapshot, project_id=pid)
+                self._ensure_logged_in(browser)
         except FlruAuthError:
             raise
         except Exception as exc:
@@ -713,7 +875,17 @@ class FlruAdapter:
 
         if not isinstance(raw, dict):
             raise RuntimeError("flru_read_failed: empty project payload")
-        logger.info("flru_read project_id=%s via=browser", pid)
+        if raw.get("requires_paid_response") is None and isinstance(
+            raw.get("_html"), str
+        ):
+            raw["requires_paid_response"] = detect_flru_requires_paid_response(
+                str(raw.get("_html"))
+            )
+        logger.info(
+            "flru_read project_id=%s via=browser paid=%s",
+            pid,
+            raw.get("requires_paid_response"),
+        )
         return self._project_full_from_raw(pid, url, raw)
 
     def submit_response(

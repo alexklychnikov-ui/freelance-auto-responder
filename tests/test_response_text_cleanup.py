@@ -92,10 +92,9 @@ def test_strip_hallucinated_irina_when_no_buyer() -> None:
     out = finalize_response_text(text, project)
     assert out.lstrip().startswith("Здравствуйте!")
     assert "ирина" not in out.lower().split("здравствуйте", 1)[0]
-    assert "\n\n" not in out
-    assert "\n" in out
+    assert "\n\n" in out
     assert out.startswith("    ")
-    assert all(line.startswith("    ") for line in out.split("\n") if line)
+    assert all(line.startswith("    ") for line in out.split("\n") if line.strip())
     assert "hh.ru" in out
 
 
@@ -131,15 +130,35 @@ def test_reject_self_account_dump_as_buyer() -> None:
     )
     out = finalize_response_text(text, project)
     assert out.lstrip().startswith("Здравствуйте!")
-    assert "\n\n" not in out
+    assert "\n\n" in out
     assert out.startswith("    Здравствуйте!")
-    assert all(line.startswith("    ") for line in out.split("\n") if line)
+    assert all(line.startswith("    ") for line in out.split("\n") if line.strip())
 
 
 def test_ensure_hello_greeting_idempotent() -> None:
-    assert ensure_hello_greeting("Сделаю бота.") == "Здравствуйте! Сделаю бота."
-    assert ensure_hello_greeting("Здравствуйте! Уже есть.") == "Здравствуйте! Уже есть."
-    assert ensure_hello_greeting("Ирина, здравствуйте! Текст.") == "Здравствуйте! Текст."
+    assert ensure_hello_greeting("Сделаю бота.") == "Здравствуйте!\nСделаю бота."
+    assert ensure_hello_greeting("Здравствуйте! Уже есть.") == "Здравствуйте!\nУже есть."
+    assert ensure_hello_greeting("Ирина, здравствуйте! Текст.") == "Здравствуйте!\nТекст."
+
+
+def test_finalize_breaks_wall_into_blank_line_paragraphs() -> None:
+    """Any Kwork response wall must get greeting / essence / details / CTA blocks."""
+    project = _project("парсер API").model_copy(update={"project_id": "3270732"})
+    wall = (
+        "Здравствуйте! Сделаю парсер под вашу выгрузку и свяжу с API. "
+        "Разложу на этапы: сбор, нормализация и отчёт в нужном формате. "
+        "Стоимость — 5 000 ₽. Срок — 7 дней. "
+        "Если подход ок — напишите, согласуем старт."
+    )
+    out = finalize_response_text(wall, project)
+    paras = [p for p in out.split("\n\n") if p.strip()]
+    assert len(paras) >= 3
+    assert paras[0].strip().startswith("Здравствуйте!")
+    assert all(p.startswith("    ") for p in paras)
+    assert "Стоимость" in out
+    # Blank lines between blocks — not a single wall.
+    assert "\n\n" in out
+    assert out.count("\n\n") >= 2
 
 
 def test_diversify_mini_proof_stock_opener() -> None:
@@ -165,3 +184,26 @@ def test_finalize_replaces_stock_mini_proof() -> None:
     out = finalize_response_text(text, project)
     assert "demo/кейс в чате Kwork" not in out
     assert "Здравствуйте!" in out
+
+
+def test_finalize_clamps_yandex_to_1000_chars() -> None:
+    from src.analyzer.response_text import clamp_yandex_response_length
+
+    long = "А" * 1200
+    assert len(clamp_yandex_response_length(long)) <= 1000
+
+    project = ProjectFull(
+        platform="yandex_uslugi",
+        source_key="yandex_manual",
+        project_id="6b4fe021-6dbf-4e3e-ade5-57e645f681b7",
+        url="https://uslugi.yandex.ru/order/6b4fe021-6dbf-4e3e-ade5-57e645f681b7",
+        title="Создать панель управления",
+        full_description="панель",
+    )
+    para = (
+        "Здравствуйте! Сделаю панель управления с навигацией и экранами. "
+        * 40
+    )
+    out = finalize_response_text(para, project)
+    assert len(out) <= 1000
+    assert "Здравствуйте" in out

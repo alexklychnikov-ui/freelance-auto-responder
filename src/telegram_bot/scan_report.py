@@ -41,41 +41,54 @@ def _platform_sort_key(platform: str) -> tuple[int, str]:
 
 
 def _format_stats_compact(stats: ScanCycleStats) -> str:
+    if stats.errors:
+        err = (stats.error or "ошибка скана").strip()
+        if len(err) > 120:
+            err = err[:117] + "…"
+        return f"❌ DOWN · {html.escape(err)}"
     return (
-        f"проверено {stats.checked} "
-        f"(лента {stats.seen}) · "
+        f"лента {stats.seen} · "
+        f"в TG {stats.notified} · "
         f"не стек {stats.rejected_stack} · "
-        f"не бюджет {stats.rejected_budget} · "
-        f"в TG {stats.notified}"
+        f"не бюджет {stats.rejected_budget}"
     )
 
 
 def _format_legacy_lines(report: ScanReport) -> list[str]:
     lines = [
-        f"Проверено: {report.checked} "
-        f"(в ленте {report.seen}) · "
-        f"не стек: {report.rejected_stack} · "
-        f"не бюджет: {report.rejected_budget}"
+        f"Лента: {report.seen} · в TG: {report.notified} · "
+        f"не стек: {report.rejected_stack} · не бюджет: {report.rejected_budget}"
     ]
-    if report.notified:
-        lines.append(f"В TG: {report.notified}")
     return lines
 
 
 def _format_by_platform_lines(report: ScanReport) -> list[str]:
     lines: list[str] = []
+    down: list[str] = []
     for plat in sorted(report.by_platform.keys(), key=_platform_sort_key):
         stats = report.by_platform[plat]
         label = PLATFORM_LABELS.get(plat, plat)
-        lines.append(f"• {html.escape(label)} — {_format_stats_compact(stats)}")
-    totals = ScanCycleStats(
+        line = f"• {html.escape(label)} — {_format_stats_compact(stats)}"
+        lines.append(line)
+        if stats.errors:
+            down.append(label)
+    if down:
+        lines.insert(
+            0,
+            "🚨 Отвал: " + ", ".join(html.escape(x) for x in down),
+        )
+    ok_totals = ScanCycleStats(
         seen=report.seen,
         checked=report.checked,
         rejected_stack=report.rejected_stack,
         rejected_budget=report.rejected_budget,
         notified=report.notified,
+        errors=sum(s.errors for s in report.by_platform.values()),
     )
-    lines.append(f"Итого: {_format_stats_compact(totals)}")
+    if ok_totals.errors == 0:
+        lines.append(
+            f"Итого: лента {ok_totals.seen} · в TG {ok_totals.notified}"
+        )
     return lines
 
 
@@ -96,6 +109,10 @@ def format_scan_reports_message(
         f"Часовой пояс: <code>{html.escape(timezone_name)}</code>",
         "",
     ]
+    latest = reports[0]
+    if latest.by_platform and any(s.errors for s in latest.by_platform.values()):
+        lines.append("⚠️ В последнем цикле есть площадки в DOWN — см. ниже.")
+        lines.append("")
     for idx, report in enumerate(reports[:limit], start=1):
         when = format_scan_time(report.scanned_at, timezone_name)
         lines.append(f"<b>{idx}.</b> {when}")

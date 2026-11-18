@@ -24,10 +24,14 @@ def settings(tmp_path: Path) -> Settings:
         database_path=str(tmp_path / "test.db"),
         kwork_fast_scan_enabled=True,
         kwork_fast_scan_seconds=90,
+        yandex_early_scan_enabled=True,
+        flru_early_scan_enabled=True,
         process_concurrency=1,
         early_ping_seen_db=str(tmp_path / "early_ping_seen.db"),
+        early_listings_dir=str(tmp_path / "early"),
         kwork_inbox_mirror_enabled=False,
         flru_inbox_mirror_enabled=False,
+        yandex_inbox_mirror_enabled=False,
         scan_bootstrap_skip_pipeline=False,
         _env_file=None,
     )
@@ -37,7 +41,43 @@ def test_settings_kwork_fast_defaults(env_vars: None) -> None:
     s = get_settings()
     assert s.kwork_fast_scan_enabled is True
     assert s.kwork_fast_scan_seconds == 90
+    assert s.yandex_early_scan_enabled is True
+    assert s.flru_early_scan_enabled is True
     assert s.process_concurrency == 1
+    assert s.early_scan_enabled_for("kwork") is True
+    assert s.early_scan_enabled_for("yandex_uslugi") is True
+    assert s.early_scan_enabled_for("flru") is True
+    assert s.early_scan_enabled_for("telegram") is False
+    assert s.any_early_scan_enabled() is True
+
+
+def test_settings_early_scan_helpers_respect_flags() -> None:
+    s = Settings(
+        openai_api_key="k",
+        telegram_bot_token="t",
+        telegram_chat_id="1",
+        response_journal="j.xlsx",
+        kwork_fast_scan_enabled=False,
+        yandex_early_scan_enabled=True,
+        flru_early_scan_enabled=False,
+        _env_file=None,
+    )
+    assert s.early_scan_enabled_for("kwork") is False
+    assert s.early_scan_enabled_for("yandex_uslugi") is True
+    assert s.early_scan_enabled_for("flru") is False
+    assert s.any_early_scan_enabled() is True
+
+    s2 = Settings(
+        openai_api_key="k",
+        telegram_bot_token="t",
+        telegram_chat_id="1",
+        response_journal="j.xlsx",
+        kwork_fast_scan_enabled=False,
+        yandex_early_scan_enabled=False,
+        flru_early_scan_enabled=False,
+        _env_file=None,
+    )
+    assert s2.any_early_scan_enabled() is False
 
 
 @pytest.fixture
@@ -230,9 +270,11 @@ def test_enqueue_process_dedupes(settings: Settings) -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_scan_cycle_skips_kwork_when_fast_enabled(
+async def test_run_scan_cycle_skips_early_enabled_platforms(
     settings: Settings,
 ) -> None:
+    settings.yandex_early_scan_enabled = False
+    settings.flru_early_scan_enabled = False
     orch = _minimal_orchestrator(settings)
     kwork_preview = ProjectPreview(
         platform="kwork",
@@ -257,26 +299,24 @@ async def test_run_scan_cycle_skips_kwork_when_fast_enabled(
     orch._scan_listings = MagicMock(side_effect=scan_side_effect)  # type: ignore[method-assign]
     orch._process_new_project = AsyncMock(return_value="skipped")  # type: ignore[method-assign]
 
-    kwork_sources = [
+    sources = [
         MagicMock(
             id="kwork_dev_it",
             platform="kwork",
             enabled=True,
             bootstrap=False,
-        )
-    ]
-    yandex_sources = [
+        ),
         MagicMock(
             id="yandex_uslugi_it",
             platform="yandex_uslugi",
             enabled=True,
             bootstrap=False,
-        )
+        ),
     ]
 
     with patch(
         "src.pipeline.orchestrator.get_enabled_sources",
-        side_effect=[kwork_sources + yandex_sources],
+        return_value=sources,
     ):
         totals = await orch.run_scan_cycle()
 
@@ -284,3 +324,91 @@ async def test_run_scan_cycle_skips_kwork_when_fast_enabled(
     assert "kwork" not in scan_calls
     assert "yandex_uslugi" in scan_calls
     assert totals["seen"] == 1
+
+
+@pytest.mark.asyncio
+async def test_run_scan_cycle_skips_yandex_and_flru_when_early_enabled(
+    settings: Settings,
+) -> None:
+    orch = _minimal_orchestrator(settings)
+    orch._scan_listings = MagicMock(return_value=[])  # type: ignore[method-assign]
+    orch._process_new_project = AsyncMock(return_value="skipped")  # type: ignore[method-assign]
+
+    sources = [
+        MagicMock(id="kwork_dev_it", platform="kwork", enabled=True, bootstrap=False),
+        MagicMock(
+            id="yandex_uslugi_it",
+            platform="yandex_uslugi",
+            enabled=True,
+            bootstrap=False,
+        ),
+        MagicMock(id="flru_orders", platform="flru", enabled=True, bootstrap=False),
+    ]
+
+    with patch(
+        "src.pipeline.orchestrator.get_enabled_sources",
+        return_value=sources,
+    ):
+        await orch.run_scan_cycle()
+
+    assert orch._scan_listings.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_run_early_scan_cycle_covers_yandex(
+    settings: Settings,
+) -> None:
+    settings.kwork_fast_scan_enabled = False
+    settings.flru_early_scan_enabled = False
+    orch = _minimal_orchestrator(settings)
+    orch.review_service.tg_bot.notify_early_listing = AsyncMock(return_value=99)
+
+    preview = ProjectPreview(
+        platform="yandex_uslugi",
+        source_key="yandex_uslugi_it",
+        project_id="uuid-abc",
+        url="https://yandex.ru/uslugi/order/uuid-abc",
+        title="Ya job",
+    )
+    orch._scan_listings = MagicMock(return_value=[preview])  # type: ignore[method-assign]
+
+    sources = [
+        MagicMock(
+            id="yandex_uslugi_it",
+            platform="yandex_uslugi",
+            enabled=True,
+            bootstrap=False,
+        ),
+        MagicMock(id="kwork_dev_it", platform="kwork", enabled=True, bootstrap=False),
+    ]
+
+    with patch(
+        "src.pipeline.orchestrator.get_enabled_sources",
+        return_value=sources,
+    ), patch(
+        "src.pipeline.orchestrator.is_kwork_paused",
+        return_value=False,
+    ):
+        totals = await orch.run_early_scan_cycle()
+
+    assert totals["pinged"] == 1
+    assert totals["new"] == 1
+    orch.review_service.tg_bot.notify_early_listing.assert_awaited_once()
+    call_kw = orch.review_service.tg_bot.notify_early_listing.await_args.kwargs
+    assert call_kw["platform"] == "yandex_uslugi"
+    assert call_kw["project_id"] == "uuid-abc"
+    # non-digit id → last preview id string
+    state = orch.repository.get_scan_state("yandex_uslugi_it")
+    assert state is not None
+    assert state.last_known_project_id == "uuid-abc"
+
+
+@pytest.mark.asyncio
+async def test_run_kwork_fast_scan_cycle_alias(
+    settings: Settings,
+) -> None:
+    orch = _minimal_orchestrator(settings)
+    orch.run_early_scan_cycle = AsyncMock(return_value={"seen": 1})  # type: ignore[method-assign]
+    out = await orch.run_kwork_fast_scan_cycle()
+    assert out == {"seen": 1}
+    orch.run_early_scan_cycle.assert_awaited_once()

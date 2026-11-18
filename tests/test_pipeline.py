@@ -36,6 +36,8 @@ def settings(tmp_path: Path) -> Settings:
         kwork_inbox_seen_db=str(tmp_path / "kwork_inbox_seen.db"),
         flru_inbox_mirror_enabled=False,
         flru_inbox_seen_db=str(tmp_path / "flru_inbox_seen.db"),
+        yandex_inbox_mirror_enabled=False,
+        yandex_inbox_seen_db=str(tmp_path / "yandex_inbox_seen.db"),
         _env_file=None,
     )
 

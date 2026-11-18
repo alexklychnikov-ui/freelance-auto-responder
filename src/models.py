@@ -18,6 +18,7 @@ class ProjectPreview(BaseModel):
     budget_text: str | None = None
     published_at: datetime | None = None
     responses_count: int | None = None
+    requires_paid_response: bool | None = None
 
 
 class ProjectFull(BaseModel):
@@ -34,6 +35,7 @@ class ProjectFull(BaseModel):
     buyer_hire_rate: str | None = None
     time_left: str | None = None
     tags: list[str] = Field(default_factory=list)
+    requires_paid_response: bool | None = None
 
 
 class GptScoreResult(BaseModel):
