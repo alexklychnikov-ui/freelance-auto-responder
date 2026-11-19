@@ -72,6 +72,33 @@ def build_ipv4_host_resolver_rules(hosts: tuple[str, ...] = _YANDEX_IPV4_HOSTS) 
     return ",".join(parts)
 
 
+def strip_ddos_guard_cookies(state: dict[str, Any]) -> dict[str, Any]:
+    """Drop DDoS-Guard ``__ddg*`` cookies so Chromium can mint fresh ones.
+
+    Stale ``__ddg*`` (often short-lived) poison fl.ru fetches: page.evaluate
+    ``fetch`` throws ``TypeError: Failed to fetch`` and httpx hangs with
+    auth cookies. Session cookies (id/pwd/PHPSESSID) are kept.
+    """
+    cookies = state.get("cookies")
+    if not isinstance(cookies, list):
+        return state
+    kept: list[Any] = []
+    dropped = 0
+    for c in cookies:
+        if isinstance(c, dict):
+            name = str(c.get("name") or "")
+            if name.startswith("__ddg"):
+                dropped += 1
+                continue
+        kept.append(c)
+    if dropped:
+        logger.info("storage_state_stripped_ddg count=%d", dropped)
+        out = dict(state)
+        out["cookies"] = kept
+        return out
+    return state
+
+
 def load_storage_state(path: Path) -> dict[str, Any] | None:
     """Load Playwright storage_state; repair trailing garbage from torn writes."""
     if not path.exists():
@@ -100,7 +127,7 @@ def load_storage_state(path: Path) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         logger.error("storage_state_not_object path=%s", path)
         return None
-    return data
+    return strip_ddos_guard_cookies(data)
 
 
 def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
@@ -119,11 +146,13 @@ class PlaywrightBrowserAdapter:
         *,
         headless: bool = True,
         storage_state_path: str | None = None,
+        proxy_url: str | None = None,
         navigate_timeout_ms: int = 60000,
         navigate_retries: int = 3,
     ) -> None:
         self._headless = headless
         self._storage_state_path = storage_state_path
+        self._proxy_url = (proxy_url or "").strip() or None
         self._navigate_timeout_ms = navigate_timeout_ms
         self._navigate_retries = max(1, int(navigate_retries))
         self._playwright: Any = None
@@ -133,6 +162,8 @@ class PlaywrightBrowserAdapter:
 
     def _launch_args(self) -> list[str]:
         args = ["--disable-ipv6"]
+        if self._proxy_url:
+            return args
         rules = build_ipv4_host_resolver_rules()
         if rules:
             args.append(f"--host-resolver-rules={rules}")
@@ -145,9 +176,14 @@ class PlaywrightBrowserAdapter:
         from playwright.sync_api import sync_playwright
 
         self._playwright = sync_playwright().start()
+        launch_kwargs: dict[str, Any] = {
+            "headless": self._headless,
+            "args": self._launch_args(),
+        }
+        if self._proxy_url:
+            launch_kwargs["proxy"] = {"server": self._proxy_url}
         self._browser = self._playwright.chromium.launch(
-            headless=self._headless,
-            args=self._launch_args(),
+            **launch_kwargs,
         )
         context_kwargs: dict[str, Any] = {}
         if self._storage_state_path:
@@ -243,6 +279,26 @@ class PlaywrightBrowserAdapter:
 
     def evaluate(self, js: str) -> Any:
         return self._ensure_page().evaluate(js)
+
+    def request_get(self, url: str, *, timeout_ms: int = 25000) -> str:
+        self._ensure_page()
+        response = self._context.request.get(
+            url,
+            timeout=timeout_ms,
+            fail_on_status_code=False,
+        )
+        if not response.ok:
+            raise RuntimeError(
+                f"playwright_request_get_http_error status={response.status} "
+                f"url={response.url}"
+            )
+        text = response.text()
+        if not text.strip():
+            raise RuntimeError(
+                f"playwright_request_get_empty status={response.status} "
+                f"url={response.url}"
+            )
+        return text
 
     def screenshot(self) -> bytes:
         return self._ensure_page().screenshot(full_page=True)

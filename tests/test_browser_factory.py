@@ -62,9 +62,14 @@ def test_factory_playwright_custom_storage(tmp_path) -> None:
         kwork_storage_state=str(tmp_path / "kwork_storage.json"),
         _env_file=None,
     )
-    client = get_browser_client(settings, storage_state_path=str(state))
+    client = get_browser_client(
+        settings,
+        storage_state_path=str(state),
+        proxy_url="socks5://127.0.0.1:1080",
+    )
     assert isinstance(client, PlaywrightBrowserAdapter)
     assert client._storage_state_path == str(state)
+    assert client._proxy_url == "socks5://127.0.0.1:1080"
 
 
 def test_browser_client_protocol() -> None:

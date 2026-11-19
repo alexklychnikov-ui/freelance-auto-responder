@@ -228,7 +228,17 @@ def test_checklist_rule_передач_before_входит() -> None:
 
 
 def test_site_recon_task_excludes_collect_applications() -> None:
-    assert is_parsing_task("Бот должен собирать заявки от клиентов")
+    assert not is_parsing_task("Бот должен собирать заявки от клиентов")
     assert not is_site_recon_task("Бот должен собирать заявки от клиентов")
     assert is_site_recon_task("Нужно спарсить контент с сайта")
     assert is_site_recon_task("Собрать данные каталога товаров в CSV")
+    assert is_parsing_task("Нужно спарсить контент с сайта")
+    assert is_parsing_task("Собрать данные каталога товаров в CSV")
+
+
+def test_collect_feedback_is_not_parsing() -> None:
+    assert not is_parsing_task("бот должен собирать обратную связь от сотрудников")
+    assert not is_parsing_task(
+        "ИИ-специалист будет собирать в течение периода обратную связь "
+        "от сотрудников (вопросы, предложения)"
+    )

@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+from deploy.kwork_listing_coach import COACH, buyer_copy_problems as coach_buyer_copy_problems
+from deploy.kwork_listing_contentforge import FORGE, buyer_copy_problems as forge_buyer_copy_problems
 from deploy.kwork_listing_fullcrm import CRM, buyer_copy_problems
 from deploy.kwork_listing_landing import LANDING
+from deploy.kwork_listing_news_scraper import NEWS, buyer_copy_problems as news_buyer_copy_problems
 from deploy.kwork_listing_price_monitor import PRICE
 from deploy.kwork_listing_skel import NEW, assemble, validate
 
@@ -13,6 +16,34 @@ def test_fullcrm_assemble_validate_ok() -> None:
     assert built["github_url"] == "https://github.com/alexklychnikov-ui/FullCRM"
     assert validate(built) == []
     assert buyer_copy_problems(built) == []
+
+
+def test_coach_assemble_validate_ok() -> None:
+    built = assemble(COACH)
+    assert built["github_url"] == "https://github.com/alexklychnikov-ui/PersonalAICoach"
+    assert built["price_buyer"] == 1000
+    assert validate(built) == []
+    assert coach_buyer_copy_problems(built) == []
+
+
+def test_contentforge_assemble_validate_ok() -> None:
+    built = assemble(FORGE)
+    assert built["github_url"] == "https://github.com/alexklychnikov-ui/ContentForge"
+    assert built["price_buyer"] == 1000
+    assert len(built["extras"]) == 6
+    assert len(built["faqs"]) == 7
+    assert validate(built) == []
+    assert forge_buyer_copy_problems(built) == []
+
+
+def test_news_scraper_assemble_validate_ok() -> None:
+    built = assemble(NEWS)
+    assert built["github_url"] == "https://github.com/alexklychnikov-ui/WebScraperForNews"
+    assert built["price_buyer"] == 1000
+    assert len(built["extras"]) == 6
+    assert len(built["faqs"]) == 7
+    assert validate(built) == []
+    assert news_buyer_copy_problems(built) == []
 
 
 def test_landing_assemble_validate_ok() -> None:
@@ -42,6 +73,17 @@ def test_landing_price_buyer_5000_fails_github_case() -> None:
     assert any("github case" in item and "price_buyer" in item for item in problems)
 
 
+def test_github_case_allows_buyer_1000() -> None:
+    built = assemble(COACH)
+    assert built["price_buyer"] == 1000
+    assert validate(built) == []
+    src = deepcopy(LANDING)
+    src["github_url"] = "https://github.com/alexklychnikov-ui/PersonalAICoach"
+    src["price_buyer"] = 1000
+    src["extras"] = [{**extra, "price": 1200} for extra in src["extras"][:5]]
+    assert validate(assemble(src)) == []
+
+
 def test_landing_extras_slice_fails_github_case() -> None:
     src = deepcopy(LANDING)
     src["extras"] = src["extras"][:2]
@@ -58,8 +100,16 @@ def test_extra_price_500_fails_github_case() -> None:
 
 def test_five_extras_all_800_sum_4000_ok() -> None:
     src = deepcopy(LANDING)
+    assert src["price_buyer"] == 500
     src["extras"] = [{**extra, "price": 800} for extra in src["extras"][:5]]
     assert validate(assemble(src)) == []
+
+
+def test_coach_five_extras_all_800_fails() -> None:
+    src = deepcopy(COACH)
+    src["extras"] = [{**extra, "price": 800} for extra in src["extras"][:5]]
+    problems = validate(assemble(src))
+    assert any("github case" in item and "extra" in item and "price" in item for item in problems)
 
 
 def test_github_url_without_github_com_does_not_trigger() -> None:

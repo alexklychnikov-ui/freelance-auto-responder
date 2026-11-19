@@ -12,6 +12,7 @@ def get_browser_client(
     settings: Settings,
     *,
     storage_state_path: str | None = None,
+    proxy_url: str | None = None,
 ) -> BrowserClient:
     adapter = settings.browser_adapter.lower().strip()
     server_path = resolve_server_path(settings.browsermcp_server)
@@ -21,7 +22,11 @@ def get_browser_client(
             storage = (storage_state_path or "").strip() or None
         else:
             storage = (settings.kwork_storage_state or "").strip() or None
-        return PlaywrightBrowserAdapter(storage_state_path=storage)
+        proxy = (proxy_url or "").strip() or None
+        return PlaywrightBrowserAdapter(
+            storage_state_path=storage,
+            proxy_url=proxy,
+        )
     if adapter == "external":
         return ExternalBrowserMcpAdapter(
             server_path=server_path,

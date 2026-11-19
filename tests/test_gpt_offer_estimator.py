@@ -61,3 +61,35 @@ def test_offer_estimator_fallback(tmp_path) -> None:
     # competitive 0.8 → 6400 is lifted back to the желаемый floor by the clamp
     assert terms.price_rub == 8000
     assert terms.delivery_days == 5
+
+
+def test_offer_estimator_no_budget_keeps_unknown_zero(tmp_path) -> None:
+    settings = Settings(
+        openai_api_key="x",
+        telegram_bot_token="t",
+        telegram_chat_id="1",
+        response_journal=str(tmp_path / "journal.xlsx"),
+        default_offer_days=14,
+        offer_price_competitive_factor=0.8,
+        _env_file=None,
+    )
+    project = ProjectFull(
+        platform="yandex_uslugi",
+        source_key="yandex_orders",
+        project_id="f559a5fb",
+        url="https://uslugi.yandex.ru/order/f559a5fb",
+        title="Интеграция",
+        full_description="Настроить интеграцию по ТЗ",
+        desired_budget=None,
+        max_budget=None,
+    )
+    estimator = GptOfferEstimator(settings, http_client=MagicMock())
+
+    unknown = estimator.fallback(project, "Сделаю интеграцию за 5 дней.")
+    assert unknown.price_rub == 0
+
+    explicit = estimator.fallback(
+        project,
+        "Стоимость первой версии — 95 000 ₽. Срок — 14 дней.",
+    )
+    assert explicit.price_rub == 76_000

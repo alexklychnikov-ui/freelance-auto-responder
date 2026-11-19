@@ -118,9 +118,8 @@ def suggest_delivery_days_for_scope(
 ) -> int:
     """Volume/type-calibrated Kwork delivery days (always a snapped int)."""
     text = f"{project.title or ''}\n{project.full_description or ''}"
-    parsing = is_parsing_task(text)
     vol = int(volume or 0)
-    if parsing or vol > 0:
+    if vol > 0:
         images = project_wants_images(project)
         if vol >= LARGE_CATALOG_ITEMS:
             raw = 5 if images else 4

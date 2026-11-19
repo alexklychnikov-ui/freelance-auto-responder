@@ -8,7 +8,6 @@ from pydantic import BaseModel, Field
 from src.evidence.models import EvidenceBundle
 
 
-
 class ProjectPreview(BaseModel):
     platform: str
     source_key: str
@@ -50,7 +49,7 @@ class GptScoreResult(BaseModel):
 
 
 class OfferTerms(BaseModel):
-    price_rub: int = Field(ge=500)
+    price_rub: int = Field(ge=0)
     delivery_days: int = Field(ge=1, le=60)
     plan_summary: str = ""
 
@@ -88,4 +87,3 @@ class PendingOffer(BaseModel):
     draft_message_id: int | None = None
     evidence: EvidenceBundle | None = None
     budget_ceiling_warning: str | None = None
-

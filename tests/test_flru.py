@@ -4,8 +4,11 @@ import re
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 from src.adapters.flru import (
     FlruAdapter,
+    FlruAuthError,
     _clean_submitted_description,
     cookie_header_from_storage,
     detect_flru_requires_paid_response,
@@ -161,6 +164,7 @@ def test_cookie_header_from_storage(tmp_path) -> None:
     path = tmp_path / "flru_storage.json"
     path.write_text(
         '{"cookies":[{"name":"sid","value":"1","domain":".fl.ru"},'
+        '{"name":"__ddg8_","value":"stale","domain":".fl.ru"},'
         '{"name":"ya","value":"2","domain":".yandex.ru"}],"origins":[]}',
         encoding="utf-8",
     )
@@ -168,20 +172,100 @@ def test_cookie_header_from_storage(tmp_path) -> None:
     assert cookie_header_from_storage(None) == ""
 
 
-def test_scan_new_prefers_http(monkeypatch) -> None:
-    html = (FIXTURES / "flru_listing.html").read_text(encoding="utf-8")
-    monkeypatch.setattr(
-        "src.adapters.flru.fetch_flru_html", lambda *a, **k: html
-    )
+def test_auth_fetch_skips_request_get_uses_page() -> None:
     browser = MagicMock()
+    browser.request_get.side_effect = TimeoutError(
+        "APIRequestContext.get: Timeout 25000ms exceeded"
+    )
     adapter = _make_adapter(browser=browser)
+    page_fetch = MagicMock(return_value="<html>page</html>")
+    adapter._page_auth_fetch_html = page_fetch
+
+    html = adapter._auth_fetch_html("https://www.fl.ru/projects/?for_all=1")
+
+    assert html == "<html>page</html>"
+    page_fetch.assert_called_once_with("https://www.fl.ru/projects/?for_all=1")
+    browser.request_get.assert_not_called()
+
+
+def test_auth_fetch_error_is_single_line() -> None:
+    adapter = _make_adapter()
+    adapter._page_auth_fetch_html = MagicMock(
+        side_effect=RuntimeError(
+            "Timeout 25000ms exceeded\nCall log:\n  - navigating to url"
+        )
+    )
+
+    with pytest.raises(RuntimeError) as ei:
+        adapter._auth_fetch_html("https://www.fl.ru/projects/?for_all=1")
+
+    msg = str(ei.value)
+    assert "flru_auth_fetch_failed:" in msg
+    assert "\n" not in msg
+    assert "Call log" not in msg
+
+
+def test_flru_browser_uses_flru_proxy_then_tg_fallback(monkeypatch) -> None:
+    adapter = _make_adapter(browser=None)
+    adapter.settings.flru_proxy = ""
+    adapter.settings.tg_user_proxy = "socks5://127.0.0.1:1080"
+    factory = MagicMock(return_value=MagicMock())
+    monkeypatch.setattr("src.adapters.flru.get_browser_client", factory)
+
+    adapter._get_browser()
+
+    factory.assert_called_once_with(
+        adapter.settings,
+        storage_state_path="data/flru_storage.json",
+        proxy_url="socks5://127.0.0.1:1080",
+    )
+
+
+def test_scan_new_allows_guest_fallback_by_default(monkeypatch) -> None:
+    adapter = _make_adapter()
     monkeypatch.setattr(
         adapter,
         "_auth_fetch_html",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("auth down")),
     )
+    guest_cards = [MagicMock(project_id=PID)]
+    http_scan = MagicMock(return_value=guest_cards)
+    monkeypatch.setattr(adapter, "_scan_via_http", http_scan)
+
     cards = adapter.scan_new()
-    assert any(c.project_id == PID for c in cards)
+
+    assert cards is guest_cards
+    http_scan.assert_called_once_with(skip_closed=True)
+
+
+def test_scan_new_rejects_guest_fallback_on_auth_failure(monkeypatch) -> None:
+    adapter = _make_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_auth_fetch_html",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("Failed to fetch")),
+    )
+    http_scan = MagicMock()
+    monkeypatch.setattr(adapter, "_scan_via_http", http_scan)
+
+    with pytest.raises(
+        FlruAuthError, match="flru_auth_fetch_failed: Failed to fetch"
+    ):
+        adapter.scan_new(allow_guest_fallback=False)
+
+    http_scan.assert_not_called()
+
+
+def test_scan_new_rejects_guest_fallback_on_empty_auth_scan(monkeypatch) -> None:
+    adapter = _make_adapter()
+    monkeypatch.setattr(adapter, "_scan_via_auth_fetch", MagicMock(return_value=[]))
+    http_scan = MagicMock()
+    monkeypatch.setattr(adapter, "_scan_via_http", http_scan)
+
+    with pytest.raises(FlruAuthError, match="flru_auth_fetch_empty"):
+        adapter.scan_new(allow_guest_fallback=False)
+
+    http_scan.assert_not_called()
 
 
 def test_scan_new_ensures_for_all_checkbox(monkeypatch) -> None:

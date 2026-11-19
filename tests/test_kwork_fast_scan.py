@@ -6,9 +6,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.adapters.flru import FlruAuthError
 from src.config import Settings, get_settings
 from src.models import ProjectPreview
-from src.pipeline.orchestrator import PipelineOrchestrator
+from src.pipeline.orchestrator import (
+    PipelineOrchestrator,
+    _classify_flru_check_error,
+)
 from src.store.early_ping_seen import EarlyPingSeenStore
 from src.store.repository import ProjectRepository
 
@@ -78,6 +82,18 @@ def test_settings_early_scan_helpers_respect_flags() -> None:
         _env_file=None,
     )
     assert s2.any_early_scan_enabled() is False
+
+
+@pytest.mark.parametrize(
+    ("error", "category"),
+    [
+        (RuntimeError("Timeout 60000ms exceeded"), "таймаут"),
+        (RuntimeError("TypeError: Failed to fetch"), "WAF/сеть"),
+        (FlruAuthError("not_logged_in: login required"), "куки/сессия"),
+    ],
+)
+def test_fl_check_error_categories(error: BaseException, category: str) -> None:
+    assert _classify_flru_check_error(error) == category
 
 
 @pytest.fixture
@@ -397,6 +413,7 @@ async def test_run_early_scan_cycle_covers_yandex(
     call_kw = orch.review_service.tg_bot.notify_early_listing.await_args.kwargs
     assert call_kw["platform"] == "yandex_uslugi"
     assert call_kw["project_id"] == "uuid-abc"
+    assert orch._scan_listings.call_args.kwargs == {}
     # non-digit id → last preview id string
     state = orch.repository.get_scan_state("yandex_uslugi_it")
     assert state is not None
@@ -412,3 +429,69 @@ async def test_run_kwork_fast_scan_cycle_alias(
     out = await orch.run_kwork_fast_scan_cycle()
     assert out == {"seen": 1}
     orch.run_early_scan_cycle.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_fl_check_reports_auth_fetch_success(settings: Settings) -> None:
+    orch = _minimal_orchestrator(settings)
+    source = MagicMock(id="flru_orders", platform="flru")
+    adapter = MagicMock()
+    adapter.scan_new.return_value = [MagicMock(), MagicMock()]
+    orch._adapter_factory.return_value = adapter
+    message = MagicMock()
+    message.answer = AsyncMock()
+
+    with patch(
+        "src.pipeline.orchestrator.get_enabled_sources",
+        return_value=[source],
+    ):
+        await orch.check_flru_health(message)
+
+    adapter.scan_new.assert_called_once_with(allow_guest_fallback=False)
+    assert message.answer.await_count == 2
+    report = message.answer.await_args_list[-1].args[0]
+    assert "FL.ru жив" in report
+    assert "auth_fetch: OK" in report
+    assert "early_scan: OK" in report
+    assert "карточек: 2" in report
+    assert orch.repository.get_scan_state("flru_orders") is None
+    orch.review_service.tg_bot.notify_early_listing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fl_check_classifies_cookie_failure(settings: Settings) -> None:
+    orch = _minimal_orchestrator(settings)
+    source = MagicMock(id="flru_orders", platform="flru")
+    adapter = MagicMock()
+    adapter.scan_new.side_effect = FlruAuthError(
+        "not_logged_in: auth fetch → login"
+    )
+    orch._adapter_factory.return_value = adapter
+    message = MagicMock()
+    message.answer = AsyncMock()
+
+    with patch(
+        "src.pipeline.orchestrator.get_enabled_sources",
+        return_value=[source],
+    ):
+        await orch.check_flru_health(message)
+
+    report = message.answer.await_args_list[-1].args[0]
+    assert "проверка не пройдена" in report
+    assert "куки/сессия" in report
+
+
+@pytest.mark.asyncio
+async def test_fl_check_is_idempotent_while_scan_is_running(
+    settings: Settings,
+) -> None:
+    orch = _minimal_orchestrator(settings)
+    message = MagicMock()
+    message.answer = AsyncMock()
+
+    async with orch._flru_scan_lock:
+        await orch.check_flru_health(message)
+
+    message.answer.assert_awaited_once()
+    assert "уже выполняется" in message.answer.await_args.args[0]
+    orch._adapter_factory.assert_not_called()

@@ -26,6 +26,7 @@ EarlyDecisionHandler = Callable[
 SubmitTextHandler = Callable[[PendingOffer, str], Awaitable[None]]
 ExportJournalHandler = Callable[[Message], Awaitable[None]]
 ScanReportHandler = Callable[[Message], Awaitable[None]]
+FlCheckHandler = Callable[[Message], Awaitable[None]]
 NotebookSyncHandler = Callable[[Message, int], Awaitable[None]]
 JournalConfirmHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 PrepareRetryHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
@@ -53,6 +54,7 @@ class ReviewService:
         on_submit_text: SubmitTextHandler | None = None,
         on_export_journal: ExportJournalHandler | None = None,
         on_scan_report: ScanReportHandler | None = None,
+        on_fl_check: FlCheckHandler | None = None,
         on_notebook_sync: NotebookSyncHandler | None = None,
         on_journal_confirm: JournalConfirmHandler | None = None,
         on_prepare_retry: PrepareRetryHandler | None = None,
@@ -74,6 +76,7 @@ class ReviewService:
         self._on_submit_text = on_submit_text
         self._on_export_journal = on_export_journal
         self._on_scan_report = on_scan_report
+        self._on_fl_check = on_fl_check
         self._on_notebook_sync = on_notebook_sync
         self._on_journal_confirm = on_journal_confirm
         self._on_prepare_retry = on_prepare_retry
@@ -92,6 +95,7 @@ class ReviewService:
             on_response_text=self._handle_response_text,
             on_export_journal=self._handle_export_journal,
             on_scan_report=self._handle_scan_report,
+            on_fl_check=self._handle_fl_check,
             on_notebook_sync=self._handle_notebook_sync,
             on_journal_confirm=self._handle_journal_confirm,
             on_prepare_retry=self._handle_prepare_retry,
@@ -117,6 +121,9 @@ class ReviewService:
 
     def set_scan_report_handler(self, handler: ScanReportHandler) -> None:
         self._on_scan_report = handler
+
+    def set_fl_check_handler(self, handler: FlCheckHandler) -> None:
+        self._on_fl_check = handler
 
     def set_notebook_sync_handler(self, handler: NotebookSyncHandler) -> None:
         self._on_notebook_sync = handler
@@ -514,6 +521,14 @@ class ReviewService:
         if str(message.chat.id) != str(self.tg_bot.chat_id):
             return
         await self._on_scan_report(message)
+
+    async def _handle_fl_check(self, message: Message) -> None:
+        if self._on_fl_check is None:
+            await message.answer("Команда /flcheck недоступна")
+            return
+        if str(message.chat.id) != str(self.tg_bot.chat_id):
+            return
+        await self._on_fl_check(message)
 
     async def _handle_notebook_sync(self, message: Message, days: int) -> None:
         if self._on_notebook_sync is None:

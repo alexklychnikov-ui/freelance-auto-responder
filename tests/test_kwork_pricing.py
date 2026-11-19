@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 
+from src.adapters.kwork import _normalize_offer_price
 from src.adapters.kwork_pricing import (
     align_response_commercials,
     apply_competitive_price,
@@ -22,6 +23,7 @@ from src.adapters.kwork_pricing import (
     suggest_offer_price,
 )
 from src.models import ProjectFull
+from src.pipeline.orchestrator import PipelineOrchestrator
 
 
 def test_apply_competitive_price() -> None:
@@ -95,6 +97,60 @@ def test_suggest_offer_price_ignores_title_digits() -> None:
     price = int(suggest_offer_price(project))
     assert price >= 7000
     assert price <= 105000
+
+
+def test_no_budget_uses_fair_or_unknown() -> None:
+    project = ProjectFull(
+        platform="yandex_uslugi",
+        source_key="yandex_orders",
+        project_id="f559a5fb",
+        url="https://uslugi.yandex.ru/order/f559a5fb",
+        title="Интеграция",
+        full_description="Настроить интеграцию по ТЗ",
+        desired_budget=None,
+        max_budget=None,
+    )
+    assert pick_listed_offer_price(project, fair=0) == 0
+    assert pick_listed_offer_price(project, fair=45_000) == 45_000
+    assert suggest_offer_price(project) == "0"
+    assert _normalize_offer_price("", project) == "0"
+    assert _normalize_offer_price("400", project) == "500"
+    assert _normalize_offer_price("45000", project) == "45000"
+
+
+def test_no_budget_response_price_wins_fill_resolution() -> None:
+    project = ProjectFull(
+        platform="flru",
+        source_key="flru_orders",
+        project_id="5529717",
+        url="https://www.fl.ru/projects/5529717/x.html",
+        title="Поиск перевозчиков",
+        full_description="Сервис поиска перевозчиков",
+        desired_budget=None,
+        max_budget=None,
+    )
+    text = "Стоимость первой версии — 95 000 ₽. Срок — 14 дней."
+    assert prefer_response_price_when_no_budget(project, 0, text) == 95_000
+
+    orchestrator = object.__new__(PipelineOrchestrator)
+    fill, gap, fair = orchestrator._resolve_listed_fill(
+        project,
+        fair_price=45_000,
+        offer_price=60_000,
+        response_text=text,
+    )
+    assert fill == 95_000
+    assert gap is None
+    assert fair == 45_000
+
+
+def test_align_unknown_price_does_not_append_cost() -> None:
+    body = "Соберу интеграцию по ТЗ."
+    out = align_response_commercials(body, price=0, delivery_days=None)
+    assert out == body
+    assert "Стоимость" not in out
+    assert "8 000" not in out
+    assert "0 ₽" not in out
 
 
 def test_parse_form_price_bounds() -> None:

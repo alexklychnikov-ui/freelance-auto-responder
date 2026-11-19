@@ -14,12 +14,14 @@ from src.adapters.kwork_delivery import (
     snap_delivery_days,
 )
 from src.adapters.kwork_pricing import (
+    MIN_OFFER_PRICE_RUB,
     align_response_commercials,
     budget_gap,
     clamp_price_to_budget,
     ensure_budget_mismatch_note,
     parse_budget_ceiling_rub,
     parse_form_price_bounds,
+    suggest_offer_price,
 )
 from src.adapters.kwork_stages import plan_offer_stages
 from src.adapters.kwork_auth import (
@@ -1572,10 +1574,12 @@ def _normalize_offer_price(
         )
     digits = re.sub(r"\D", "", str(price) or "")
     value = int(digits) if digits else 0
-    if value < 500:
-        from src.adapters.kwork_pricing import suggest_offer_price
-
+    if value <= 0:
         value = int(suggest_offer_price(project, form_min=form_min, form_max=form_max))
+        if value <= 0:
+            return "0"
+    elif value < MIN_OFFER_PRICE_RUB:
+        value = MIN_OFFER_PRICE_RUB
     value = clamp_price_to_budget(
         value, project, form_min=form_min, form_max=form_max
     )

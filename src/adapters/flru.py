@@ -297,7 +297,11 @@ _FLRU_HTTP_UA = (
 
 
 def cookie_header_from_storage(storage_state_path: str | Path | None) -> str:
-    """Build Cookie header for fl.ru from Playwright storage_state."""
+    """Build Cookie header for fl.ru from Playwright storage_state.
+
+    Skips stale DDoS-Guard ``__ddg*`` cookies — they hang/break auth requests
+    from VPS until the browser mints a fresh pair.
+    """
     if not storage_state_path:
         return ""
     path = Path(storage_state_path)
@@ -315,7 +319,7 @@ def cookie_header_from_storage(storage_state_path: str | Path | None) -> str:
         if "fl.ru" not in dom:
             continue
         name = str(c.get("name") or "").strip()
-        if not name:
+        if not name or name.startswith("__ddg"):
             continue
         parts.append(f"{name}={c.get('value', '')}")
     return "; ".join(parts)
@@ -546,8 +550,15 @@ class FlruAdapter:
     def _get_browser(self) -> Any:
         if self._browser is None:
             storage = self._storage_path()
+            proxy = (
+                (self.settings.flru_proxy or "").strip()
+                or (self.settings.tg_user_proxy or "").strip()
+                or None
+            )
             self._browser = get_browser_client(
-                self.settings, storage_state_path=storage
+                self.settings,
+                storage_state_path=storage,
+                proxy_url=proxy,
             )
             self._owns_browser = True
         return self._browser
@@ -626,27 +637,73 @@ class FlruAdapter:
         return previews
 
     def _auth_fetch_html(self, url: str) -> str:
-        """Logged-in fetch via /messages/ (page.goto /projects/* hangs on VPS)."""
+        # Skip APIRequestContext: DDoS-Guard JS hangs request_get ~25s on fl.ru.
+        # Page /messages/ + same-origin fetch is the reliable auth path.
+        try:
+            return self._page_auth_fetch_html(url)
+        except FlruAuthError:
+            raise
+        except Exception as exc:
+            msg = str(exc).splitlines()[0].strip() or exc.__class__.__name__
+            raise RuntimeError(f"flru_auth_fetch_failed: {msg[:200]}") from exc
+
+    def _page_auth_fetch_html(self, url: str) -> str:
+        """Logged-in fetch via /messages/ (page.goto /projects/* hangs on VPS).
+
+        Always re-opens inbox first so DDoS-Guard can mint fresh ``__ddg*``
+        cookies; stale ones make ``fetch`` throw ``TypeError: Failed to fetch``.
+        Uses a same-origin path when possible and catches JS fetch errors.
+        """
         browser = self._get_browser()
-        cur = self._current_url(browser)
-        if "fl.ru/messages" not in cur.lower():
-            browser.navigate(INBOX_URL)
-            if hasattr(browser, "wait_ms"):
-                browser.wait_ms(1200)
+        # Warm origin + refresh short-lived DDoS-Guard cookies every time.
+        browser.navigate(INBOX_URL)
+        if hasattr(browser, "wait_ms"):
+            browser.wait_ms(1500)
         self._ensure_logged_in(browser)
-        payload = json.dumps(url)
+        cur = self._current_url(browser).lower()
+        if "fl.ru" not in cur or cur.startswith("about:"):
+            raise FlruAuthError(
+                f"flru_auth_fetch_bad_origin: {cur[:120] or 'empty'}"
+            )
+        # Prefer relative path on www.fl.ru to avoid opaque-origin CORS failures.
+        fetch_target = url
+        if url.startswith(FLRU_ORIGIN):
+            fetch_target = url[len(FLRU_ORIGIN) :] or "/"
+        elif url.startswith("https://fl.ru"):
+            fetch_target = url[len("https://fl.ru") :] or "/"
+        payload = json.dumps(fetch_target)
         result = browser.evaluate(
             f"""async () => {{
-              const r = await fetch({payload}, {{
-                credentials: 'include',
-                redirect: 'follow',
-              }});
-              const text = await r.text();
-              return {{ status: r.status, final: String(r.url || ''), text }};
+              try {{
+                const r = await fetch({payload}, {{
+                  credentials: 'include',
+                  redirect: 'follow',
+                }});
+                const text = await r.text();
+                return {{
+                  ok: true,
+                  status: r.status,
+                  final: String(r.url || ''),
+                  text,
+                  href: String(location.href || ''),
+                }};
+              }} catch (e) {{
+                return {{
+                  ok: false,
+                  error: String((e && e.message) || e),
+                  name: String((e && e.name) || ''),
+                  href: String(location.href || ''),
+                }};
+              }}
             }}"""
         )
         if not isinstance(result, dict):
             raise RuntimeError("flru_auth_fetch_bad_payload")
+        if result.get("ok") is False:
+            raise RuntimeError(
+                f"flru_auth_fetch_failed: {result.get('error') or 'fetch error'} "
+                f"(href={str(result.get('href') or '')[:80]})"
+            )
         final = str(result.get("final") or "")
         if _is_login_url(final):
             raise FlruAuthError(
@@ -658,6 +715,13 @@ class FlruAdapter:
             raise RuntimeError(
                 f"flru_auth_fetch_empty status={result.get('status')}"
             )
+        # Persist refreshed DDoS-Guard cookies after a successful auth fetch.
+        save = getattr(browser, "save_storage_state", None)
+        if callable(save):
+            try:
+                save()
+            except Exception:
+                logger.warning("flru_storage_save_after_auth_failed", exc_info=True)
         return text
 
     def _scan_via_auth_fetch(self, *, skip_closed: bool) -> list[ProjectPreview]:
@@ -699,7 +763,9 @@ class FlruAdapter:
             requires_paid_response=False if free_default else None,
         )
 
-    def scan_new(self) -> list[ProjectPreview]:
+    def scan_new(
+        self, *, allow_guest_fallback: bool = True
+    ) -> list[ProjectPreview]:
         skip_closed = bool(self.filters.get("skip_closed", True))
         # Prefer auth fetch from /messages/: guest HTTP ignores for_all filter.
         try:
@@ -711,6 +777,8 @@ class FlruAdapter:
                     len(previews),
                 )
                 return previews
+            if not allow_guest_fallback:
+                raise FlruAuthError("flru_auth_fetch_empty")
             logger.warning(
                 "flru_scan_auth_empty source=%s — fallback http",
                 self.source_key,
@@ -718,6 +786,10 @@ class FlruAdapter:
         except FlruAuthError:
             raise
         except Exception as auth_exc:
+            if not allow_guest_fallback:
+                raise FlruAuthError(
+                    f"flru_auth_fetch_failed: {auth_exc}"
+                ) from auth_exc
             logger.warning(
                 "flru_scan_auth_failed source=%s err=%s — fallback http",
                 self.source_key,

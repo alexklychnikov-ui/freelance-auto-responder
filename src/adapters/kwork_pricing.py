@@ -197,8 +197,7 @@ def prefer_response_price_when_no_budget(
 ) -> int:
     """Keep response asking price when listing budgets are missing.
 
-    Stops prepare/correct from resurrecting the 8000 fallback after the
-    user (or revise) already put a lower explicit price in the text.
+    Stops prepare/correct from replacing an explicit response price.
     When a ceiling exists, always clamp.
     """
     fill_i = int(fill or 0)
@@ -208,8 +207,8 @@ def prefer_response_price_when_no_budget(
     if extracted is not None and extracted > 0:
         return extracted
     if fill_i > 0:
-        return max(MIN_OFFER_PRICE_RUB, fill_i)
-    return MIN_OFFER_PRICE_RUB
+        return fill_i
+    return 0
 
 
 def pick_listed_offer_price(
@@ -231,14 +230,16 @@ def pick_listed_offer_price(
     hi = parse_budget_ceiling_rub(project)
     lo = desired if desired is not None else (min(amounts) if amounts else None)
     if lo is None and hi is None:
-        base = 8000
+        if fair <= 0:
+            return 0
+        base = int(fair)
     else:
         if lo is None:
             lo = hi
         if hi is None:
             hi = lo
         if lo is None or hi is None:
-            base = 8000
+            return 0
         else:
             if lo > hi:
                 lo = hi

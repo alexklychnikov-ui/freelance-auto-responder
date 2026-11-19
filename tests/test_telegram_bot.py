@@ -6,7 +6,13 @@ import pytest
 from aiogram import Bot
 from aiogram.types import Update
 
-from src.telegram_bot.bot import TelegramReviewBot
+from src.telegram_bot.bot import (
+    CALLBACK_COMMAND_FLCHECK,
+    CALLBACK_COMMAND_FLPING,
+    CALLBACK_COMMAND_REPAIR,
+    TelegramReviewBot,
+    build_start_command_keyboard,
+)
 
 
 def _make_update(text: str) -> Update:
@@ -27,6 +33,35 @@ def _make_update(text: str) -> Update:
             }
         ]
     return Update.model_validate({"update_id": 1, "message": message})
+
+
+def _make_callback_update(data: str) -> Update:
+    return Update.model_validate(
+        {
+            "update_id": 2,
+            "callback_query": {
+                "id": "callback-1",
+                "from": {
+                    "id": 456,
+                    "is_bot": False,
+                    "first_name": "Test",
+                },
+                "chat_instance": "chat-1",
+                "data": data,
+                "message": {
+                    "message_id": 10,
+                    "date": "2025-01-01T00:00:00Z",
+                    "chat": {"id": 123, "type": "private"},
+                    "from": {
+                        "id": 123456,
+                        "is_bot": True,
+                        "first_name": "Bot",
+                    },
+                    "text": "Freelance Auto-Responder",
+                },
+            },
+        }
+    )
 
 
 @pytest.mark.asyncio
@@ -58,6 +93,97 @@ async def test_slash_command_not_handled_as_response_text() -> None:
     await bot.dispatcher.feed_update(bot.bot, _make_update("/journal"))
 
     text_handler.assert_not_awaited()
+    await bot.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", ["/repair", "/flcheck", "/flping"])
+async def test_fl_check_commands_trigger_handler(command: str) -> None:
+    fl_check_handler = AsyncMock()
+    bot = TelegramReviewBot(
+        token="123456:TEST",
+        chat_id="123",
+        bot=Bot(token="123456:TEST"),
+    )
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_fl_check=fl_check_handler,
+    )
+
+    await bot.dispatcher.feed_update(bot.bot, _make_update(command))
+
+    fl_check_handler.assert_awaited_once()
+    await bot.close()
+
+
+def test_start_command_keyboard_has_fl_aliases() -> None:
+    keyboard = build_start_command_keyboard()
+    buttons = [button for row in keyboard.inline_keyboard for button in row]
+
+    assert [button.text for button in buttons] == [
+        "🛠 /repair",
+        "🔎 /flcheck",
+        "📡 /flping",
+    ]
+    assert [button.callback_data for button in buttons] == [
+        CALLBACK_COMMAND_REPAIR,
+        CALLBACK_COMMAND_FLCHECK,
+        CALLBACK_COMMAND_FLPING,
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "callback_data",
+    [
+        CALLBACK_COMMAND_REPAIR,
+        CALLBACK_COMMAND_FLCHECK,
+        CALLBACK_COMMAND_FLPING,
+    ],
+)
+async def test_start_command_buttons_trigger_fl_check(
+    callback_data: str,
+) -> None:
+    fl_check_handler = AsyncMock()
+    bot = TelegramReviewBot(
+        token="123456:TEST",
+        chat_id="123",
+        bot=Bot(token="123456:TEST"),
+    )
+    bot.bot.session = AsyncMock(return_value=True)
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_fl_check=fl_check_handler,
+    )
+
+    await bot.dispatcher.feed_update(
+        bot.bot,
+        _make_callback_update(callback_data),
+    )
+
+    fl_check_handler.assert_awaited_once()
+    await bot.close()
+
+
+@pytest.mark.asyncio
+async def test_fl_check_ignored_for_wrong_chat() -> None:
+    fl_check_handler = AsyncMock()
+    bot = TelegramReviewBot(
+        token="123456:TEST",
+        chat_id="999",
+        bot=Bot(token="123456:TEST"),
+    )
+    bot.register_handlers(
+        on_approve=AsyncMock(),
+        on_reject=AsyncMock(),
+        on_fl_check=fl_check_handler,
+    )
+
+    await bot.dispatcher.feed_update(bot.bot, _make_update("/flcheck"))
+
+    fl_check_handler.assert_not_awaited()
     await bot.close()
 
 
@@ -574,6 +700,29 @@ async def test_start_clears_corr_awaiting() -> None:
     bot.bot.session.make_request = AsyncMock(return_value=True)
     await bot.dispatcher.feed_update(bot.bot, _make_update("/start"))
     assert "123" not in bot._corr_awaiting
+    request = bot.bot.session.await_args.args[1]
+    for command in (
+        "/start",
+        "/project",
+        "/force",
+        "/tz",
+        "/kworkoff",
+        "/kworkon",
+        "/repair",
+        "/flcheck",
+        "/flping",
+        "/journal",
+        "/journal_sync",
+        "/notebook",
+        "/report",
+    ):
+        assert command in request.text
+    assert "проверяет авторизацию, auth_fetch и early scan FL.ru" in request.text
+    assert "показывает последние отчёты сканирования" in request.text
+    assert "<id/URL>" not in request.text
+    assert "<текст>" not in request.text
+    assert len(request.text) <= 4096
+    assert request.reply_markup == build_start_command_keyboard()
     await bot.close()
 
 

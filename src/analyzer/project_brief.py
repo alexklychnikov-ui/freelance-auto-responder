@@ -10,7 +10,10 @@ _SOURCE_RE = re.compile(
     re.IGNORECASE,
 )
 _PARSE_TASK_RE = re.compile(
-    r"(парс\w*|скрап\w*|собира\w+|выгруж\w+|мониторинг\s+цен|парсер)",
+    r"(парс\w*|скрап\w*|выгруз\w*|парсер|мониторинг\s+цен|"
+    r"(?:собира\w+|собр\w+)\s+(?:данн|товар|каталог|цен|контент|таблиц)|"
+    r"(?:xml|json|html).{0,16}(?:extract|извлеч|парс|scrap|дамп|feed|выгруз)|"
+    r"(?:extract|извлеч\w*).{0,16}(?:xml|json|html))",
     re.IGNORECASE,
 )
 _SITE_RECON_TASK_RE = re.compile(

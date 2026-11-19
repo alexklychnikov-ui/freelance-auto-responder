@@ -74,6 +74,14 @@ CALLBACK_CORRECT = "corr"
 CALLBACK_OPEN = "open"
 CALLBACK_EARLY_GO = "ego"
 CALLBACK_EARLY_SKIP = "esk"
+CALLBACK_COMMAND_REPAIR = "cmd:repair"
+CALLBACK_COMMAND_FLCHECK = "cmd:flcheck"
+CALLBACK_COMMAND_FLPING = "cmd:flping"
+_FL_CHECK_CALLBACKS = {
+    CALLBACK_COMMAND_REPAIR,
+    CALLBACK_COMMAND_FLCHECK,
+    CALLBACK_COMMAND_FLPING,
+}
 
 
 def _chunk_text(text: str, max_len: int = 4000) -> list[str]:
@@ -203,6 +211,29 @@ def build_early_listing_keyboard(
                     ),
                 ),
             ]
+        ]
+    )
+
+
+def build_start_command_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🛠 /repair",
+                    callback_data=CALLBACK_COMMAND_REPAIR,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔎 /flcheck",
+                    callback_data=CALLBACK_COMMAND_FLCHECK,
+                ),
+                InlineKeyboardButton(
+                    text="📡 /flping",
+                    callback_data=CALLBACK_COMMAND_FLPING,
+                ),
+            ],
         ]
     )
 
@@ -369,6 +400,7 @@ class TelegramReviewBot:
         on_response_text: Any | None = None,
         on_export_journal: Any | None = None,
         on_scan_report: Any | None = None,
+        on_fl_check: Any | None = None,
         on_notebook_sync: Any | None = None,
         on_journal_confirm: Any | None = None,
         on_prepare_retry: Any | None = None,
@@ -472,6 +504,20 @@ class TelegramReviewBot:
                 _, platform, source_key, project_id = parsed
                 await on_correct(platform, source_key, project_id, callback)
 
+        @self._dp.callback_query(F.data.in_(_FL_CHECK_CALLBACKS))
+        async def handle_fl_check_callback(callback: CallbackQuery) -> None:
+            if callback.message is None:
+                await callback.answer("Сообщение команды недоступно")
+                return
+            if str(callback.message.chat.id) != self.chat_id:
+                await callback.answer("Недоступно", show_alert=True)
+                return
+            if on_fl_check is None:
+                await callback.answer("Команда недоступна", show_alert=True)
+                return
+            await callback.answer("Запускаю проверку FL.ru…")
+            await on_fl_check(callback.message)
+
         @self._dp.message(Command("start"))
         async def handle_start(message: Message) -> None:
             self._tz_awaiting_chats.discard(str(message.chat.id))
@@ -480,9 +526,37 @@ class TelegramReviewBot:
                 "Freelance Auto-Responder\n"
                 "Kwork: карточка → автозаполнение формы (VPS).\n"
                 "Яндекс / FL.ru: карточка → текст в TG → копируй вручную.\n"
-                "Ручной: /project ссылка · /force id/URL мимо фильтра · /tz ТЗ\n"
-                "Kwork авто: /kworkoff · /kworkon\n"
-                "Excel: /journal · Notebook: /notebook [N] · отчёт: /report"
+                "\nКоманды:\n"
+                "/start — показывает эту справку и кнопки быстрой проверки FL.ru. "
+                "Используй, чтобы вспомнить доступные действия.\n"
+                "/project &lt;id/URL&gt; — вручную загружает проект Kwork, Яндекс Услуг "
+                "или FL.ru и запускает обычную обработку. Используй для конкретного "
+                "заказа вне ожидания планового скана.\n"
+                "/force &lt;id/URL&gt; — обрабатывает проект мимо фильтра стека и score "
+                "и отправляет карточку на ревью. Используй, когда обычный фильтр "
+                "отклонил нужный заказ.\n"
+                "/tz &lt;текст&gt; — создаёт ручной проект прямо из текста ТЗ без ссылки. "
+                "Используй для заказа из переписки или другого источника.\n"
+                "/kworkoff — ставит автоматический Kwork-пайплайн на паузу. "
+                "Используй, чтобы временно остановить сканирование и обработку Kwork.\n"
+                "/kworkon — снимает паузу и возобновляет Kwork-пайплайн. "
+                "Используй после устранения проблемы или завершения ручных работ.\n"
+                "/repair — запускает безопасную проверку FL.ru без карточек и записи "
+                "scan-state. Это привычный alias для ручной диагностики источника.\n"
+                "/flcheck — проверяет авторизацию, auth_fetch и early scan FL.ru, "
+                "затем сообщает причину сбоя. Используй после таймаута, WAF или "
+                "подозрения на устаревшие куки.\n"
+                "/flping — выполняет ту же полную проверку FL.ru, что /flcheck. "
+                "Используй как короткий alias для быстрой ручной диагностики.\n"
+                "/journal — синхронизирует журнал откликов и присылает актуальный "
+                "Excel-файл. Используй после подготовки или отправки откликов.\n"
+                "/journal_sync — alias команды /journal с тем же результатом. "
+                "Используй в старых сценариях и автоматизациях.\n"
+                "/notebook [N] — создаёт задачу обновления Google Notebook/таблицы "
+                "за последние N дней. Используй для внеплановой синхронизации.\n"
+                "/report — показывает последние отчёты сканирования, статистику "
+                "и ошибки площадок. Используй для быстрой проверки состояния системы.",
+                reply_markup=build_start_command_keyboard(),
             )
 
         if on_manual_tz is not None:
@@ -584,6 +658,16 @@ class TelegramReviewBot:
             if on_scan_report is None:
                 return
             await on_scan_report(message)
+
+        @self._dp.message(Command("repair", "flcheck", "flping"))
+        async def handle_fl_check(message: Message) -> None:
+            if str(message.chat.id) != self.chat_id:
+                return
+            self._tz_awaiting_chats.discard(str(message.chat.id))
+            self.clear_correct_awaiting(str(message.chat.id))
+            if on_fl_check is None:
+                return
+            await on_fl_check(message)
 
         @self._dp.message(Command("journal", "journal_sync"))
         async def handle_journal_sync(message: Message) -> None:

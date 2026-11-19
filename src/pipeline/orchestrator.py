@@ -25,6 +25,7 @@ from src.adapters.kwork_pricing import (
     pick_listed_offer_price,
     prefer_response_price_when_no_budget,
     price_exceeds_budget_ceiling,
+    project_has_listed_budget,
 )
 from src.adapters.offer_scope import (
     catalog_item_count_from_evidence,
@@ -106,6 +107,48 @@ def _is_closed_project_error(exc: BaseException) -> bool:
         return True
     msg = str(exc).lower()
     return "flru_project_closed" in msg or "project_closed" in msg
+
+
+def _classify_flru_check_error(exc: BaseException) -> str:
+    message = str(exc).lower()
+    if any(
+        marker in message
+        for marker in (
+            "timeout",
+            "timed out",
+            "err_timed_out",
+            "deadline exceeded",
+        )
+    ):
+        return "таймаут"
+    if any(
+        marker in message
+        for marker in (
+            "not_logged_in",
+            "login",
+            "storage_state",
+            "cookie",
+            "куки",
+            "сесс",
+        )
+    ):
+        return "куки/сессия"
+    if any(
+        marker in message
+        for marker in (
+            "failed to fetch",
+            "ddos",
+            "__ddg",
+            "waf",
+            "403",
+            "429",
+            "bad_origin",
+            "connection",
+            "network",
+        )
+    ):
+        return "WAF/сеть"
+    return "ошибка"
 
 
 def _manual_outcome_tg_text(
@@ -207,6 +250,7 @@ class PipelineOrchestrator:
         self._browser = browser
         self._adapter_factory = adapter_factory or self._default_adapter
         self._journal_sync_lock = asyncio.Lock()
+        self._flru_scan_lock = asyncio.Lock()
         self.scan_reports = ScanReportStore(settings.database_path)
         self.kwork_inbox_seen = KworkInboxSeenStore(
             settings.kwork_inbox_seen_db or "data/kwork_inbox_seen.db"
@@ -243,6 +287,7 @@ class PipelineOrchestrator:
         )
         self.review_service.set_export_journal_handler(self.export_prepared_to_journal)
         self.review_service.set_scan_report_handler(self.send_scan_report)
+        self.review_service.set_fl_check_handler(self.check_flru_health)
         self.review_service.set_notebook_sync_handler(self.request_notebook_sync)
         self.review_service.set_manual_project_handler(self.handle_manual_project)
         self.review_service.set_force_project_handler(self.handle_force_project)
@@ -529,7 +574,10 @@ class PipelineOrchestrator:
                 continue
             source_stats = ScanCycleStats()
             try:
-                previews = await asyncio.to_thread(self._scan_listings, source)
+                previews = await self._scan_source(
+                    source,
+                    allow_guest_fallback=True,
+                )
             except KworkAuthError as exc:
                 logger.error("Kwork auth failed for %s: %s", source.id, exc)
                 await self.review_service.tg_bot.notify(
@@ -976,7 +1024,10 @@ class PipelineOrchestrator:
                 continue
             plat_stats = _plat_stats(source.platform)
             try:
-                previews = await asyncio.to_thread(self._scan_listings, source)
+                previews = await self._scan_source(
+                    source,
+                    allow_guest_fallback=False,
+                )
             except KworkAuthError as exc:
                 msg = str(exc)
                 logger.error("Kwork auth failed for %s: %s", source.id, msg)
@@ -1251,10 +1302,34 @@ class PipelineOrchestrator:
             title,
         )
 
-    def _scan_listings(self, source: SourceConfig) -> list[Any]:
+    async def _scan_source(
+        self,
+        source: SourceConfig,
+        *,
+        allow_guest_fallback: bool,
+    ) -> list[Any]:
+        if source.platform != "flru":
+            return await asyncio.to_thread(self._scan_listings, source)
+        async with self._flru_scan_lock:
+            return await asyncio.to_thread(
+                self._scan_listings,
+                source,
+                allow_guest_fallback=allow_guest_fallback,
+            )
+
+    def _scan_listings(
+        self,
+        source: SourceConfig,
+        *,
+        allow_guest_fallback: bool = True,
+    ) -> list[Any]:
         if source.platform in ("yandex_uslugi", "flru"):
             adapter = self._adapter_factory(source, None)
             try:
+                if source.platform == "flru":
+                    return adapter.scan_new(
+                        allow_guest_fallback=allow_guest_fallback
+                    )
                 return adapter.scan_new()
             finally:
                 close = getattr(adapter, "close", None)
@@ -1522,7 +1597,7 @@ class PipelineOrchestrator:
             offer.project.max_budget or ""
         ).strip()
         # Long description alone is not enough — missing budgets must re-scrape
-        # (flat «Цена N ₽» cards otherwise keep None/None → fill=8000).
+        # because flat «Цена N ₽» cards can otherwise keep None/None.
         if (
             not budgets_missing
             and len(brief) >= 80
@@ -1674,7 +1749,9 @@ class PipelineOrchestrator:
             else None
         )
         listed = pick_listed_offer_price(offer.project, fair=fair_price, mix=mix)
-        price_hint: int | str | None = listed if listed > 0 else None
+        price_hint: int | str | None = (
+            listed if listed > 0 else fair_price if fair_price > 0 else None
+        )
         days_hint = suggest_delivery_days_for_scope(
             offer.project, volume=volume
         )
@@ -2185,9 +2262,20 @@ class PipelineOrchestrator:
         listed = pick_listed_offer_price(
             project, fair=int(fair_price or 0), mix=mix
         )
-        listed = prefer_response_price_when_no_budget(
-            project, listed, response_text or ""
-        )
+        if project_has_listed_budget(project):
+            listed = prefer_response_price_when_no_budget(
+                project, listed, response_text or ""
+            )
+        else:
+            response_price = prefer_response_price_when_no_budget(
+                project, 0, response_text or ""
+            )
+            listed = (
+                response_price
+                or max(0, int(offer_price or 0))
+                or listed
+                or max(0, int(fair_price or 0))
+            )
         if gap is not None:
             gap = dict(gap)
             gap["fill_price"] = int(listed)
@@ -2884,6 +2972,72 @@ class PipelineOrchestrator:
             limit=3,
         )
         await self.review_service.tg_bot.notify(text)
+
+    async def check_flru_health(self, message: Any) -> None:
+        sources = [
+            source
+            for source in get_enabled_sources(self.settings.sources_config_path)
+            if source.platform == "flru"
+        ]
+        if not sources:
+            await message.answer("⚠️ FL.ru: нет включённых источников")
+            return
+        if self._flru_scan_lock.locked():
+            await message.answer(
+                "⏳ FL.ru: проверка уже выполняется плановым сканом или /flcheck"
+            )
+            return
+
+        started = time.perf_counter()
+        proxy_enabled = bool(
+            (self.settings.flru_proxy or "").strip()
+            or (self.settings.tg_user_proxy or "").strip()
+        )
+        results: list[str] = []
+        all_ok = True
+
+        async with self._flru_scan_lock:
+            await message.answer("🔎 FL.ru: проверяю auth_fetch и early scan…")
+            for source in sources:
+                source_started = time.perf_counter()
+                try:
+                    previews = await asyncio.to_thread(
+                        self._scan_listings,
+                        source,
+                        allow_guest_fallback=False,
+                    )
+                except Exception as exc:
+                    all_ok = False
+                    category = _classify_flru_check_error(exc)
+                    detail = str(exc).splitlines()[0].strip() or exc.__class__.__name__
+                    logger.warning(
+                        "flru_manual_check_failed source=%s category=%s err=%s",
+                        source.id,
+                        category,
+                        detail[:300],
+                    )
+                    results.append(
+                        f"❌ {html.escape(source.id)}: {category}\n"
+                        f"auth_fetch/early_scan: FAIL\n"
+                        f"{html.escape(detail[:300])}"
+                    )
+                    continue
+
+                elapsed = time.perf_counter() - source_started
+                results.append(
+                    f"✅ {html.escape(source.id)}: источник жив\n"
+                    f"auth_fetch: OK · early_scan: OK · карточек: {len(previews)}\n"
+                    f"время: {elapsed:.1f} с"
+                )
+
+        status = "✅ FL.ru жив" if all_ok else "❌ FL.ru проверка не пройдена"
+        route = "proxy/SOCKS" if proxy_enabled else "direct"
+        total = time.perf_counter() - started
+        await message.answer(
+            f"{status}\n"
+            f"маршрут: {route} · всего: {total:.1f} с\n\n"
+            + "\n\n".join(results)
+        )
 
     async def request_notebook_sync(self, message: Any, days: int) -> None:
         """VPS side of Bridge A: write job JSON for local Google watcher."""

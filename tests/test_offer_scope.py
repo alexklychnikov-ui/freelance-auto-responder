@@ -128,3 +128,24 @@ def test_landing_defaults_to_five() -> None:
         max_budget="до 30 000 ₽",
     )
     assert suggest_delivery_days_for_scope(project, volume=None) == 5
+
+
+def test_learning_system_collect_feedback_not_two_days() -> None:
+    project = ProjectFull(
+        platform="kwork",
+        source_key="kwork_manual",
+        project_id="3273960",
+        url="https://kwork.ru/projects/3273960/view",
+        title="Система обучения сотрудников",
+        full_description=(
+            "Необходимо реализовать ИИ-специалиста по обучению кадров, "
+            "который будет собирать в течение указанного периода обратную связь "
+            "от сотрудников (вопросы, предложения, описания рабочих ситуаций "
+            "по почте), определять категорию подходящего материала."
+        ),
+        desired_budget="до 100 000 ₽",
+        max_budget="до 200 000 ₽",
+    )
+    days = suggest_delivery_days_for_scope(project, volume=None)
+    assert days != 2
+    assert days >= 5

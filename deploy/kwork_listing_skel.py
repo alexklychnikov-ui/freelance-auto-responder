@@ -16,6 +16,7 @@ LIMITS = {
 # Срок опции: "0" | "1" | "2" | ...
 
 GITHUB_CASE_MIN_BUYER = 500
+GITHUB_CASE_ALLOWED_BUYER = (500, 1000)
 EXTRA_BUYER_GRID = (800, 1200, 1600, 2000, 2400)  # сетка extra, buyer 500 в extra нет
 
 
@@ -263,8 +264,8 @@ def github_case_problems(built: dict) -> list[str]:
         return []
     err: list[str] = []
     buyer = int(built["price_buyer"])
-    if buyer != GITHUB_CASE_MIN_BUYER:
-        err.append(f"github case: price_buyer {buyer} != {GITHUB_CASE_MIN_BUYER}")
+    if buyer not in GITHUB_CASE_ALLOWED_BUYER:
+        err.append(f"github case: price_buyer {buyer} not in {GITHUB_CASE_ALLOWED_BUYER}")
     extras = built["extras"]
     n_ex = len(extras)
     if n_ex < 5 or n_ex > 7:
@@ -273,7 +274,7 @@ def github_case_problems(built: dict) -> list[str]:
     for i, extra in enumerate(extras):
         price = int(extra["price"])
         extra_sum += price
-        if price not in EXTRA_BUYER_GRID or price <= GITHUB_CASE_MIN_BUYER:
+        if price not in EXTRA_BUYER_GRID or price <= buyer:
             err.append(f"github case: extra[{i}].price {price} not in {EXTRA_BUYER_GRID}")
     if extra_sum < 4000:
         err.append(f"github case: extras sum {extra_sum} < 4000")

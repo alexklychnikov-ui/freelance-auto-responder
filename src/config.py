@@ -148,6 +148,7 @@ class Settings(BaseSettings):
     flru_inbox_mirror_enabled: bool = True
     flru_inbox_seen_db: str = "data/flru_inbox_seen.db"
     flru_inbox_poll_seconds: int = 90
+    flru_proxy: str = ""
 
     # Telegram USER session (Telethon) — VIP private-group watcher
     tg_user_api_id: int = 0
