@@ -15,6 +15,7 @@ from src.adapters.flru import (
     flru_page_looks_logged_out,
     flru_paid_response_tg_mark,
     is_flru_project_closed,
+    parse_flru_money_fields,
     parse_listing_from_html,
     parse_project_from_html,
     parse_submitted_offer_from_text,
@@ -142,6 +143,38 @@ def test_listing_url_appends_for_all() -> None:
     assert adapter._listing_url() == "https://www.fl.ru/projects/?kind=1&for_all=1"
 
 
+def test_parse_flru_money_range_ruble_sign() -> None:
+    desired, max_b = parse_flru_money_fields("Оплата: 5 000 ₽ – 10 000 ₽")
+    assert desired == "5000 руб"
+    assert max_b == "10000 руб"
+
+
+def test_parse_project_budget_range_from_html() -> None:
+    html = """
+    <html><body>
+    <h1>ТЗ Word без цены</h1>
+    <div class="description">Нужен бот. Бюджет в карточке, в файле денег нет.</div>
+    <div>Оплата: 5 000 ₽ – 10 000 ₽</div>
+    </body></html>
+    """
+    raw = parse_project_from_html(html, project_id="5530543")
+    assert raw["desired_budget"] == "5000 руб"
+    assert raw["max_budget"] == "10000 руб"
+
+
+def test_parse_listing_budget_range_ruble() -> None:
+    html = """
+    <a href="/projects/5530543/bot.html">Бот</a>
+    <span>Оплата: 5 000 ₽ – 10 000 ₽</span>
+    <span>2 ответа</span>
+    """
+    cards = parse_listing_from_html(html, skip_closed=False)
+    assert len(cards) == 1
+    assert cards[0]["budget_text"] is not None
+    assert "5000" in cards[0]["budget_text"].replace(" ", "")
+    assert "10000" in cards[0]["budget_text"].replace(" ", "")
+
+
 def test_detect_flru_requires_paid_response() -> None:
     paid_html = (
         "<div>Вы можете купить 1 отклик, чтобы ответить на этот заказ.</div>"
@@ -225,8 +258,13 @@ def test_scan_new_allows_guest_fallback_by_default(monkeypatch) -> None:
     adapter = _make_adapter()
     monkeypatch.setattr(
         adapter,
-        "_auth_fetch_html",
+        "_scan_via_auth_fetch",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("auth down")),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_scan_via_auth_http",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("auth http down")),
     )
     guest_cards = [MagicMock(project_id=PID)]
     http_scan = MagicMock(return_value=guest_cards)
@@ -238,12 +276,39 @@ def test_scan_new_allows_guest_fallback_by_default(monkeypatch) -> None:
     http_scan.assert_called_once_with(skip_closed=True)
 
 
+def test_scan_new_failed_fetch_uses_auth_http_not_guest(monkeypatch) -> None:
+    adapter = _make_adapter()
+    monkeypatch.setattr(
+        adapter,
+        "_scan_via_auth_fetch",
+        lambda *a, **k: (_ for _ in ()).throw(
+            RuntimeError("Failed to fetch (href=https://www.fl.ru/messages/)")
+        ),
+    )
+    auth_http_cards = [MagicMock(project_id=PID)]
+    auth_http = MagicMock(return_value=auth_http_cards)
+    guest = MagicMock()
+    monkeypatch.setattr(adapter, "_scan_via_auth_http", auth_http)
+    monkeypatch.setattr(adapter, "_scan_via_http", guest)
+
+    cards = adapter.scan_new(allow_guest_fallback=False)
+
+    assert cards is auth_http_cards
+    auth_http.assert_called_once_with(skip_closed=True)
+    guest.assert_not_called()
+
+
 def test_scan_new_rejects_guest_fallback_on_auth_failure(monkeypatch) -> None:
     adapter = _make_adapter()
     monkeypatch.setattr(
         adapter,
-        "_auth_fetch_html",
+        "_scan_via_auth_fetch",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("Failed to fetch")),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_scan_via_auth_http",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("auth http down")),
     )
     http_scan = MagicMock()
     monkeypatch.setattr(adapter, "_scan_via_http", http_scan)
@@ -259,6 +324,7 @@ def test_scan_new_rejects_guest_fallback_on_auth_failure(monkeypatch) -> None:
 def test_scan_new_rejects_guest_fallback_on_empty_auth_scan(monkeypatch) -> None:
     adapter = _make_adapter()
     monkeypatch.setattr(adapter, "_scan_via_auth_fetch", MagicMock(return_value=[]))
+    monkeypatch.setattr(adapter, "_scan_via_auth_http", MagicMock(return_value=[]))
     http_scan = MagicMock()
     monkeypatch.setattr(adapter, "_scan_via_http", http_scan)
 
@@ -282,8 +348,18 @@ def test_scan_new_ensures_for_all_checkbox(monkeypatch) -> None:
     adapter = _make_adapter(browser=browser)
     monkeypatch.setattr(
         adapter,
-        "_auth_fetch_html",
+        "_scan_via_auth_fetch",
         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("auth down")),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_scan_via_auth_http",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("auth http down")),
+    )
+    monkeypatch.setattr(
+        adapter,
+        "_scan_via_http",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("http down")),
     )
     cards = adapter.scan_new()
     assert len(cards) == 1
@@ -291,6 +367,121 @@ def test_scan_new_ensures_for_all_checkbox(monkeypatch) -> None:
     browser.navigate.assert_called_with(
         "https://www.fl.ru/projects/?kind=1&for_all=1"
     )
+
+
+def test_fetch_flru_html_passes_proxy_to_httpx(monkeypatch) -> None:
+    captured: dict = {}
+
+    class FakeResp:
+        url = "https://www.fl.ru/projects/?kind=1"
+        text = "<html></html>"
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def get(self, url, headers=None):
+            return FakeResp()
+
+    monkeypatch.setattr("src.adapters.flru.httpx.Client", FakeClient)
+    monkeypatch.setattr("src.adapters.flru.cookie_header_from_storage", lambda p: "")
+
+    from src.adapters.flru import fetch_flru_html
+
+    html = fetch_flru_html(
+        "https://www.fl.ru/projects/?kind=1",
+        use_cookies=False,
+        proxy_url="socks5://127.0.0.1:12335",
+    )
+    assert html == "<html></html>"
+    assert captured.get("proxy") == "socks5://127.0.0.1:12335"
+
+
+def test_warm_auth_origin_uses_site_root_not_messages() -> None:
+    browser = MagicMock()
+    browser.evaluate.return_value = "https://www.fl.ru/"
+    adapter = _make_adapter(browser=browser)
+
+    adapter._warm_auth_origin(browser)
+
+    browser.navigate.assert_called_once_with("https://www.fl.ru/")
+    assert "/messages/" not in browser.navigate.call_args[0][0]
+
+
+def test_listing_pages_clamp_and_filter_override() -> None:
+    adapter = _make_adapter()
+    adapter.settings.flru_listing_pages = 3
+    assert adapter._listing_pages() == 3
+    adapter.settings.flru_listing_pages = 99
+    assert adapter._listing_pages() == 5
+    adapter.settings.flru_listing_pages = 0
+    assert adapter._listing_pages() == 1
+    adapter.filters["listing_pages"] = 2
+    assert adapter._listing_pages() == 2
+
+
+def test_merge_raw_cards_dedupes_preserving_order() -> None:
+    adapter = _make_adapter()
+    page1 = [
+        {"project_id": "11111", "title": "a"},
+        {"project_id": "22222", "title": "b"},
+    ]
+    page2 = [
+        {"project_id": "22222", "title": "b-dup"},
+        {"project_id": "33333", "title": "c"},
+    ]
+    merged = adapter._merge_raw_cards([page1, page2])
+    assert [c["project_id"] for c in merged] == ["11111", "22222", "33333"]
+    assert merged[1]["title"] == "b"
+
+
+def test_scan_via_auth_fetch_warms_inbox_once(monkeypatch) -> None:
+    browser = MagicMock()
+    adapter = _make_adapter(browser=browser)
+    adapter.settings.flru_listing_pages = 3
+    fetched_urls: list[str] = []
+
+    def fake_fetch(_browser, url: str) -> str:
+        fetched_urls.append(url)
+        if "page=2" in url:
+            return '<a href="/projects/22222/x">Two</a>'
+        if "page=3" in url:
+            return '<a href="/projects/11111/x">Dup</a><a href="/projects/33333/x">Three</a>'
+        return '<a href="/projects/11111/x">One</a>'
+
+    warm = MagicMock()
+    monkeypatch.setattr(adapter, "_warm_auth_origin", warm)
+    monkeypatch.setattr(adapter, "_same_origin_fetch_html", fake_fetch)
+    monkeypatch.setattr(
+        "src.adapters.flru.parse_listing_from_html",
+        lambda html, skip_closed=True: [
+            {
+                "project_id": m,
+                "url": f"https://www.fl.ru/projects/{m}/",
+                "title": m,
+            }
+            for m in re.findall(r"/projects/(\d+)/", html)
+        ],
+    )
+
+    cards = adapter._scan_via_auth_fetch(skip_closed=True)
+
+    warm.assert_called_once_with(browser)
+    browser.navigate.assert_not_called()
+    assert len(fetched_urls) == 3
+    assert "page=" not in fetched_urls[0]
+    assert "page=2" in fetched_urls[1]
+    assert "page=3" in fetched_urls[2]
+    assert [c.project_id for c in cards] == ["11111", "22222", "33333"]
 
 
 def test_parse_submitted_offer_from_fixture_text() -> None:

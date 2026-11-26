@@ -11,8 +11,12 @@ from typing import Any
 
 import httpx
 
-from src.adapters.flru_urls import FLRU_ORIGIN, ensure_flru_for_all, flru_project_url
-from src.adapters.flru_inbox import INBOX_URL
+from src.adapters.flru_urls import (
+    FLRU_ORIGIN,
+    ensure_flru_for_all,
+    flru_listing_page_url,
+    flru_project_url,
+)
 from src.browser.base import BrowserClient
 from src.browser.factory import close_browser_client, get_browser_client
 from src.config import Settings
@@ -110,6 +114,96 @@ def is_flru_project_page_closed(html_or_text: str) -> bool:
     return is_flru_project_closed(flru_project_closed_scope(html_or_text))
 
 
+# Money: «Оплата: 5 000 ₽ – 10 000 ₽» / «5000 руб» / «по договоренности»
+_FLRU_CURRENCY = r"(?:₽|руб\.?)"
+_FLRU_AMOUNT = r"(\d[\d\s\u00a0]*)"
+_FLRU_RANGE_SEP = r"(?:\s*[–—−-]\s*|\s+до\s+)"
+_FLRU_NEGO_RE = re.compile(r"по\s+договоренности", re.I)
+_FLRU_RANGE_BOTH_CUR_RE = re.compile(
+    rf"{_FLRU_AMOUNT}\s*{_FLRU_CURRENCY}{_FLRU_RANGE_SEP}{_FLRU_AMOUNT}\s*{_FLRU_CURRENCY}",
+    re.I,
+)
+_FLRU_RANGE_ONE_CUR_RE = re.compile(
+    rf"{_FLRU_AMOUNT}{_FLRU_RANGE_SEP}{_FLRU_AMOUNT}\s*{_FLRU_CURRENCY}",
+    re.I,
+)
+_FLRU_SINGLE_RE = re.compile(rf"{_FLRU_AMOUNT}\s*{_FLRU_CURRENCY}", re.I)
+# JS snippet shared by listing/detail extractors (keep in sync with Python helpers).
+_FLRU_MONEY_JS = r"""
+  const normMoney = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const digitsOnly = (s) => String(s || '').replace(/[^\d]/g, '');
+  const fmtRub = (s) => {
+    const d = digitsOnly(s);
+    return d ? (d + ' руб') : null;
+  };
+  const parseMoneyPair = (text) => {
+    const t = normMoney(text || '');
+    if (!t) return { desired: null, max: null, display: null };
+    if (/по\s+договоренности/i.test(t)) {
+      return { desired: 'по договоренности', max: 'по договоренности', display: 'по договоренности' };
+    }
+    let m = t.match(/(\d[\d\s\u00a0]*)\s*(?:₽|руб\.?)\s*[–—−-]\s*(\d[\d\s\u00a0]*)\s*(?:₽|руб\.?)/i)
+      || t.match(/(\d[\d\s\u00a0]*)\s*(?:₽|руб\.?)\s+до\s+(\d[\d\s\u00a0]*)\s*(?:₽|руб\.?)/i)
+      || t.match(/(\d[\d\s\u00a0]*)\s*[–—−-]\s*(\d[\d\s\u00a0]*)\s*(?:₽|руб\.?)/i)
+      || t.match(/(\d[\d\s\u00a0]*)\s+до\s+(\d[\d\s\u00a0]*)\s*(?:₽|руб\.?)/i);
+    if (m) {
+      const lo = fmtRub(m[1]);
+      const hi = fmtRub(m[2]);
+      return { desired: lo, max: hi || lo, display: normMoney(m[0]) };
+    }
+    m = t.match(/(\d[\d\s\u00a0]*)\s*(?:₽|руб\.?)/i);
+    if (m) {
+      const one = fmtRub(m[1]);
+      return { desired: one, max: one, display: normMoney(m[0]) };
+    }
+    return { desired: null, max: null, display: null };
+  };
+"""
+
+
+def _flru_norm_amount(raw: str) -> str | None:
+    digits = re.sub(r"[^\d]", "", raw or "")
+    if not digits:
+        return None
+    return f"{digits} руб"
+
+
+def parse_flru_money_fields(text: str) -> tuple[str | None, str | None]:
+    """Parse FL payment text → (desired_budget, max_budget).
+
+    Range with ₽/руб and separators –—−- / «до» → desired=lo, max=hi.
+    Single amount → desired=max. Keeps «по договоренности».
+    """
+    raw = re.sub(r"[\s\u00a0]+", " ", (text or "")).strip()
+    if not raw:
+        return None, None
+    if _FLRU_NEGO_RE.search(raw):
+        return "по договоренности", "по договоренности"
+    m = _FLRU_RANGE_BOTH_CUR_RE.search(raw) or _FLRU_RANGE_ONE_CUR_RE.search(raw)
+    if m:
+        lo = _flru_norm_amount(m.group(1))
+        hi = _flru_norm_amount(m.group(2))
+        if lo and hi:
+            return lo, hi
+        return lo or hi, hi or lo
+    m = _FLRU_SINGLE_RE.search(raw)
+    if m:
+        one = _flru_norm_amount(m.group(1))
+        return one, one
+    return None, None
+
+
+def parse_flru_budget_display(text: str) -> str | None:
+    """Single budget_text for listing cards (range or single or negotiable)."""
+    desired, max_b = parse_flru_money_fields(text)
+    if desired and max_b and desired != max_b:
+        # Keep human-readable range in card budget_text when both ends present.
+        lo = desired.replace(" руб", "")
+        hi = max_b.replace(" руб", "")
+        return f"{lo} – {hi} руб"
+    return desired
+
+
 def extract_project_offers_count(text: str) -> int | None:
     """Project-page offers: prefer «Откликнулись: N».
 
@@ -134,16 +228,18 @@ def extract_project_offers_count(text: str) -> int | None:
     return None
 
 
-LISTING_EXTRACTOR_JS = """
-() => {
-  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-  const isClosed = (t) => /(?:исполнитель\\s+определ|выбрал\\s+исполнител|исполнитель\\s+выбран)/i.test(t || '');
+LISTING_EXTRACTOR_JS = (
+    "() => {\n"
+    + _FLRU_MONEY_JS
+    + r"""
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const isClosed = (t) => /(?:исполнитель\s+определ|выбрал\s+исполнител|исполнитель\s+выбран)/i.test(t || '');
   const seen = new Set();
   const cards = [];
   const links = [...document.querySelectorAll('a[href*="/projects/"]')];
   for (const link of links) {
     const href = link.getAttribute('href') || '';
-    const m = href.match(/\\/projects\\/(\\d{5,9})/);
+    const m = href.match(/\/projects\/(\d{5,9})/);
     if (!m) continue;
     const id = m[1];
     if (seen.has(id)) continue;
@@ -160,13 +256,16 @@ LISTING_EXTRACTOR_JS = """
       card?.querySelector('h2, h3, [class*="title"]') || link;
     let title = norm(titleEl?.textContent || link.textContent);
     if (!title || title.length < 3) title = `Проект ${id}`;
-    const budgetMatch = cardText.match(
-      /(?:^|\\s)(по договоренности|\\d[\\d\\s]*\\s*руб)/i
-    );
-    const budget_text = budgetMatch ? norm(budgetMatch[1]) : null;
+    const money = parseMoneyPair(cardText);
+    let budget_text = money.display;
+    if (money.desired && money.max && money.desired !== money.max) {
+      budget_text = money.desired.replace(' руб', '') + ' – ' + money.max.replace(' руб', '') + ' руб';
+    } else if (money.desired) {
+      budget_text = money.desired;
+    }
     const respMatch =
-      cardText.match(/(\\d+)\\s+ответ/i) ||
-      cardText.match(/(\\d+)\\s+отклик/i);
+      cardText.match(/(\d+)\s+ответ/i) ||
+      cardText.match(/(\d+)\s+отклик/i);
     const responses_count = respMatch ? parseInt(respMatch[1], 10) : null;
     const url = href.startsWith('http')
       ? href.split('?')[0]
@@ -183,17 +282,20 @@ LISTING_EXTRACTOR_JS = """
   return cards;
 }
 """
+)
 
-PROJECT_EXTRACTOR_JS = """
-() => {
-  const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
-  const pathId = (location.pathname.match(/\\/projects\\/(\\d{5,9})/) || [])[1] || null;
+PROJECT_EXTRACTOR_JS = (
+    "() => {\n"
+    + _FLRU_MONEY_JS
+    + r"""
+  const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const pathId = (location.pathname.match(/\/projects\/(\d{5,9})/) || [])[1] || null;
   const title =
     norm(document.querySelector('h1')?.textContent) ||
     norm(document.querySelector('[class*="title"]')?.textContent) ||
-    norm(document.title).replace(/\\s*[|·—-].*$/i, '');
+    norm(document.title).replace(/\s*[|·—-].*$/i, '');
 
-  const closedRe = /(?:исполнитель\\s+определ|выбрал\\s+исполнител|исполнитель\\s+выбран)/i;
+  const closedRe = /(?:исполнитель\s+определ|выбрал\s+исполнител|исполнитель\s+выбран)/i;
   const scopeRoot = document.body ? document.body.cloneNode(true) : null;
   if (scopeRoot) {
     scopeRoot.querySelectorAll(
@@ -201,7 +303,7 @@ PROJECT_EXTRACTOR_JS = """
     ).forEach((el) => el.remove());
   }
   let closedScope = (scopeRoot?.innerText || document.body?.innerText || '');
-  const relatedCut = closedScope.search(/другие\\s+заказ|похожие\\s+(?:заказ|проект)|рекоменд/i);
+  const relatedCut = closedScope.search(/другие\s+заказ|похожие\s+(?:заказ|проект)|рекоменд/i);
   if (relatedCut > 0) closedScope = closedScope.slice(0, relatedCut);
   const closed = closedRe.test(closedScope);
   const descCandidates = [
@@ -220,28 +322,23 @@ PROJECT_EXTRACTOR_JS = """
   }
 
   const bodyText = document.body?.innerText || '';
-  const moneyRe = /(\\d[\\d\\s]*)\\s*руб|по договоренности/gi;
-  const moneyBits = [];
-  let mm;
-  while ((mm = moneyRe.exec(bodyText)) && moneyBits.length < 6) {
-    moneyBits.push(norm(mm[0]));
-  }
-  const desired_budget = moneyBits[0] || null;
-  const max_budget = moneyBits.length > 1 ? moneyBits[1] : desired_budget;
+  const money = parseMoneyPair(bodyText);
+  const desired_budget = money.desired;
+  const max_budget = money.max || money.desired;
 
   let offers_count = null;
-  const otkliknulis = bodyText.match(/Откликнулись:\\s*(\\d+)/i);
+  const otkliknulis = bodyText.match(/Откликнулись:\s*(\d+)/i);
   if (otkliknulis) {
     offers_count = parseInt(otkliknulis[1], 10);
   } else {
-    const statsWin = bodyText.match(/Статистика[\\s\\S]{0,400}/i);
+    const statsWin = bodyText.match(/Статистика[\s\S]{0,400}/i);
     if (statsWin) {
       const region = statsWin[0];
-      const otklik = region.match(/(\\d+)\\s+отклик\\w*/i);
+      const otklik = region.match(/(\d+)\s+отклик\w*/i);
       if (otklik) {
         offers_count = parseInt(otklik[1], 10);
       } else {
-        const otvet = region.match(/(\\d+)\\s+ответ\\w*/i);
+        const otvet = region.match(/(\d+)\s+ответ\w*/i);
         if (otvet) offers_count = parseInt(otvet[1], 10);
       }
     }
@@ -274,6 +371,7 @@ PROJECT_EXTRACTOR_JS = """
   };
 }
 """
+)
 
 
 class FlruAuthError(RuntimeError):
@@ -331,6 +429,7 @@ def fetch_flru_html(
     storage_state_path: str | Path | None = None,
     timeout_s: float = 40.0,
     use_cookies: bool = True,
+    proxy_url: str | None = None,
 ) -> str:
     """HTTP GET fl.ru HTML (Chromium page.goto often hangs on /projects/*)."""
     headers = {
@@ -342,7 +441,10 @@ def fetch_flru_html(
         cookie = cookie_header_from_storage(storage_state_path)
         if cookie:
             headers["Cookie"] = cookie
-    with httpx.Client(timeout=timeout_s, follow_redirects=True) as client:
+    proxy = (proxy_url or "").strip() or None
+    with httpx.Client(
+        timeout=timeout_s, follow_redirects=True, proxy=proxy
+    ) as client:
         resp = client.get(url, headers=headers)
         final = str(resp.url)
         if _is_login_url(final):
@@ -360,6 +462,7 @@ def fetch_flru_html_resilient(
     storage_state_path: str | Path | None = None,
     timeout_s: float = 40.0,
     prefer_anonymous: bool = False,
+    proxy_url: str | None = None,
 ) -> str:
     """GET listing/project HTML; anonymous first when cookies stall on VPS."""
     order = (False, True) if prefer_anonymous else (True, False)
@@ -371,6 +474,7 @@ def fetch_flru_html_resilient(
                 storage_state_path=storage_state_path,
                 timeout_s=timeout_s,
                 use_cookies=use_cookies,
+                proxy_url=proxy_url,
             )
         except FlruAuthError:
             raise
@@ -423,14 +527,7 @@ def parse_listing_from_html(html: str, *, skip_closed: bool = True) -> list[dict
         tm = re.search(r">([^<]{5,200})</a>", window, flags=re.I)
         if tm:
             title = re.sub(r"\s+", " ", tm.group(1)).strip()
-        budget = None
-        bm = re.search(
-            r"(по договоренности|\d[\d\s]*\s*руб)",
-            window,
-            flags=re.I,
-        )
-        if bm:
-            budget = re.sub(r"\s+", " ", bm.group(1)).strip()
+        budget = parse_flru_budget_display(window)
         responses = None
         rm = re.search(r"(\d+)\s+(?:ответ|отклик)", window, flags=re.I)
         if rm:
@@ -485,14 +582,11 @@ def parse_project_from_html(html: str, project_id: str | None = None) -> dict[st
             if len(text) > len(desc):
                 desc = text
 
-    money = re.findall(
-        r"(?:по договоренности|\d[\d\s]*\s*руб)",
-        html,
-        flags=re.I,
-    )
-    money = [re.sub(r"\s+", " ", x).strip() for x in money[:4]]
-    desired = money[0] if money else None
-    max_b = money[1] if len(money) > 1 else desired
+    # Prefer visible text over raw HTML attrs (avoids JS noise).
+    plain = re.sub(r"<script\b[^>]*>.*?</script>", " ", html, flags=re.I | re.DOTALL)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    plain = re.sub(r"\s+", " ", plain)
+    desired, max_b = parse_flru_money_fields(plain)
 
     offers = extract_project_offers_count(html)
 
@@ -542,23 +636,26 @@ class FlruAdapter:
         self.filters = filters or {}
         self._browser = browser
         self._owns_browser = browser is None
+        self.last_scan_via: str | None = None
 
     def _storage_path(self) -> str | None:
         path = (self.settings.flru_storage_state or "").strip()
         return path or None
 
+    def _proxy_url(self) -> str | None:
+        return (
+            (self.settings.flru_proxy or "").strip()
+            or (self.settings.tg_user_proxy or "").strip()
+            or None
+        )
+
     def _get_browser(self) -> Any:
         if self._browser is None:
             storage = self._storage_path()
-            proxy = (
-                (self.settings.flru_proxy or "").strip()
-                or (self.settings.tg_user_proxy or "").strip()
-                or None
-            )
             self._browser = get_browser_client(
                 self.settings,
                 storage_state_path=storage,
-                proxy_url=proxy,
+                proxy_url=self._proxy_url(),
             )
             self._owns_browser = True
         return self._browser
@@ -587,6 +684,14 @@ class FlruAdapter:
         if bool(self.filters.get("for_all", True)):
             url = ensure_flru_for_all(url)
         return url
+
+    def _listing_pages(self) -> int:
+        raw = self.filters.get("listing_pages")
+        if isinstance(raw, int):
+            pages = raw
+        else:
+            pages = int(getattr(self.settings, "flru_listing_pages", 3))
+        return max(1, min(5, pages))
 
     def _ensure_for_all_filter(self, browser: Any) -> None:
         if not bool(self.filters.get("for_all", True)):
@@ -638,7 +743,7 @@ class FlruAdapter:
 
     def _auth_fetch_html(self, url: str) -> str:
         # Skip APIRequestContext: DDoS-Guard JS hangs request_get ~25s on fl.ru.
-        # Page /messages/ + same-origin fetch is the reliable auth path.
+        # Warm origin + same-origin fetch; auth_http is scan_new fallback.
         try:
             return self._page_auth_fetch_html(url)
         except FlruAuthError:
@@ -647,16 +752,13 @@ class FlruAdapter:
             msg = str(exc).splitlines()[0].strip() or exc.__class__.__name__
             raise RuntimeError(f"flru_auth_fetch_failed: {msg[:200]}") from exc
 
-    def _page_auth_fetch_html(self, url: str) -> str:
-        """Logged-in fetch via /messages/ (page.goto /projects/* hangs on VPS).
+    def _warm_auth_origin(self, browser: Any) -> None:
+        """Warm site origin (not /messages/).
 
-        Always re-opens inbox first so DDoS-Guard can mint fresh ``__ddg*``
-        cookies; stale ones make ``fetch`` throw ``TypeError: Failed to fetch``.
-        Uses a same-origin path when possible and catches JS fetch errors.
+        Inbox warm + same-origin fetch trips WAF (Failed to fetch) on some
+        proxy exits; root origin still lets login cookies / ddg mint work.
         """
-        browser = self._get_browser()
-        # Warm origin + refresh short-lived DDoS-Guard cookies every time.
-        browser.navigate(INBOX_URL)
+        browser.navigate(f"{FLRU_ORIGIN}/")
         if hasattr(browser, "wait_ms"):
             browser.wait_ms(1500)
         self._ensure_logged_in(browser)
@@ -665,7 +767,9 @@ class FlruAdapter:
             raise FlruAuthError(
                 f"flru_auth_fetch_bad_origin: {cur[:120] or 'empty'}"
             )
-        # Prefer relative path on www.fl.ru to avoid opaque-origin CORS failures.
+
+    def _same_origin_fetch_html(self, browser: Any, url: str) -> str:
+        """Same-origin fetch from already-warmed page (no re-navigate)."""
         fetch_target = url
         if url.startswith(FLRU_ORIGIN):
             fetch_target = url[len(FLRU_ORIGIN) :] or "/"
@@ -715,6 +819,18 @@ class FlruAdapter:
             raise RuntimeError(
                 f"flru_auth_fetch_empty status={result.get('status')}"
             )
+        return text
+
+    def _page_auth_fetch_html(self, url: str) -> str:
+        """Logged-in fetch via warmed origin (page.goto /projects/* hangs on VPS).
+
+        Re-opens site root so DDoS-Guard can mint fresh ``__ddg*`` cookies;
+        stale ones make ``fetch`` throw ``TypeError: Failed to fetch``.
+        Uses a same-origin path when possible and catches JS fetch errors.
+        """
+        browser = self._get_browser()
+        self._warm_auth_origin(browser)
+        text = self._same_origin_fetch_html(browser, url)
         # Persist refreshed DDoS-Guard cookies after a successful auth fetch.
         save = getattr(browser, "save_storage_state", None)
         if callable(save):
@@ -724,25 +840,117 @@ class FlruAdapter:
                 logger.warning("flru_storage_save_after_auth_failed", exc_info=True)
         return text
 
+    def _merge_raw_cards(
+        self, batches: list[list[dict[str, Any]]]
+    ) -> list[dict[str, Any]]:
+        """Dedupe by project_id, preserve first-seen order (page1 first)."""
+        seen: set[str] = set()
+        merged: list[dict[str, Any]] = []
+        for batch in batches:
+            for item in batch:
+                if not isinstance(item, dict):
+                    continue
+                pid = str(item.get("project_id") or "").strip()
+                if not pid or pid in seen:
+                    continue
+                seen.add(pid)
+                merged.append(item)
+        return merged
+
     def _scan_via_auth_fetch(self, *, skip_closed: bool) -> list[ProjectPreview]:
         # Auth + for_all listing excludes paid-response projects.
-        html = self._auth_fetch_html(self._listing_url())
-        raw_cards = parse_listing_from_html(html, skip_closed=skip_closed)
+        # Warm inbox once, then same-origin fetch pages 1..N.
+        pages = self._listing_pages()
+        base = self._listing_url()
+        browser = self._get_browser()
+        try:
+            self._warm_auth_origin(browser)
+            batches: list[list[dict[str, Any]]] = []
+            for page in range(1, pages + 1):
+                page_url = flru_listing_page_url(base, page)
+                html = self._same_origin_fetch_html(browser, page_url)
+                batches.append(parse_listing_from_html(html, skip_closed=skip_closed))
+            save = getattr(browser, "save_storage_state", None)
+            if callable(save):
+                try:
+                    save()
+                except Exception:
+                    logger.warning(
+                        "flru_storage_save_after_auth_failed", exc_info=True
+                    )
+        except FlruAuthError:
+            raise
+        except Exception as exc:
+            msg = str(exc).splitlines()[0].strip() or exc.__class__.__name__
+            raise RuntimeError(f"flru_auth_fetch_failed: {msg[:200]}") from exc
+
+        raw_cards = self._merge_raw_cards(batches)
         free_default = True if bool(self.filters.get("for_all", True)) else None
-        return self._previews_from_cards(
+        previews = self._previews_from_cards(
             raw_cards, requires_paid_response=False if free_default else None
         )
+        self.last_scan_via = "auth_fetch"
+        logger.info(
+            "flru_scan source=%s cards=%d pages=%d via=auth_fetch",
+            self.source_key,
+            len(previews),
+            pages,
+        )
+        return previews
+
+    def _scan_via_auth_http(self, *, skip_closed: bool) -> list[ProjectPreview]:
+        # Logged-in cookies + proxy; never anonymous. for_all → paid=False.
+        pages = self._listing_pages()
+        base = self._listing_url()
+        batches: list[list[dict[str, Any]]] = []
+        for page in range(1, pages + 1):
+            page_url = flru_listing_page_url(base, page)
+            html = fetch_flru_html_resilient(
+                page_url,
+                storage_state_path=self._storage_path(),
+                prefer_anonymous=False,
+                proxy_url=self._proxy_url(),
+            )
+            batches.append(parse_listing_from_html(html, skip_closed=skip_closed))
+        raw_cards = self._merge_raw_cards(batches)
+        free_default = True if bool(self.filters.get("for_all", True)) else None
+        previews = self._previews_from_cards(
+            raw_cards, requires_paid_response=False if free_default else None
+        )
+        self.last_scan_via = "auth_http"
+        logger.info(
+            "flru_scan source=%s cards=%d pages=%d via=auth_http",
+            self.source_key,
+            len(previews),
+            pages,
+        )
+        return previews
 
     def _scan_via_http(self, *, skip_closed: bool) -> list[ProjectPreview]:
         # Guest for_all=1 does NOT filter paid projects — mark unknown.
         prefer_anon = bool(self.filters.get("for_all", True))
-        html = fetch_flru_html_resilient(
-            self._listing_url(),
-            storage_state_path=self._storage_path(),
-            prefer_anonymous=prefer_anon,
+        pages = self._listing_pages()
+        base = self._listing_url()
+        batches: list[list[dict[str, Any]]] = []
+        for page in range(1, pages + 1):
+            page_url = flru_listing_page_url(base, page)
+            html = fetch_flru_html_resilient(
+                page_url,
+                storage_state_path=self._storage_path(),
+                prefer_anonymous=prefer_anon,
+                proxy_url=self._proxy_url(),
+            )
+            batches.append(parse_listing_from_html(html, skip_closed=skip_closed))
+        raw_cards = self._merge_raw_cards(batches)
+        previews = self._previews_from_cards(raw_cards, requires_paid_response=None)
+        self.last_scan_via = "http"
+        logger.info(
+            "flru_scan source=%s cards=%d pages=%d via=http",
+            self.source_key,
+            len(previews),
+            pages,
         )
-        raw_cards = parse_listing_from_html(html, skip_closed=skip_closed)
-        return self._previews_from_cards(raw_cards, requires_paid_response=None)
+        return previews
 
     def _scan_via_browser(self, *, skip_closed: bool) -> list[ProjectPreview]:
         browser = self._get_browser()
@@ -758,52 +966,68 @@ class FlruAdapter:
                 snapshot, skip_closed=skip_closed
             )
         free_default = True if bool(self.filters.get("for_all", True)) else None
-        return self._previews_from_cards(
+        previews = self._previews_from_cards(
             raw_cards if isinstance(raw_cards, list) else [],
             requires_paid_response=False if free_default else None,
         )
+        self.last_scan_via = "browser"
+        return previews
 
     def scan_new(
         self, *, allow_guest_fallback: bool = True
     ) -> list[ProjectPreview]:
         skip_closed = bool(self.filters.get("skip_closed", True))
-        # Prefer auth fetch from /messages/: guest HTTP ignores for_all filter.
+        # Prefer page auth fetch; on WAF/Failed to fetch → auth HTTP+proxy;
+        # guest HTTP only when allow_guest_fallback (early_scan keeps False).
+        auth_fetch_err: BaseException | None = None
         try:
             previews = self._scan_via_auth_fetch(skip_closed=skip_closed)
             if previews:
-                logger.info(
-                    "flru_scan source=%s cards=%d via=auth_fetch",
-                    self.source_key,
-                    len(previews),
-                )
                 return previews
-            if not allow_guest_fallback:
-                raise FlruAuthError("flru_auth_fetch_empty")
             logger.warning(
-                "flru_scan_auth_empty source=%s — fallback http",
+                "flru_scan_auth_empty source=%s — try auth_http",
                 self.source_key,
             )
         except FlruAuthError:
             raise
         except Exception as auth_exc:
-            if not allow_guest_fallback:
-                raise FlruAuthError(
-                    f"flru_auth_fetch_failed: {auth_exc}"
-                ) from auth_exc
+            auth_fetch_err = auth_exc
             logger.warning(
-                "flru_scan_auth_failed source=%s err=%s — fallback http",
+                "flru_scan_auth_failed source=%s err=%s — try auth_http",
                 self.source_key,
                 str(auth_exc)[:200],
             )
 
         try:
+            previews = self._scan_via_auth_http(skip_closed=skip_closed)
+            if previews:
+                return previews
+            if not allow_guest_fallback:
+                raise FlruAuthError(
+                    "flru_auth_fetch_empty"
+                    if auth_fetch_err is None
+                    else f"flru_auth_fetch_failed: {auth_fetch_err}"
+                )
+            logger.warning(
+                "flru_scan_auth_http_empty source=%s — fallback http",
+                self.source_key,
+            )
+        except FlruAuthError:
+            raise
+        except Exception as auth_http_exc:
+            if not allow_guest_fallback:
+                raise FlruAuthError(
+                    f"flru_auth_fetch_failed: {auth_fetch_err or auth_http_exc}"
+                ) from auth_http_exc
+            logger.warning(
+                "flru_scan_auth_http_failed source=%s err=%s — fallback http",
+                self.source_key,
+                str(auth_http_exc)[:200],
+            )
+
+        try:
             previews = self._scan_via_http(skip_closed=skip_closed)
             if previews:
-                logger.info(
-                    "flru_scan source=%s cards=%d via=http",
-                    self.source_key,
-                    len(previews),
-                )
                 return previews
             logger.warning(
                 "flru_scan_http_empty source=%s — fallback browser",
@@ -833,13 +1057,45 @@ class FlruAdapter:
         )
         return previews
 
-    def _project_full_from_raw(self, pid: str, url: str, raw: dict[str, Any]) -> ProjectFull:
+    def _enrich_desc(
+        self,
+        desc: str,
+        *,
+        html: str | None = None,
+        browser: Any | None = None,
+    ) -> str:
+        try:
+            from src.adapters.flru_attachments import (
+                enrich_description_with_attachments,
+            )
+
+            return enrich_description_with_attachments(
+                desc,
+                html=html,
+                browser=browser,
+                storage_state_path=self._storage_path(),
+                proxy_url=self._proxy_url(),
+            )
+        except Exception:
+            logger.exception("flru_enrich_attachments_outer_failed")
+            return desc
+
+    def _project_full_from_raw(
+        self,
+        pid: str,
+        url: str,
+        raw: dict[str, Any],
+        *,
+        html: str | None = None,
+        browser: Any | None = None,
+    ) -> ProjectFull:
         if raw.get("closed"):
             raise FlruProjectClosed(
                 "flru_project_closed: исполнитель уже определён"
             )
         title = str(raw.get("title") or "").strip()
         desc = str(raw.get("full_description") or "").strip()
+        desc = self._enrich_desc(desc, html=html, browser=browser)
         paid = raw.get("requires_paid_response")
         if not isinstance(paid, bool):
             paid = None
@@ -863,7 +1119,14 @@ class FlruAdapter:
         raw = parse_project_from_html(html, project_id=pid)
         if raw.get("requires_paid_response") is None:
             raw["requires_paid_response"] = detect_flru_requires_paid_response(html)
-        return self._project_full_from_raw(pid, url, raw)
+        browser = None
+        try:
+            browser = self._browser
+        except Exception:
+            browser = None
+        return self._project_full_from_raw(
+            pid, url, raw, html=html, browser=browser
+        )
 
     def _read_full_via_http(self, pid: str, url: str) -> ProjectFull:
         html = fetch_flru_html_resilient(
@@ -872,7 +1135,7 @@ class FlruAdapter:
             prefer_anonymous=True,
         )
         raw = parse_project_from_html(html, project_id=pid)
-        return self._project_full_from_raw(pid, url, raw)
+        return self._project_full_from_raw(pid, url, raw, html=html)
 
     def read_full(self, project_id: str) -> ProjectFull:
         pid = str(project_id).strip()
@@ -924,6 +1187,7 @@ class FlruAdapter:
             )
 
         browser = self._get_browser()
+        html: str | None = None
         try:
             # Avoid hung goto /projects/* — reuse auth fetch when possible.
             try:
@@ -935,8 +1199,13 @@ class FlruAdapter:
                     browser.wait_ms(2000)
                 self._ensure_logged_in(browser)
                 raw = browser.evaluate(PROJECT_EXTRACTOR_JS)
+                try:
+                    html = browser.snapshot() or None
+                except Exception:
+                    html = None
                 if not isinstance(raw, dict) or not str(raw.get("title") or "").strip():
-                    snapshot = browser.snapshot()
+                    snapshot = html or browser.snapshot()
+                    html = snapshot
                     raw = parse_project_from_html(snapshot, project_id=pid)
                 self._ensure_logged_in(browser)
         except FlruAuthError:
@@ -958,7 +1227,9 @@ class FlruAdapter:
             pid,
             raw.get("requires_paid_response"),
         )
-        return self._project_full_from_raw(pid, url, raw)
+        return self._project_full_from_raw(
+            pid, url, raw, html=html, browser=browser
+        )
 
     def submit_response(
         self, project_id: str, text: str, price: str | None

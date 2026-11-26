@@ -24,7 +24,8 @@ sources:
   - id: flru_orders
     platform: flru
     enabled: true
-    url: https://www.fl.ru/projects/?kind=1&for_all=1
+    # kind=5 = «Лента заказов»; kind=1 under auth has no page>1 (404, ~19 cards only)
+    url: https://www.fl.ru/projects/?kind=5&for_all=1
     scan_interval_minutes: 30
     bootstrap: true
     filters:

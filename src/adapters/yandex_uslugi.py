@@ -831,6 +831,21 @@ class YandexUslugiAdapter:
         desc = sanitize_yandex_order_description(
             str(raw.get("full_description") or "").strip()
         )
+        try:
+            from src.adapters.yandex_attachments import (
+                enrich_description_with_attachments,
+            )
+
+            html_snap = None
+            try:
+                html_snap = browser.snapshot()
+            except Exception:
+                html_snap = None
+            desc = enrich_description_with_attachments(
+                desc, html=html_snap, browser=browser
+            )
+        except Exception:
+            logger.exception("yandex_enrich_attachments_outer_failed")
         return ProjectFull(
             platform=self.platform_id,
             source_key=self.source_key,

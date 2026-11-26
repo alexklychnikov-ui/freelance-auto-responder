@@ -114,6 +114,9 @@ async def test_fl_check_commands_trigger_handler(command: str) -> None:
     await bot.dispatcher.feed_update(bot.bot, _make_update(command))
 
     fl_check_handler.assert_awaited_once()
+    assert fl_check_handler.await_args.kwargs.get("repair") is (
+        command == "/repair"
+    )
     await bot.close()
 
 
@@ -164,6 +167,9 @@ async def test_start_command_buttons_trigger_fl_check(
     )
 
     fl_check_handler.assert_awaited_once()
+    assert fl_check_handler.await_args.kwargs.get("repair") is (
+        callback_data == CALLBACK_COMMAND_REPAIR
+    )
     await bot.close()
 
 
@@ -717,7 +723,8 @@ async def test_start_clears_corr_awaiting() -> None:
         "/report",
     ):
         assert command in request.text
-    assert "проверяет авторизацию, auth_fetch и early scan FL.ru" in request.text
+    assert "попытка восстановления FL.ru" in request.text
+    assert "диагностика" in request.text
     assert "показывает последние отчёты сканирования" in request.text
     assert "<id/URL>" not in request.text
     assert "<текст>" not in request.text

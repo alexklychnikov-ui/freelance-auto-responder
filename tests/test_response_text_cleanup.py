@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from src.adapters.kwork import _strip_stage_title_leakage
 from src.analyzer.response_text import (
+    clean_link_strip_collateral,
     diversify_mini_proof,
     ensure_hello_greeting,
     finalize_response_text,
@@ -59,6 +60,38 @@ def test_strip_github_and_portfolio_footer() -> None:
     out = finalize_response_text(text)
     assert "github" not in out.lower()
     assert "portfolio.hayklyvibelexy.ru" not in out
+    assert "См. и" not in out
+
+
+def test_keeps_conjunction_before_capital_tech() -> None:
+    """«и» before Capital/tech names must survive collateral cleanup."""
+    prose = "Стек: Python, vkbottle и Docker, плюс FSM."
+    assert "vkbottle и Docker" in clean_link_strip_collateral(prose)
+    assert "и FSM" in clean_link_strip_collateral("бот на aiogram и FSM")
+    text = (
+        "Здравствуйте! Сделаю бота на vkbottle и Docker. "
+        "Состояния через FSM. Срок — 7 дней."
+    )
+    out = finalize_response_text(text)
+    assert "vkbottle и Docker" in out
+    assert "через FSM" in out
+
+
+def test_finalize_strips_links_without_broken_see_and() -> None:
+    text = (
+        "Кейс по боту готов. "
+        "См. github.com/alexklychnikov-ui и https://github.com/foo/bar. "
+        "Могу обсудить детали в чате.\n"
+        "Портфолио: https://portfolio.hayklyvibelexy.ru/"
+    )
+    out = finalize_response_text(text)
+    low = out.lower()
+    assert "github" not in low
+    assert "portfolio.hayklyvibelexy.ru" not in low
+    assert "См. и" not in out
+    assert "см. и" not in low
+    assert "Кейс по боту" in out
+    assert "обсудить детали" in out
 
 
 def test_payment_mismatch_when_tz_lead_only() -> None:
@@ -78,7 +111,10 @@ def test_strip_portfolio_footer_only() -> None:
 
 def test_strip_github_links() -> None:
     text = "См. github.com/alexklychnikov-ui и https://github.com/foo/bar"
-    assert strip_github_links(text) == "См. и"
+    out = strip_github_links(text)
+    assert "github" not in out.lower()
+    assert out == ""
+    assert "См. и" not in out
 
 
 def test_strip_hallucinated_irina_when_no_buyer() -> None:

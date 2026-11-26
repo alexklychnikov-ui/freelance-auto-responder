@@ -27,10 +27,15 @@ _TARGET_RE = re.compile(
     re.IGNORECASE,
 )
 _CHECKLIST_HEADER_RE = re.compile(
-    r"(?:просьба\s+)?(?:при|в)\s+отклике\s+(?:сразу\s+)?(?:прошу\s+)?(?:укажите|указать)",
+    r"(?:просьба\s+)?(?:при|в)\s+отклике\s+(?:сразу\s+)?"
+    r"(?:"
+    r"напишите|ответьте|укажи(?:те)?|указать|"
+    r"нужно\s+указать|прошу\s+указать"
+    r")",
     re.I,
 )
 _CHECKLIST_ITEM_RE = re.compile(r"^\s*\d+[\.\):\-]\s*(.+)", re.MULTILINE)
+_NUMBERED_MARKER_RE = re.compile(r"\d+[\.\)\:]\s*")
 _MAX_NUMBERED_ITEMS = 15
 _POST_LAUNCH_ITEM_RE = re.compile(r"расход|после запуска|хостинг|абонент|saas", re.I)
 _HOSTING_COST_RE = re.compile(r"хостинг|vps|сервер|домен|подписк|saas|абонент", re.I)
@@ -60,6 +65,29 @@ def build_project_brief(project: ProjectFull) -> str:
     return title
 
 
+def _extract_inline_numbered_items(section: str) -> list[str]:
+    """Numbered items on one line (optionally after a leading colon)."""
+    s = (section or "").strip()
+    if not s:
+        return []
+    if s.startswith(":"):
+        s = s[1:].strip()
+    # Stay within the first paragraph after the header.
+    s = re.split(r"\n\s*\n", s, maxsplit=1)[0].strip()
+    matches = list(_NUMBERED_MARKER_RE.finditer(s))
+    if not matches or matches[0].start() != 0:
+        return []
+    items: list[str] = []
+    for i, marker in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(s)
+        cleaned = _clean_checklist_item(s[marker.end() : end])
+        if cleaned:
+            items.append(cleaned)
+        if len(items) >= _MAX_NUMBERED_ITEMS:
+            break
+    return items
+
+
 def _extract_numbered_block(text: str, *, start_at: int = 0) -> list[str]:
     """First contiguous numbered list in text[start_at:], up to _MAX_NUMBERED_ITEMS."""
     section = text[start_at:] if start_at else text
@@ -69,6 +97,16 @@ def _extract_numbered_block(text: str, *, start_at: int = 0) -> list[str]:
         stripped = line.strip()
         if not stripped:
             if items:
+                break
+            continue
+        # Same-line list: «: 1. … 2. …» or «1. … 2. …» on one line.
+        inline = _extract_inline_numbered_items(stripped)
+        if len(inline) >= 2:
+            return inline[:_MAX_NUMBERED_ITEMS]
+        if not started and inline and re.match(r"^:?\s*\d+[\.\)\:]", stripped):
+            items.extend(inline)
+            started = True
+            if len(items) >= _MAX_NUMBERED_ITEMS:
                 break
             continue
         match = _CHECKLIST_ITEM_RE.match(stripped)
@@ -82,7 +120,10 @@ def _extract_numbered_block(text: str, *, start_at: int = 0) -> list[str]:
             continue
         if started:
             break
-    return items
+    if items:
+        return items
+    # Whole header section on one physical line after «напишите:».
+    return _extract_inline_numbered_items(section)[:_MAX_NUMBERED_ITEMS]
 
 
 def _extract_colon_list_items(text: str, *, start_at: int) -> list[str]:
@@ -93,7 +134,10 @@ def _extract_colon_list_items(text: str, *, start_at: int) -> list[str]:
     if not section:
         return []
     if re.match(r"^\s*\d+[\.\):\-]", section):
-        return _extract_numbered_block(text, start_at=start_at)
+        numbered = _extract_numbered_block(text, start_at=start_at)
+        if numbered:
+            return numbered
+        return _extract_inline_numbered_items(text[start_at:])[:_MAX_NUMBERED_ITEMS]
     items: list[str] = []
     for part in re.split(r"[.;\n]+", section):
         s = _clean_checklist_item(part)

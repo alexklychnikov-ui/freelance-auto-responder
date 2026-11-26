@@ -99,6 +99,41 @@ def strip_ddos_guard_cookies(state: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+def persist_strip_ddos_guard_cookies(path: Path | str) -> int:
+    """Strip ``__ddg*`` from storage_state on disk. Returns dropped count."""
+    p = Path(path)
+    if not str(path).strip() or not p.exists():
+        return 0
+    raw = p.read_text(encoding="utf-8")
+    if not raw.strip():
+        return 0
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        try:
+            data, _end = json.JSONDecoder().raw_decode(raw)
+        except json.JSONDecodeError:
+            logger.error("persist_strip_ddg_unreadable path=%s", p)
+            return 0
+    if not isinstance(data, dict):
+        return 0
+    cookies = data.get("cookies")
+    before = 0
+    if isinstance(cookies, list):
+        before = sum(
+            1
+            for c in cookies
+            if isinstance(c, dict)
+            and str(c.get("name") or "").startswith("__ddg")
+        )
+    if before == 0:
+        return 0
+    cleaned = strip_ddos_guard_cookies(data)
+    _atomic_write_json(p, cleaned)
+    logger.info("persist_strip_ddos_guard_cookies path=%s dropped=%d", p, before)
+    return before
+
+
 def load_storage_state(path: Path) -> dict[str, Any] | None:
     """Load Playwright storage_state; repair trailing garbage from torn writes."""
     if not path.exists():

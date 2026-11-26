@@ -1,18 +1,32 @@
+# Quark platform in product language maps to Kwork adapter (no separate quark module).
 from __future__ import annotations
 
 import logging
-import re
-import zipfile
-from dataclasses import dataclass
-from io import BytesIO
 from typing import Any
-from xml.etree import ElementTree as ET
+
+from src.adapters.attachments_common import (
+    DEFAULT_MAX_CHARS_TOTAL,
+    DEFAULT_MAX_FILES,
+    MAX_ATTACHMENT_BYTES,
+    AttachmentRef,
+    download_via_browser_request,
+    enrich_with_downloaded,
+    extract_text_from_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
-MAX_ATTACHMENT_BYTES = 5_000_000
-DEFAULT_MAX_FILES = 3
-DEFAULT_MAX_CHARS_TOTAL = 20_000
+__all__ = [
+    "AttachmentRef",
+    "DEFAULT_MAX_CHARS_TOTAL",
+    "DEFAULT_MAX_FILES",
+    "MAX_ATTACHMENT_BYTES",
+    "LIST_ATTACHMENTS_JS",
+    "download_attachment",
+    "enrich_description_with_attachments",
+    "extract_text_from_bytes",
+    "list_project_attachments",
+]
 
 LIST_ATTACHMENTS_JS = """
 (() => {
@@ -69,13 +83,6 @@ LIST_ATTACHMENTS_JS = """
 """
 
 
-@dataclass(frozen=True)
-class AttachmentRef:
-    name: str
-    url: str
-    size: int | None = None
-
-
 def list_project_attachments(browser: Any) -> list[AttachmentRef]:
     try:
         raw = browser.evaluate(LIST_ATTACHMENTS_JS)
@@ -112,98 +119,7 @@ def download_attachment(
     *,
     max_size: int = MAX_ATTACHMENT_BYTES,
 ) -> bytes | None:
-    try:
-        ensure = getattr(browser, "_ensure_page", None)
-        if not callable(ensure):
-            return None
-        page = ensure()
-        if page is None or not hasattr(page, "request"):
-            return None
-        resp = page.request.get(url)
-        status = getattr(resp, "status", None)
-        if status is not None and int(status) != 200:
-            logger.warning("attachment_download_bad_status url=%s status=%s", url, status)
-            return None
-        body = resp.body() if callable(getattr(resp, "body", None)) else None
-        if not isinstance(body, (bytes, bytearray)):
-            return None
-        data = bytes(body)
-        if len(data) > max_size:
-            logger.warning(
-                "attachment_too_large url=%s size=%s max=%s",
-                url,
-                len(data),
-                max_size,
-            )
-            return None
-        return data
-    except Exception:
-        logger.exception("attachment_download_failed url=%s", url)
-        return None
-
-
-def _decode_text(data: bytes) -> str:
-    for enc in ("utf-8", "cp1251"):
-        try:
-            return data.decode(enc)
-        except UnicodeDecodeError:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def _extract_pdf(data: bytes) -> str:
-    from pypdf import PdfReader
-
-    reader = PdfReader(BytesIO(data))
-    parts: list[str] = []
-    for page in reader.pages:
-        try:
-            text = page.extract_text() or ""
-        except Exception:
-            text = ""
-        if text.strip():
-            parts.append(text)
-    return "\n".join(parts).strip()
-
-
-def _extract_docx(data: bytes) -> str:
-    try:
-        with zipfile.ZipFile(BytesIO(data)) as zf:
-            xml = zf.read("word/document.xml")
-    except (KeyError, zipfile.BadZipFile, OSError):
-        return ""
-    try:
-        root = ET.fromstring(xml)
-    except ET.ParseError:
-        return re.sub(r"<[^>]+>", " ", xml.decode("utf-8", errors="replace"))
-    texts: list[str] = []
-    for el in root.iter():
-        if el.tag.endswith("}t") and el.text:
-            texts.append(el.text)
-        elif el.tag.endswith("}tab"):
-            texts.append("\t")
-        elif el.tag.endswith("}br") or el.tag.endswith("}cr"):
-            texts.append("\n")
-        elif el.tag.endswith("}p"):
-            texts.append("\n")
-    return re.sub(r"[ \t]+\n", "\n", "".join(texts)).strip()
-
-
-def extract_text_from_bytes(data: bytes, filename: str) -> str:
-    if not data:
-        return ""
-    name = (filename or "").lower().split("?")[0]
-    try:
-        if name.endswith(".pdf"):
-            return _extract_pdf(data)
-        if name.endswith(".docx"):
-            return _extract_docx(data)
-        if name.endswith((".txt", ".md", ".csv", ".log")):
-            return _decode_text(data).strip()
-    except Exception:
-        logger.exception("attachment_extract_failed filename=%s", filename)
-        return ""
-    return ""
+    return download_via_browser_request(browser, url, max_size=max_size)
 
 
 def enrich_description_with_attachments(
@@ -225,35 +141,10 @@ def enrich_description_with_attachments(
         return base
 
     logger.info("attachments_found=%s", len(attachments))
-    chunks: list[str] = []
-    used_chars = 0
-    ok = 0
-
-    for att in attachments[: max(0, int(max_files))]:
-        if used_chars >= max_chars_total:
-            break
-        try:
-            data = download_attachment(browser, att.url)
-            if not data:
-                logger.warning("attachment_download_empty name=%s", att.name)
-                continue
-            text = extract_text_from_bytes(data, att.name)
-            if not text.strip():
-                logger.warning("attachment_extract_empty name=%s", att.name)
-                continue
-            remain = max_chars_total - used_chars
-            clipped = text[:remain]
-            used_chars += len(clipped)
-            chunks.append(f"--- Вложение: {att.name} ---\n{clipped}")
-            ok += 1
-        except Exception:
-            logger.exception("attachment_enrich_item_failed name=%s", att.name)
-            continue
-
-    logger.info("attachments_enriched=%s chars=%s", ok, used_chars)
-    if not chunks:
-        return base
-    suffix = "\n\n".join(chunks)
-    if base.strip():
-        return f"{base.rstrip()}\n\n{suffix}"
-    return suffix
+    return enrich_with_downloaded(
+        base,
+        attachments,
+        lambda att: download_attachment(browser, att.url),
+        max_files=max_files,
+        max_chars_total=max_chars_total,
+    )

@@ -26,6 +26,16 @@ _TEXT_TYPES = (
     "application/xhtml+xml",
 )
 
+_BINARY_EXTRACT_CONTENT_TYPES = (
+    "application/pdf",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+)
+_BINARY_EXTRACT_SUFFIXES = (".pdf", ".docx", ".zip", ".txt", ".md", ".csv", ".json", ".xml")
+
 
 @dataclass
 class SourceContent:
@@ -76,6 +86,33 @@ def _is_text_content_type(content_type: str | None) -> bool:
         "text/xml",
         "application/xhtml+xml",
     }
+
+
+def _filename_hint(url: str, content_type: str | None) -> str:
+    path = (url or "").split("?")[0].rstrip("/")
+    name = path.rsplit("/", 1)[-1] if path else ""
+    if name and "." in name:
+        return name
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if "pdf" in ct:
+        return "file.pdf"
+    if "wordprocessingml" in ct or "msword" in ct:
+        return "file.docx"
+    if "zip" in ct:
+        return "file.zip"
+    return name or "file.bin"
+
+
+def _is_extractable_binary(url: str, content_type: str | None) -> bool:
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct and any(ct == t or ct.startswith(t) for t in _BINARY_EXTRACT_CONTENT_TYPES):
+        # octet-stream only when URL looks like a file we can extract
+        if ct == "application/octet-stream":
+            low = (url or "").split("?")[0].lower()
+            return any(low.endswith(sfx) for sfx in _BINARY_EXTRACT_SUFFIXES)
+        return True
+    low = (url or "").split("?")[0].lower()
+    return any(low.endswith(sfx) for sfx in _BINARY_EXTRACT_SUFFIXES)
 
 
 def _decode_body(data: bytes, content_type: str | None) -> str:
@@ -151,9 +188,11 @@ def fetch_url(
                         continue
 
                     content_type = resp.headers.get("content-type")
-                    if not _is_text_content_type(content_type):
+                    final_url = str(resp.url)
+                    extract_binary = _is_extractable_binary(final_url, content_type)
+                    if not _is_text_content_type(content_type) and not extract_binary:
                         return SourceContent(
-                            final_url=str(resp.url),
+                            final_url=final_url,
                             status_code=resp.status_code,
                             content_type=content_type,
                             text=None,
@@ -177,7 +216,7 @@ def fetch_url(
 
                     if oversized:
                         return SourceContent(
-                            final_url=str(resp.url),
+                            final_url=final_url,
                             status_code=resp.status_code,
                             content_type=content_type,
                             text=None,
@@ -187,7 +226,7 @@ def fetch_url(
 
                     if resp.status_code >= 400:
                         return SourceContent(
-                            final_url=str(resp.url),
+                            final_url=final_url,
                             status_code=resp.status_code,
                             content_type=content_type,
                             text=None,
@@ -195,11 +234,38 @@ def fetch_url(
                             method="http",
                         )
 
-                    raw = _decode_body(bytes(buf), content_type)
+                    body = bytes(buf)
+                    if extract_binary and not _is_text_content_type(content_type):
+                        from src.evidence.files import extract_text_from_bytes
+
+                        text = extract_text_from_bytes(
+                            body, _filename_hint(final_url, content_type)
+                        )
+                        if not text:
+                            return SourceContent(
+                                final_url=final_url,
+                                status_code=resp.status_code,
+                                content_type=content_type,
+                                text=None,
+                                error_code="empty_content",
+                                method="http",
+                            )
+                        return SourceContent(
+                            final_url=final_url,
+                            status_code=resp.status_code,
+                            content_type=content_type,
+                            text=text,
+                            error_code=None,
+                            method="http",
+                            title=_filename_hint(final_url, content_type),
+                            raw_text=text if keep_raw else None,
+                        )
+
+                    raw = _decode_body(body, content_type)
                     doc = normalize_content(raw, content_type)
                     if not doc.text:
                         return SourceContent(
-                            final_url=str(resp.url),
+                            final_url=final_url,
                             status_code=resp.status_code,
                             content_type=content_type,
                             text=None,
@@ -208,7 +274,7 @@ def fetch_url(
                             title=doc.title,
                         )
                     return SourceContent(
-                        final_url=str(resp.url),
+                        final_url=final_url,
                         status_code=resp.status_code,
                         content_type=content_type,
                         text=doc.text,

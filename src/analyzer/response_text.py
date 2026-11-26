@@ -51,15 +51,57 @@ def strip_response_markdown(text: str) -> str:
     return cleaned.strip()
 
 
+# Orphan «см. / смотрите … и» left after URL wipe.
+_SEE_AND_ORPHAN_RE = re.compile(
+    r"(?:^|(?<=[.!?…]\s)|(?<=\n))"
+    r"(?:см\.?|смотрите|смотри)\s+и\b[.,;:]?\s*",
+    re.I,
+)
+# Lone connector / see-also debris on its own line.
+_ORPHAN_CONNECTOR_LINE_RE = re.compile(
+    r"^\s*(?:и|или|а\s+также|см\.?|смотрите|смотри)\s*[.,;:]?\s*$",
+    re.I | re.M,
+)
+# Line that is only leftover punctuation / empty parens.
+_PUNCT_ONLY_LINE_RE = re.compile(r"^\s*[()\[\].,;:\-–—«»\"']+\s*$", re.M)
+
+
+def clean_link_strip_collateral(text: str) -> str:
+    """Remove prose debris left after URL/label stripping — never restore links."""
+    cleaned = text or ""
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"\[\s*\]", "", cleaned)
+    cleaned = _SEE_AND_ORPHAN_RE.sub("", cleaned)
+    cleaned = _ORPHAN_CONNECTOR_LINE_RE.sub("", cleaned)
+    cleaned = _PUNCT_ONLY_LINE_RE.sub("", cleaned)
+    # Dangling connectors before sentence end / next sentence.
+    cleaned = re.sub(r"\s+(?:и|или)\s*([.,;:])", r"\1", cleaned, flags=re.I)
+    # Collapse empty / punct-only lines and trim horizontal runs.
+    lines: list[str] = []
+    for raw_line in cleaned.splitlines():
+        line = re.sub(r"[^\S\n]{2,}", " ", raw_line).strip()
+        if not line:
+            continue
+        if _PUNCT_ONLY_LINE_RE.match(line) or _ORPHAN_CONNECTOR_LINE_RE.match(line):
+            continue
+        if _SEE_AND_ORPHAN_RE.fullmatch(line):
+            continue
+        lines.append(line)
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"[^\S\n]+([,.!?;:])", r"\1", cleaned)
+    cleaned = re.sub(r"([,.!?;:]){2,}", r"\1", cleaned)
+    cleaned = re.sub(r"[^\S\n]{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
 def strip_github_links(text: str) -> str:
     cleaned = _GITHUB_URL_RE.sub("", text)
-    cleaned = re.sub(r"\(\s*\)", "", cleaned)
     cleaned = re.sub(r"GitHub\s*:\s*", "", cleaned, flags=re.I)
     # Keep paragraph breaks — only collapse horizontal whitespace runs.
     cleaned = re.sub(r"[^\S\n]{2,}", " ", cleaned)
     cleaned = re.sub(r"[^\S\n]*\n[^\S\n]*", "\n", cleaned)
     cleaned = re.sub(r"[^\S\n]+([,.])", r"\1", cleaned)
-    return cleaned.strip()
+    return clean_link_strip_collateral(cleaned)
 
 
 def strip_portfolio_footer(text: str) -> str:
@@ -357,6 +399,7 @@ def finalize_response_text(text: str, project: ProjectFull | None = None) -> str
     cleaned = strip_response_markdown(cleaned)
     cleaned = strip_github_links(cleaned)
     cleaned = strip_portfolio_footer(cleaned)
+    cleaned = clean_link_strip_collateral(cleaned)
     cleaned = ensure_hello_greeting(cleaned)
     seed = None
     if project is not None:

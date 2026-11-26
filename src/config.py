@@ -135,6 +135,7 @@ class Settings(BaseSettings):
     flru_early_scan_enabled: bool = True
     process_concurrency: int = 1
     early_ping_seen_db: str = "data/early_ping_seen.db"
+    early_ping_max_per_source: int = 8
     early_listings_dir: str = "data/early_listings"
 
     yandex_storage_state: str = ""
@@ -149,6 +150,7 @@ class Settings(BaseSettings):
     flru_inbox_seen_db: str = "data/flru_inbox_seen.db"
     flru_inbox_poll_seconds: int = 90
     flru_proxy: str = ""
+    flru_listing_pages: int = 3
 
     # Telegram USER session (Telethon) — VIP private-group watcher
     tg_user_api_id: int = 0

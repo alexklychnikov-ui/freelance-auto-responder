@@ -26,7 +26,7 @@ EarlyDecisionHandler = Callable[
 SubmitTextHandler = Callable[[PendingOffer, str], Awaitable[None]]
 ExportJournalHandler = Callable[[Message], Awaitable[None]]
 ScanReportHandler = Callable[[Message], Awaitable[None]]
-FlCheckHandler = Callable[[Message], Awaitable[None]]
+FlCheckHandler = Callable[..., Awaitable[None]]
 NotebookSyncHandler = Callable[[Message, int], Awaitable[None]]
 JournalConfirmHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
 PrepareRetryHandler = Callable[[str, str, str, CallbackQuery], Awaitable[None]]
@@ -522,13 +522,15 @@ class ReviewService:
             return
         await self._on_scan_report(message)
 
-    async def _handle_fl_check(self, message: Message) -> None:
+    async def _handle_fl_check(
+        self, message: Message, *, repair: bool = False
+    ) -> None:
         if self._on_fl_check is None:
             await message.answer("Команда /flcheck недоступна")
             return
         if str(message.chat.id) != str(self.tg_bot.chat_id):
             return
-        await self._on_fl_check(message)
+        await self._on_fl_check(message, repair=repair)
 
     async def _handle_notebook_sync(self, message: Message, days: int) -> None:
         if self._on_notebook_sync is None:

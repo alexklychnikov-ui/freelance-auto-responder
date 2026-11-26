@@ -355,3 +355,34 @@ def test_browser_route_guard_blocks_private_hop() -> None:
     assert out.method == "browser"
     assert out.error_code == "blocked_ip"
     assert out.text is None
+
+
+def test_fetch_url_extracts_docx_binary() -> None:
+    from io import BytesIO
+    from zipfile import ZipFile, ZipInfo
+
+    document_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body><w:p><w:r><w:t>Evidence DOCX body</w:t></w:r></w:p></w:body>
+</w:document>"""
+    buf = BytesIO()
+    with ZipFile(buf, "w") as zf:
+        zf.writestr(ZipInfo("word/document.xml"), document_xml.encode("utf-8"))
+        zf.writestr("[Content_Types].xml", b"<Types></Types>")
+    fake = _FakeStreamResp(
+        url="https://example.com/tz.docx",
+        headers={
+            "content-type": (
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            )
+        },
+        chunks=[buf.getvalue()],
+    )
+    client = MagicMock(spec=httpx.Client)
+    client.stream.return_value = fake
+    with patch("src.evidence.ssrf.socket.getaddrinfo", side_effect=_public_addrinfo):
+        out = fetch_url("https://example.com/tz.docx", client=client)
+    assert out.error_code is None
+    assert out.text is not None
+    assert "Evidence DOCX body" in out.text

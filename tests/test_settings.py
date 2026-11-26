@@ -39,7 +39,7 @@ def test_enabled_sources_include_kwork_and_yandex() -> None:
     assert {"kwork_dev_it", "kwork_c5", "kwork_c15", "yandex_uslugi_it", "flru_orders"} <= ids
     flru = next(s for s in enabled if s.id == "flru_orders")
     assert flru.platform == "flru"
-    assert "kind=1" in (flru.url or "")
+    assert "kind=5" in (flru.url or "")
     assert "for_all=1" in (flru.url or "")
     assert flru.filters.get("for_all") is True
 

@@ -140,16 +140,28 @@ def _offer(project_full: ProjectFull, score: GptScoreResult) -> PendingOffer:
     )
 
 
+def _project_no_urls(project_full: ProjectFull) -> ProjectFull:
+    return project_full.model_copy(
+        update={
+            "title": "Разработать сайт без ссылок",
+            "full_description": "Нужен лендинг на Tilda, без внешних референсов.",
+            "tags": [],
+        }
+    )
+
+
 @pytest.mark.asyncio
 async def test_generate_skips_evidence_when_disabled(
     settings: Settings, project_full: ProjectFull, score: GptScoreResult
 ) -> None:
+    """Flag off + no discover candidates → not_required, collect skipped."""
+    plain = _project_no_urls(project_full)
     mock_ev = MagicMock()
     mock_ev.collect = MagicMock(
         side_effect=AssertionError("collect must not run when disabled")
     )
-    orch = _make_orch(settings, project_full, score, evidence_service=mock_ev)
-    offer = _offer(project_full, score)
+    orch = _make_orch(settings, plain, score, evidence_service=mock_ev)
+    offer = _offer(plain, score)
     orch.review_service.store.save(offer)
 
     text = await orch._generate_response_text(offer)
@@ -170,12 +182,13 @@ async def test_generate_skips_evidence_when_disabled(
 async def test_ensure_evidence_disabled_clears_stale_and_prepared(
     settings: Settings, project_full: ProjectFull, score: GptScoreResult
 ) -> None:
-    """When flag is off, prior facts must not leak into prepared JSON."""
+    """When flag is off and no URL candidates, prior facts must not leak."""
     settings.evidence_research_enabled = False
+    plain = _project_no_urls(project_full)
     stale = EvidenceBundle(
         status="complete",
         required=True,
-        project_hash=project_content_hash(project_full),
+        project_hash=project_content_hash(plain),
         facts=[
             EvidenceFact(
                 id="stale",
@@ -190,8 +203,8 @@ async def test_ensure_evidence_disabled_clears_stale_and_prepared(
     mock_ev.collect = MagicMock(
         side_effect=AssertionError("collect must not run when disabled")
     )
-    orch = _make_orch(settings, project_full, score, evidence_service=mock_ev)
-    offer = _offer(project_full, score)
+    orch = _make_orch(settings, plain, score, evidence_service=mock_ev)
+    offer = _offer(plain, score)
     offer.evidence = stale
     orch.review_service.store.save(offer)
 
@@ -222,6 +235,38 @@ async def test_ensure_evidence_disabled_clears_stale_and_prepared(
     assert prepared.evidence.required is False
     assert prepared.evidence.facts == []
     assert prepared.evidence.sources == []
+
+
+@pytest.mark.asyncio
+async def test_ensure_evidence_auto_collect_when_disabled_but_has_urls(
+    settings: Settings, project_full: ProjectFull, score: GptScoreResult
+) -> None:
+    """Flag off, but discover finds URLs → still collect (fail-open)."""
+    settings.evidence_research_enabled = False
+    bundle = EvidenceBundle(
+        status="complete",
+        required=True,
+        project_hash=project_content_hash(project_full),
+        facts=[
+            EvidenceFact(
+                id="f1",
+                source_id="s1",
+                claim="лот",
+                quote="184729",
+                eligible_for_response=True,
+            )
+        ],
+    )
+    mock_ev = MagicMock()
+    mock_ev.collect = MagicMock(return_value=bundle)
+    orch = _make_orch(settings, project_full, score, evidence_service=mock_ev)
+    offer = _offer(project_full, score)
+    orch.review_service.store.save(offer)
+
+    got = await orch.ensure_evidence(offer)
+    mock_ev.collect.assert_called_once()
+    assert got.status == "complete"
+    assert offer.evidence is bundle
 
 
 @pytest.mark.asyncio

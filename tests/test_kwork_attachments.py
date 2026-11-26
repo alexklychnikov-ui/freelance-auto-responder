@@ -125,7 +125,7 @@ def test_enrich_description_appends_attachment() -> None:
             return_value=b"%PDF",
         ),
         patch(
-            "src.adapters.kwork_attachments.extract_text_from_bytes",
+            "src.adapters.attachments_common.extract_text_from_bytes",
             return_value=pdf_text,
         ),
     ):

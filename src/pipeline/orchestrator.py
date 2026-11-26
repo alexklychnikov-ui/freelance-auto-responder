@@ -64,6 +64,7 @@ from src.analyzer.project_brief import build_project_brief
 from src.analyzer.project_tier import resolve_acceptance_tier
 from src.analyzer.response_history import load_recent_response_context
 from src.browser.factory import close_browser_client, get_browser_client
+from src.browser.playwright_adapter import persist_strip_ddos_guard_cookies
 from src.config import Settings, SourceConfig, get_enabled_sources, get_settings
 from src.journal.writer import JournalWriter
 from src.journal.vps_sync import sync_journal_on_vps
@@ -87,7 +88,7 @@ from src.pipeline.flru_inbox_poller import poll_flru_inbox
 from src.pipeline.kwork_inbox_poller import poll_kwork_inbox
 from src.pipeline.tg_user_watch_poller import poll_tg_user_watch
 from src.pipeline.yandex_inbox_poller import poll_yandex_inbox
-from src.platform_health import mark_platform_up, should_send_platform_down_alert
+from src.platform_health import mark_platform_up, note_platform_failure
 from src.runtime_toggles import is_kwork_paused, set_kwork_paused
 from src.store.early_listings import EarlyListing, EarlyListingStore
 from src.store.early_ping_seen import EarlyPingSeenStore
@@ -979,7 +980,7 @@ class PipelineOrchestrator:
             "yandex_uslugi": "Яндекс Услуги",
             "flru": "FL.ru",
         }.get(platform, platform)
-        if not should_send_platform_down_alert(self.settings, platform):
+        if not note_platform_failure(self.settings, platform):
             logger.warning(
                 "platform_down_alert_throttled platform=%s source=%s msg=%s",
                 platform,
@@ -991,7 +992,8 @@ class PipelineOrchestrator:
             f"🚨 <b>{html.escape(label)} отвалилась</b>\n"
             f"Источник: <code>{html.escape(source_id)}</code>\n"
             f"{html.escape(message[:400])}\n"
-            f"Повторный алерт не чаще чем раз в 30 мин. /report — статус."
+            f"Повторная проверка ~2 мин; алерт не чаще чем раз в 30 мин. "
+            f"/report — статус."
         )
 
     async def run_early_scan_cycle(self) -> dict[str, int]:
@@ -1070,6 +1072,8 @@ class PipelineOrchestrator:
             new_in_source = 0
             source_seen = 0
             source_pinged = 0
+            early_ping_overflow = 0
+            ping_cap = max(0, int(self.settings.early_ping_max_per_source))
 
             for preview in previews:
                 totals["seen"] += 1
@@ -1132,6 +1136,9 @@ class PipelineOrchestrator:
                     if self.early_ping_seen.mark_if_new(
                         preview.platform, preview.project_id
                     ):
+                        if source_pinged >= ping_cap:
+                            early_ping_overflow += 1
+                            continue
                         offers = getattr(preview, "offers_count", None)
                         if offers is None:
                             offers = getattr(preview, "responses_count", None)
@@ -1163,6 +1170,17 @@ class PipelineOrchestrator:
                         totals["pinged"] += 1
                         source_pinged += 1
                         plat_stats.notified += 1
+
+            if early_ping_overflow > 0:
+                overflow_label = {
+                    "kwork": "Kwork",
+                    "yandex_uslugi": "Яндекс Услуги",
+                    "flru": "FL.ru",
+                }.get(source.platform, source.platform)
+                await tg.notify(
+                    f"⚡ {overflow_label}: ещё {early_ping_overflow} новых "
+                    f"без early-ping (лимит {ping_cap}/цикл)"
+                )
 
             digit_ids = [
                 int(p.project_id) for p in previews if p.project_id.isdigit()
@@ -1323,13 +1341,18 @@ class PipelineOrchestrator:
         *,
         allow_guest_fallback: bool = True,
     ) -> list[Any]:
+        self._last_flru_scan_via = None
         if source.platform in ("yandex_uslugi", "flru"):
             adapter = self._adapter_factory(source, None)
             try:
                 if source.platform == "flru":
-                    return adapter.scan_new(
+                    previews = adapter.scan_new(
                         allow_guest_fallback=allow_guest_fallback
                     )
+                    self._last_flru_scan_via = getattr(
+                        adapter, "last_scan_via", None
+                    )
+                    return previews
                 return adapter.scan_new()
             finally:
                 close = getattr(adapter, "close", None)
@@ -1633,32 +1656,52 @@ class PipelineOrchestrator:
         notify: Any | None = None,
     ) -> EvidenceBundle:
         """Collect or reuse EvidenceBundle before response generation. Fail-open."""
-        if not self.settings.evidence_research_enabled:
-            bundle = EvidenceBundle(
-                status="not_required",
-                required=False,
-                project_hash=project_content_hash(offer.project),
-            )
-            prior = offer.evidence
-            offer.evidence = bundle
-            # Clear stale prior evidence from pending so prepared saves stay clean.
-            if prior is not None and (
-                prior.status != "not_required"
-                or prior.required
-                or prior.facts
-                or prior.sources
-                or prior.insights
-                or prior.warnings
-            ):
-                self.review_service.store.save(offer)
-            return bundle
-
         current_hash = project_content_hash(offer.project)
+        if not self.settings.evidence_research_enabled:
+            # Auto-collect when TZ already exposes URLs/attachment markers
+            # (fail-open path below). No candidates → keep not_required.
+            try:
+                from src.evidence.discovery import discover
+
+                auto_candidates = discover(
+                    offer.project,
+                    max_urls=int(self.settings.evidence_max_urls),
+                )
+            except Exception:
+                logger.warning(
+                    "evidence_discover_for_auto_failed", exc_info=True
+                )
+                auto_candidates = []
+            if not auto_candidates:
+                bundle = EvidenceBundle(
+                    status="not_required",
+                    required=False,
+                    project_hash=current_hash,
+                )
+                prior = offer.evidence
+                offer.evidence = bundle
+                # Clear stale prior evidence from pending so prepared saves stay clean.
+                if prior is not None and (
+                    prior.status != "not_required"
+                    or prior.required
+                    or prior.facts
+                    or prior.sources
+                    or prior.insights
+                    or prior.warnings
+                ):
+                    self.review_service.store.save(offer)
+                return bundle
+
         if (
             offer.evidence is not None
             and offer.evidence.project_hash == current_hash
         ):
-            return offer.evidence
+            # Flag-off auto-collect: don't stick on a prior not_required stub.
+            if not (
+                not self.settings.evidence_research_enabled
+                and offer.evidence.status == "not_required"
+            ):
+                return offer.evidence
 
         async def _notify(msg: str) -> None:
             if notify is None:
@@ -2973,7 +3016,9 @@ class PipelineOrchestrator:
         )
         await self.review_service.tg_bot.notify(text)
 
-    async def check_flru_health(self, message: Any) -> None:
+    async def check_flru_health(
+        self, message: Any, *, repair: bool = False
+    ) -> None:
         sources = [
             source
             for source in get_enabled_sources(self.settings.sources_config_path)
@@ -2995,9 +3040,28 @@ class PipelineOrchestrator:
         )
         results: list[str] = []
         all_ok = True
+        stripped = 0
+        cards_total = 0
 
         async with self._flru_scan_lock:
-            await message.answer("🔎 FL.ru: проверяю auth_fetch и early scan…")
+            if repair:
+                await message.answer(
+                    "🔧 FL.ru: recovery — strip __ddg + auth scan…"
+                )
+                storage = (self.settings.flru_storage_state or "").strip()
+                if storage:
+                    stripped = await asyncio.to_thread(
+                        persist_strip_ddos_guard_cookies, storage
+                    )
+                logger.info(
+                    "flru_repair_strip_ddg dropped=%d path=%s",
+                    stripped,
+                    storage or "(empty)",
+                )
+            else:
+                await message.answer(
+                    "🔎 FL.ru: проверяю auth_fetch и early scan…"
+                )
             for source in sources:
                 source_started = time.perf_counter()
                 try:
@@ -3024,18 +3088,35 @@ class PipelineOrchestrator:
                     continue
 
                 elapsed = time.perf_counter() - source_started
+                cards_total += len(previews)
+                via = getattr(self, "_last_flru_scan_via", None)
+                via_part = f" · via={via}" if via else ""
                 results.append(
                     f"✅ {html.escape(source.id)}: источник жив\n"
-                    f"auth_fetch: OK · early_scan: OK · карточек: {len(previews)}\n"
+                    f"auth_fetch: OK · early_scan: OK · "
+                    f"карточек: {len(previews)}{via_part}\n"
                     f"время: {elapsed:.1f} с"
                 )
 
-        status = "✅ FL.ru жив" if all_ok else "❌ FL.ru проверка не пройдена"
+        if repair and all_ok:
+            mark_platform_up(self.settings, "flru")
+
+        if repair:
+            status = (
+                "✅ FL.ru recovery OK" if all_ok else "❌ FL.ru recovery FAIL"
+            )
+            recovery_line = f"recovery: strip __ddg × {stripped}\n"
+        else:
+            status = (
+                "✅ FL.ru жив" if all_ok else "❌ FL.ru проверка не пройдена"
+            )
+            recovery_line = ""
         route = "proxy/SOCKS" if proxy_enabled else "direct"
         total = time.perf_counter() - started
         await message.answer(
             f"{status}\n"
-            f"маршрут: {route} · всего: {total:.1f} с\n\n"
+            f"{recovery_line}"
+            f"маршрут: {route} · cards={cards_total} · всего: {total:.1f} с\n\n"
             + "\n\n".join(results)
         )
 

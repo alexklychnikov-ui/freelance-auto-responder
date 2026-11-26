@@ -515,8 +515,13 @@ class TelegramReviewBot:
             if on_fl_check is None:
                 await callback.answer("Команда недоступна", show_alert=True)
                 return
-            await callback.answer("Запускаю проверку FL.ru…")
-            await on_fl_check(callback.message)
+            repair = callback.data == CALLBACK_COMMAND_REPAIR
+            await callback.answer(
+                "Запускаю recovery FL.ru…"
+                if repair
+                else "Запускаю проверку FL.ru…"
+            )
+            await on_fl_check(callback.message, repair=repair)
 
         @self._dp.message(Command("start"))
         async def handle_start(message: Message) -> None:
@@ -541,13 +546,13 @@ class TelegramReviewBot:
                 "Используй, чтобы временно остановить сканирование и обработку Kwork.\n"
                 "/kworkon — снимает паузу и возобновляет Kwork-пайплайн. "
                 "Используй после устранения проблемы или завершения ручных работ.\n"
-                "/repair — запускает безопасную проверку FL.ru без карточек и записи "
-                "scan-state. Это привычный alias для ручной диагностики источника.\n"
-                "/flcheck — проверяет авторизацию, auth_fetch и early scan FL.ru, "
-                "затем сообщает причину сбоя. Используй после таймаута, WAF или "
-                "подозрения на устаревшие куки.\n"
-                "/flping — выполняет ту же полную проверку FL.ru, что /flcheck. "
-                "Используй как короткий alias для быстрой ручной диагностики.\n"
+                "/repair — попытка восстановления FL.ru: strip __ddg + scan "
+                "(auth_fetch→auth_http/proxy) + mark_platform_up. "
+                "Используй после WAF / Failed to fetch.\n"
+                "/flcheck — диагностика: проверяет авторизацию, auth_fetch и early "
+                "scan FL.ru, затем сообщает причину сбоя (без strip).\n"
+                "/flping — та же диагностика FL.ru, что /flcheck. "
+                "Короткий alias для быстрой проверки.\n"
                 "/journal — синхронизирует журнал откликов и присылает актуальный "
                 "Excel-файл. Используй после подготовки или отправки откликов.\n"
                 "/journal_sync — alias команды /journal с тем же результатом. "
@@ -667,7 +672,9 @@ class TelegramReviewBot:
             self.clear_correct_awaiting(str(message.chat.id))
             if on_fl_check is None:
                 return
-            await on_fl_check(message)
+            raw_cmd = (message.text or "").split(maxsplit=1)[0].lstrip("/")
+            cmd = raw_cmd.split("@", 1)[0].lower()
+            await on_fl_check(message, repair=(cmd == "repair"))
 
         @self._dp.message(Command("journal", "journal_sync"))
         async def handle_journal_sync(message: Message) -> None:

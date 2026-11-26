@@ -1,4 +1,4 @@
-"""Throttle platform-down alerts so soft-fail loops don't spam TG."""
+"""Platform up/suspect/down alerts with confirm window + cooldown."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from src.config import Settings
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_CONFIRM_SEC = 120
 _DEFAULT_COOLDOWN_SEC = 30 * 60
 
 
@@ -37,35 +38,104 @@ def _save(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def should_send_platform_down_alert(
+def _entry(data: dict[str, Any], key: str) -> dict[str, Any]:
+    raw = data.get(key)
+    return raw if isinstance(raw, dict) else {}
+
+
+def note_platform_failure(
     settings: Settings,
     platform: str,
     *,
+    confirm_sec: int = _DEFAULT_CONFIRM_SEC,
     cooldown_sec: int = _DEFAULT_COOLDOWN_SEC,
 ) -> bool:
-    """True once per cooldown window per platform (first fail after silence)."""
+    """Record a failure. True only when a user-visible DOWN alert should be sent.
+
+    State machine per platform:
+    - up → suspect (no TG)
+    - suspect within confirm_sec → stay suspect (no TG)
+    - suspect confirmed → down + TG unless still in cooldown since last_alert
+    - already down + alert_sent within cooldown → no TG
+    - already down outside cooldown → TG again
+    """
     path = _alerts_path(settings)
     data = _load(path)
     key = str(platform)
     now = time.time()
-    last = float((data.get(key) or {}).get("last_alert_at") or 0)
-    if now - last < max(60, int(cooldown_sec)):
+    prev = _entry(data, key)
+    status = str(prev.get("status") or "up")
+    alert_sent = bool(prev.get("alert_sent"))
+    last_alert_at = float(prev.get("last_alert_at") or 0)
+    suspect_since = float(prev.get("suspect_since") or 0)
+    cooldown = max(60, int(cooldown_sec))
+    confirm = max(1, int(confirm_sec))
+
+    if status == "up" or status not in ("suspect", "down"):
+        data[key] = {
+            "status": "suspect",
+            "suspect_since": now,
+            "last_alert_at": last_alert_at,
+            "alert_sent": False,
+        }
+        _save(path, data)
+        return False
+
+    if status == "suspect":
+        if suspect_since <= 0:
+            data[key] = {
+                "status": "suspect",
+                "suspect_since": now,
+                "last_alert_at": last_alert_at,
+                "alert_sent": alert_sent,
+            }
+            _save(path, data)
+            return False
+        if now - suspect_since < confirm:
+            return False
+        if last_alert_at > 0 and now - last_alert_at < cooldown:
+            data[key] = {
+                "status": "down",
+                "suspect_since": suspect_since,
+                "last_alert_at": last_alert_at,
+                "alert_sent": alert_sent,
+            }
+            _save(path, data)
+            return False
+        data[key] = {
+            "status": "down",
+            "suspect_since": suspect_since,
+            "last_alert_at": now,
+            "alert_sent": True,
+        }
+        _save(path, data)
+        return True
+
+    # status == "down"
+    if alert_sent and now - last_alert_at < cooldown:
         return False
     data[key] = {
-        "last_alert_at": now,
         "status": "down",
+        "suspect_since": suspect_since or now,
+        "last_alert_at": now,
+        "alert_sent": True,
     }
     _save(path, data)
     return True
 
 
 def mark_platform_up(settings: Settings, platform: str) -> bool:
-    """Clear down state. Returns True if platform was previously marked down."""
+    """Clear failure state. True only if a DOWN alert was previously sent."""
     path = _alerts_path(settings)
     data = _load(path)
     key = str(platform)
-    prev = data.get(key) or {}
-    was_down = prev.get("status") == "down"
-    data[key] = {"last_alert_at": prev.get("last_alert_at") or 0, "status": "up"}
+    prev = _entry(data, key)
+    was_alerted = bool(prev.get("alert_sent"))
+    data[key] = {
+        "status": "up",
+        "suspect_since": 0,
+        "last_alert_at": float(prev.get("last_alert_at") or 0),
+        "alert_sent": False,
+    }
     _save(path, data)
-    return bool(was_down)
+    return was_alerted

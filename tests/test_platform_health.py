@@ -2,7 +2,7 @@
 from pathlib import Path
 
 from src.config import Settings
-from src.platform_health import mark_platform_up, should_send_platform_down_alert
+from src.platform_health import mark_platform_up, note_platform_failure
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -16,20 +16,67 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
-def test_platform_down_alert_throttled(tmp_path: Path) -> None:
+def test_first_fail_no_send(tmp_path: Path, monkeypatch) -> None:
     settings = _settings(tmp_path)
-    assert should_send_platform_down_alert(
-        settings, "yandex_uslugi", cooldown_sec=3600
-    )
-    assert not should_send_platform_down_alert(
-        settings, "yandex_uslugi", cooldown_sec=3600
+    monkeypatch.setattr("src.platform_health.time.time", lambda: 1_000.0)
+    assert (
+        note_platform_failure(
+            settings, "yandex_uslugi", confirm_sec=120, cooldown_sec=3600
+        )
+        is False
     )
 
 
-def test_platform_up_clears_down(tmp_path: Path) -> None:
+def test_second_fail_after_confirm_sends(tmp_path: Path, monkeypatch) -> None:
     settings = _settings(tmp_path)
-    assert should_send_platform_down_alert(
-        settings, "flru", cooldown_sec=3600
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(
+        "src.platform_health.time.time", lambda: clock["now"]
     )
+    assert (
+        note_platform_failure(
+            settings, "flru", confirm_sec=120, cooldown_sec=3600
+        )
+        is False
+    )
+    clock["now"] = 1_000.0 + 119
+    assert (
+        note_platform_failure(
+            settings, "flru", confirm_sec=120, cooldown_sec=3600
+        )
+        is False
+    )
+    clock["now"] = 1_000.0 + 120
+    assert (
+        note_platform_failure(
+            settings, "flru", confirm_sec=120, cooldown_sec=3600
+        )
+        is True
+    )
+    assert (
+        note_platform_failure(
+            settings, "flru", confirm_sec=120, cooldown_sec=3600
+        )
+        is False
+    )
+
+
+def test_recover_from_suspect_without_alert(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    monkeypatch.setattr("src.platform_health.time.time", lambda: 1_000.0)
+    assert note_platform_failure(settings, "kwork", confirm_sec=120) is False
+    assert mark_platform_up(settings, "kwork") is False
+    assert mark_platform_up(settings, "kwork") is False
+
+
+def test_recover_after_alert_true_once(tmp_path: Path, monkeypatch) -> None:
+    settings = _settings(tmp_path)
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(
+        "src.platform_health.time.time", lambda: clock["now"]
+    )
+    assert note_platform_failure(settings, "flru", confirm_sec=60) is False
+    clock["now"] = 1_100.0
+    assert note_platform_failure(settings, "flru", confirm_sec=60) is True
     assert mark_platform_up(settings, "flru") is True
     assert mark_platform_up(settings, "flru") is False

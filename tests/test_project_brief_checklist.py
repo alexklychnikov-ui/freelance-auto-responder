@@ -242,3 +242,54 @@ def test_collect_feedback_is_not_parsing() -> None:
         "ИИ-специалист будет собирать в течение периода обратную связь "
         "от сотрудников (вопросы, предложения)"
     )
+
+
+def _fl_vkbottle_roles_and_writein() -> ProjectFull:
+    desc = (
+        "Нужен Telegram-бот на vkbottle с Docker. Роли: "
+        "1. Супер-Админ — полный доступ. "
+        "2. Владелец — управление своим магазином. "
+        "3. Клиент — оформление заказов. "
+        "В отклике напишите: 1. Есть ли у вас опыт с vkbottle и Docker? "
+        "2. Делали ли вы раньше ботов с разделением доступа (мультитенантность)? "
+        "3. Ссылку на 1-2 ваших рабочих проекта."
+    )
+    return ProjectFull(
+        platform="fl",
+        source_key="fl_ru",
+        project_id="fl-vkbottle-1",
+        url="https://www.fl.ru/projects/1",
+        title="Бот vkbottle Docker мультитенантность",
+        full_description=desc,
+    )
+
+
+def test_extract_buyer_questions_fl_napishite_same_line() -> None:
+    items = extract_buyer_questions(_fl_vkbottle_roles_and_writein())
+    assert len(items) == 3
+    blob = " ".join(items).lower()
+    assert "vkbottle" in blob
+    assert "мультитенант" in blob
+    assert "ссылк" in blob
+    assert not any("супер-админ" in i.lower() for i in items)
+    assert not any("владелец" in i.lower() for i in items)
+    assert not any(i.lower().startswith("клиент") for i in items)
+
+
+def test_checklist_header_napishite_and_otvetyte() -> None:
+    for verb in ("напишите", "ответьте", "укажи", "нужно указать", "прошу указать"):
+        desc = (
+            f"Нужен бот.\nВ отклике {verb}: "
+            "1. Какой срок? 2. Какая цена? 3. Какой стек?"
+        )
+        project = ProjectFull(
+            platform="fl",
+            source_key="fl_ru",
+            project_id=f"fl-{verb}",
+            url="https://www.fl.ru/projects/x",
+            title="Бот",
+            full_description=desc,
+        )
+        items = extract_buyer_questions(project)
+        assert len(items) == 3, verb
+        assert "срок" in items[0].lower(), verb

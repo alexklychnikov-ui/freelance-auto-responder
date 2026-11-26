@@ -133,8 +133,13 @@ def _merge_candidates(
     merged = list(by_key.values())
     merged.sort(key=lambda c: (-c.priority, 0 if c.kind == "url" else 1, c.input_ref))
     if max_urls <= 0:
-        return []
-    return merged[:max_urls]
+        # Still keep inlined attachments — max_urls caps HTTP targets only.
+        return [c for c in merged if c.kind != "url"]
+    urls = [c for c in merged if c.kind == "url"][:max_urls]
+    attachments = [c for c in merged if c.kind != "url"]
+    out = [*urls, *attachments]
+    out.sort(key=lambda c: (-c.priority, 0 if c.kind == "url" else 1, c.input_ref))
+    return out
 
 
 class EvidenceService:

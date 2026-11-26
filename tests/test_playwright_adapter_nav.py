@@ -8,6 +8,7 @@ from src.browser.playwright_adapter import (
     _is_transient_nav_error,
     build_ipv4_host_resolver_rules,
     load_storage_state,
+    persist_strip_ddos_guard_cookies,
     strip_ddos_guard_cookies,
 )
 
@@ -68,6 +69,26 @@ def test_strip_ddos_guard_cookies_keeps_session() -> None:
     names = [c["name"] for c in cleaned["cookies"]]
     assert names == ["PHPSESSID", "id"]
     assert state["cookies"][1]["name"] == "__ddg8_"  # original untouched
+
+
+def test_persist_strip_ddos_guard_cookies(tmp_path) -> None:
+    path = tmp_path / "flru_storage.json"
+    path.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {"name": "pwd", "value": "p", "domain": ".fl.ru"},
+                    {"name": "__ddg1_", "value": "z", "domain": ".fl.ru"},
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert persist_strip_ddos_guard_cookies(path) == 1
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert [c["name"] for c in saved["cookies"]] == ["pwd"]
+    assert persist_strip_ddos_guard_cookies(path) == 0
 
 
 def test_load_storage_state_strips_ddg(tmp_path) -> None:

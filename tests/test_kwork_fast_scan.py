@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -432,11 +433,81 @@ async def test_run_kwork_fast_scan_cycle_alias(
 
 
 @pytest.mark.asyncio
+async def test_run_early_scan_cycle_burst_cap(
+    settings: Settings,
+) -> None:
+    settings.kwork_fast_scan_enabled = False
+    settings.yandex_early_scan_enabled = False
+    settings.flru_early_scan_enabled = True
+    settings.early_ping_max_per_source = 3
+    orch = _minimal_orchestrator(settings)
+    orch.review_service.tg_bot.notify_early_listing = AsyncMock(return_value=99)
+    orch.review_service.tg_bot.notify = AsyncMock()
+
+    previews = [
+        ProjectPreview(
+            platform="flru",
+            source_key="flru_orders",
+            project_id=str(9000 + i),
+            url=f"https://www.fl.ru/projects/{9000 + i}/",
+            title=f"Job {i}",
+        )
+        for i in range(12)
+    ]
+    orch._scan_listings = MagicMock(return_value=previews)  # type: ignore[method-assign]
+    sources = [
+        MagicMock(id="flru_orders", platform="flru", enabled=True, bootstrap=False),
+    ]
+
+    with patch(
+        "src.pipeline.orchestrator.get_enabled_sources",
+        return_value=sources,
+    ), patch(
+        "src.pipeline.orchestrator.is_kwork_paused",
+        return_value=False,
+    ):
+        totals = await orch.run_early_scan_cycle()
+
+    assert totals["new"] == 12
+    assert totals["pinged"] == 3
+    assert orch.review_service.tg_bot.notify_early_listing.await_count == 3
+    notified_ids = [
+        c.kwargs["project_id"]
+        for c in orch.review_service.tg_bot.notify_early_listing.await_args_list
+    ]
+    assert notified_ids == ["9000", "9001", "9002"]
+    summary_calls = [
+        c.args[0]
+        for c in orch.review_service.tg_bot.notify.await_args_list
+        if c.args and "без early-ping" in str(c.args[0])
+    ]
+    assert len(summary_calls) == 1
+    assert "ещё 9 новых" in summary_calls[0]
+    assert "лимит 3/цикл" in summary_calls[0]
+    for i in range(12):
+        assert orch.early_ping_seen.mark_if_new("flru", str(9000 + i)) is False
+
+    orch.review_service.tg_bot.notify_early_listing.reset_mock()
+    orch.review_service.tg_bot.notify.reset_mock()
+    with patch(
+        "src.pipeline.orchestrator.get_enabled_sources",
+        return_value=sources,
+    ), patch(
+        "src.pipeline.orchestrator.is_kwork_paused",
+        return_value=False,
+    ):
+        totals2 = await orch.run_early_scan_cycle()
+    assert totals2["pinged"] == 0
+    orch.review_service.tg_bot.notify_early_listing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_fl_check_reports_auth_fetch_success(settings: Settings) -> None:
     orch = _minimal_orchestrator(settings)
     source = MagicMock(id="flru_orders", platform="flru")
     adapter = MagicMock()
     adapter.scan_new.return_value = [MagicMock(), MagicMock()]
+    adapter.last_scan_via = "auth_fetch"
     orch._adapter_factory.return_value = adapter
     message = MagicMock()
     message.answer = AsyncMock()
@@ -444,9 +515,12 @@ async def test_fl_check_reports_auth_fetch_success(settings: Settings) -> None:
     with patch(
         "src.pipeline.orchestrator.get_enabled_sources",
         return_value=[source],
-    ):
+    ), patch(
+        "src.pipeline.orchestrator.persist_strip_ddos_guard_cookies",
+    ) as strip_mock:
         await orch.check_flru_health(message)
 
+    strip_mock.assert_not_called()
     adapter.scan_new.assert_called_once_with(allow_guest_fallback=False)
     assert message.answer.await_count == 2
     report = message.answer.await_args_list[-1].args[0]
@@ -454,8 +528,60 @@ async def test_fl_check_reports_auth_fetch_success(settings: Settings) -> None:
     assert "auth_fetch: OK" in report
     assert "early_scan: OK" in report
     assert "карточек: 2" in report
+    assert "via=auth_fetch" in report
     assert orch.repository.get_scan_state("flru_orders") is None
     orch.review_service.tg_bot.notify_early_listing.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_fl_repair_strips_ddg_and_marks_up(
+    settings: Settings, tmp_path
+) -> None:
+    storage = tmp_path / "flru_storage.json"
+    storage.write_text(
+        json.dumps(
+            {
+                "cookies": [
+                    {"name": "PHPSESSID", "value": "s", "domain": ".fl.ru"},
+                    {"name": "__ddg8_", "value": "x", "domain": ".fl.ru"},
+                    {"name": "__ddg9_", "value": "y", "domain": ".fl.ru"},
+                    {"name": "id", "value": "1", "domain": ".fl.ru"},
+                ],
+                "origins": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings.flru_storage_state = str(storage)
+    orch = _minimal_orchestrator(settings)
+    source = MagicMock(id="flru_orders", platform="flru")
+    adapter = MagicMock()
+    adapter.scan_new.return_value = [MagicMock(), MagicMock(), MagicMock()]
+    adapter.last_scan_via = "auth_http"
+    orch._adapter_factory.return_value = adapter
+    message = MagicMock()
+    message.answer = AsyncMock()
+
+    with patch(
+        "src.pipeline.orchestrator.get_enabled_sources",
+        return_value=[source],
+    ), patch(
+        "src.pipeline.orchestrator.mark_platform_up",
+        return_value=True,
+    ) as mark_up:
+        await orch.check_flru_health(message, repair=True)
+
+    saved = json.loads(storage.read_text(encoding="utf-8"))
+    assert [c["name"] for c in saved["cookies"]] == ["PHPSESSID", "id"]
+    mark_up.assert_called_once_with(settings, "flru")
+    assert message.answer.await_count == 2
+    assert "recovery" in message.answer.await_args_list[0].args[0].lower()
+    report = message.answer.await_args_list[-1].args[0]
+    assert "recovery OK" in report
+    assert "strip __ddg × 2" in report
+    assert "карточек: 3" in report
+    assert "via=auth_http" in report
+    assert "cards=3" in report
 
 
 @pytest.mark.asyncio
